@@ -1,0 +1,7 @@
+# Matesther Next.js App Router - Netlify detects its Next.js runtime automatically.
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "20"

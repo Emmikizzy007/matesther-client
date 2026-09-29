@@ -1,0 +1,102 @@
+import { NextResponse } from "next/server";
+import { guard, OWNER } from "@/lib/authz";
+import { db } from "@/db";
+import { workerPayments, workerOvertime, workers } from "@/db/schema";
+import { eq } from "drizzle-orm";
+import { workerAccruals, workerHistory, currentMonth } from "@/lib/payroll";
+
+/**
+ * GET /api/payroll?month=YYYY-MM            → monthly payroll summary for all workers
+ * GET /api/payroll?month=YYYY-MM&workerId=N → 12-month history + payment records for one worker
+ */
+export async function GET(req: Request) {
+  const __g = await guard(req, OWNER); if (__g) return __g;
+  try {
+    const { searchParams } = new URL(req.url);
+    const month = searchParams.get("month") || currentMonth();
+    const workerId = searchParams.get("workerId");
+
+    if (workerId) {
+      const [worker] = await db
+        .select()
+        .from(workers)
+        .where(eq(workers.id, Number(workerId)));
+      if (!worker) return NextResponse.json({ error: "Worker not found" }, { status: 404 });
+      const { history, payments } = await workerHistory(Number(workerId), month);
+      return NextResponse.json({ worker, month, history, payments });
+    }
+
+    const { workers: rows, totals } = await workerAccruals(month);
+    const [payRows, otRows, allWorkers] = await Promise.all([
+      db.select().from(workerPayments),
+      db.select().from(workerOvertime),
+      db.select().from(workers),
+    ]);
+    const wMap = new Map(allWorkers.map((w) => [w.id, w]));
+    const payments = payRows
+      .filter((p) => p.periodMonth === month)
+      .map((p) => ({ ...p, workerName: wMap.get(p.workerId)?.name ?? "-" }))
+      .sort((a, b) => String(b.paymentDate).localeCompare(String(a.paymentDate)));
+    const overtime = otRows
+      .filter((o) => {
+        const k = String(o.workedOn).slice(0, 7);
+        return k === month;
+      })
+      .map((o) => ({ ...o, workerName: wMap.get(o.workerId)?.name ?? "-" }));
+
+    return NextResponse.json({ month, workers: rows, totals, payments, overtime });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+  }
+}
+
+/**
+ * POST /api/payroll
+ *  { kind: "payment", workerId, periodMonth, paymentDate, pieceworkAmount, salaryAmount, overtimeAmount, amount, method, paidBy, notes }
+ *  { kind: "overtime", workerId, workedOn, hours, amount, notes }
+ */
+export async function POST(req: Request) {
+  const __g = await guard(req, OWNER); if (__g) return __g;
+  try {
+    const b = await req.json();
+    if (b.kind === "overtime") {
+      if (!b.workerId) return NextResponse.json({ error: "Worker is required" }, { status: 400 });
+      if (!b.amount || Number(b.amount) <= 0)
+        return NextResponse.json({ error: "Overtime amount must be greater than zero" }, { status: 400 });
+      const [row] = await db
+        .insert(workerOvertime)
+        .values({
+          workerId: Number(b.workerId),
+          workedOn: b.workedOn || new Date().toISOString().slice(0, 10),
+          hours: Number(b.hours) || 0,
+          amount: Number(b.amount),
+          notes: b.notes || null,
+        })
+        .returning();
+      return NextResponse.json(row, { status: 201 });
+    }
+
+    // payment
+    if (!b.workerId) return NextResponse.json({ error: "Worker is required" }, { status: 400 });
+    if (!b.amount || Number(b.amount) <= 0)
+      return NextResponse.json({ error: "Payment amount must be greater than zero" }, { status: 400 });
+    const [row] = await db
+      .insert(workerPayments)
+      .values({
+        workerId: Number(b.workerId),
+        paymentDate: b.paymentDate || new Date().toISOString().slice(0, 10),
+        periodMonth: b.periodMonth || currentMonth(),
+        pieceworkAmount: Number(b.pieceworkAmount) || 0,
+        salaryAmount: Number(b.salaryAmount) || 0,
+        overtimeAmount: Number(b.overtimeAmount) || 0,
+        amount: Number(b.amount),
+        method: b.method || "Cash",
+        paidBy: b.paidBy || null,
+        notes: b.notes || null,
+      })
+      .returning();
+    return NextResponse.json(row, { status: 201 });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+  }
+}

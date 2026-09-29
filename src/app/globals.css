@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+@theme {
+  --color-matesther-50: #eef7f0;
+  --color-matesther-100: #d7ecdc;
+  --color-matesther-200: #b0d9bb;
+  --color-matesther-600: #166b3d;
+  --color-matesther-700: #0f5230;
+  --color-matesther-800: #0c4227;
+  --color-matesther-900: #0a3520;
+  --color-matesther-950: #071f13;
+  --color-gold-400: #d9b545;
+  --color-gold-500: #c9a227;
+  --color-gold-600: #a9861f;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+/* thin scrollbars for kanban + tables */
+.slim-scroll::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+.slim-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 8px;
+}
+.slim-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.fade-up {
+  animation: fadeUp 0.35s ease both;
+}
+
+/* Customer-facing A4 documents inspired by Matesther's printed letterhead. */
+.matesther-letter {
+  width: min(210mm, 100%);
+  min-height: 297mm;
+  margin-inline: auto;
+  padding: 13mm 16mm 11mm;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  isolation: isolate;
+  background: #fff;
+  box-shadow: 0 18px 55px rgba(22, 34, 28, .13);
+  overflow: hidden;
+}
+.matesther-letter::before {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  z-index: -1;
+  inset: 33% 3% 13%;
+  opacity: .045;
+  background: linear-gradient(140deg, transparent 20%, #81a93c 20% 34%, transparent 34% 58%, #83a942 58% 71%, transparent 71%);
+  transform: rotate(-7deg);
+}
+.letter-header { text-align: center; }
+.letter-logo-wrap { display: flex; justify-content: center; }
+.letter-brand {
+  margin-top: 2mm;
+  font: 700 clamp(30px, 5vw, 44px)/1.08 Georgia, "Times New Roman", serif;
+  letter-spacing: -.035em;
+  color: #a4573c;
+  text-shadow: .7px .7px #d1ae62;
+}
+.letter-tagline { margin-top: 1mm; font: italic 600 13px Georgia, serif; color: #5d713f; }
+.letter-contact { margin: 3mm auto 5mm; max-width: 155mm; font-size: 11px; line-height: 1.55; font-weight: 600; color: #303334; }
+.letter-color-rule { display: flex; width: 100%; height: 6px; overflow: hidden; transform: skewY(-1.3deg); }
+.letter-color-rule span:first-child { width: 52%; background: #af644d; }
+.letter-color-rule span:last-child { flex: 1; background: #b2c76c; }
+.letter-references { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 8mm 1mm 4mm; font-size: 11px; text-align: left; }
+.letter-references p:last-child { text-align: right; }
+.letter-references strong { color: #a4573c; }
+.letter-references span { border-bottom: 1px solid #b2c76c; padding: 0 2px 2px; }
+.letter-body { flex: 1; font-size: 13px; line-height: 1.6; }
+.letter-heading { text-align: center; margin: 5mm 0 8mm; }
+.letter-kicker { font-size: 10px; font-weight: 800; letter-spacing: .2em; color: #788d4c; }
+.letter-heading h2 { margin: 3px 0 0; font: 700 25px/1.25 Georgia, "Times New Roman", serif; color: #292724; letter-spacing: .02em; }
+.letter-subtitle { font-size: 12px; color: #6b6b67; margin-top: 2mm; }
+.letter-section-title { margin-top: 8mm; font: 700 14px Georgia, serif; color: #30312e; }
+.letter-table { border-collapse: collapse; width: 100%; margin-top: 3mm; font-size: 12px; }
+.letter-table thead { background: #f3f5e9; border-block: 1px solid #9aaf62; }
+.letter-table th { text-align: left; padding: 8px 10px; color: #3c4e38; font-size: 11px; }
+.letter-table td { padding: 9px 10px; border-bottom: 1px solid #e9ecdf; vertical-align: top; }
+.letter-table th:last-child, .letter-table td:last-child { text-align: right; }
+.letter-table tfoot { border-top: 1.5px solid #9aaf62; font-weight: 700; }
+.letter-total-box { border: 1px solid #cad2b0; background: #f9fbf4; padding: 14px 18px; }
+.letter-footer { margin-top: 14mm; font-size: 11px; break-inside: avoid; }
+.letter-footer .letter-color-rule { height: 5px; transform: skewY(1deg); }
+.letter-footer-row { display: flex; align-items: center; gap: 10px; padding-top: 5mm; color: #829c47; font-style: italic; font-weight: 700; line-height: 1.4; }
+.letter-table tr, .letter-heading, .letter-references { break-inside: avoid; }
+@media print {
+  @page { size: A4 portrait; margin: 10mm; }
+  html, body { background: white !important; margin: 0 !important; padding: 0 !important; }
+  .no-print, .document-actions { display: none !important; }
+  .document-page { padding: 0 !important; background: #fff !important; }
+  .matesther-letter { width: 100%; min-height: 276mm; margin: 0; padding: 2mm 4mm 0; box-shadow: none; overflow: visible; }
+  .matesther-letter, .matesther-letter * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .letter-brand { font-size: 40px; }
+  .letter-table thead { display: table-header-group; }
+  .letter-table tr { break-inside: avoid; }
+}
