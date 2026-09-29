@@ -1,6 +1,6 @@
 "use client";
 
-import React, { ReactNode } from "react";
+import React, { ReactNode, useEffect } from "react";
 import Link from "next/link";
 import { statusColor } from "@/lib/format";
 import { Loader2 } from "lucide-react";
@@ -15,7 +15,7 @@ export function Card({
 }) {
   return (
     <div
-      className={`bg-white rounded-xl border border-slate-200 shadow-[0_1px_3px_rgba(0,0,0,0.05)] ${className}`}
+      className={`min-w-0 rounded-xl border border-slate-200 bg-white shadow-[0_1px_3px_rgba(0,0,0,0.05)] ${className}`}
     >
       {children}
     </div>
@@ -32,12 +32,12 @@ export function CardHeader({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between gap-3 px-5 pt-4 pb-3 border-b border-slate-100">
-      <div>
-        <h3 className="font-semibold text-slate-900 text-[15px]">{title}</h3>
-        {subtitle && <p className="text-xs text-slate-500 mt-0.5">{subtitle}</p>}
+    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 px-4 pb-3 pt-4 sm:flex-nowrap sm:px-5">
+      <div className="min-w-0 flex-1">
+        <h3 className="break-words text-[15px] font-semibold text-slate-900">{title}</h3>
+        {subtitle && <p className="mt-0.5 break-words text-xs text-slate-500">{subtitle}</p>}
       </div>
-      {action}
+      {action && <div className="flex max-w-full flex-wrap items-center gap-2">{action}</div>}
     </div>
   );
 }
@@ -67,14 +67,14 @@ export function StatCard({
   };
   const card = (
     <div
-      className={`rounded-xl border bg-white p-4 flex items-start gap-3 transition-all ${
+      className={`flex min-w-0 items-start gap-2 rounded-xl border bg-white p-3 transition-all sm:gap-3 sm:p-4 ${
         href
           ? "border-slate-200 hover:border-matesther-600 hover:shadow-md cursor-pointer"
           : "border-slate-200 shadow-[0_1px_3px_rgba(0,0,0,0.05)]"
       }`}
     >
       <div
-        className={`w-10 h-10 rounded-lg ${tones[tone]} text-white flex items-center justify-center shrink-0`}
+        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white sm:h-10 sm:w-10 ${tones[tone]}`}
       >
         {icon}
       </div>
@@ -82,7 +82,7 @@ export function StatCard({
         <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
           {label}
         </p>
-        <p className="text-xl font-bold text-slate-900 truncate">{value}</p>
+        <p className="break-words text-[clamp(0.95rem,3.8vw,1.25rem)] font-bold leading-tight tracking-tight text-slate-900">{value}</p>
         {sub && <p className="text-xs text-slate-500 mt-0.5">{sub}</p>}
         {href && (
           <p className="text-[10px] font-bold text-matesther-700 mt-1 opacity-0 transition-opacity group-hover:opacity-100">
@@ -149,29 +149,25 @@ export function Modal({
   children: ReactNode;
   wide?: boolean;
 }) {
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => { document.body.style.overflow = previous; window.removeEventListener("keydown", onKey); };
+  }, [open, onClose]);
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div
-        className="absolute inset-0 bg-slate-950/50"
-        onClick={onClose}
-      />
-      <div
-        className={`relative bg-white rounded-xl shadow-2xl w-full ${
-          wide ? "max-w-3xl" : "max-w-lg"
-        } max-h-[92vh] overflow-y-auto slim-scroll fade-up`}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100 sticky top-0 bg-white rounded-t-xl">
-          <h3 className="font-semibold text-slate-900">{title}</h3>
-          <button
-            onClick={onClose}
-            className="text-slate-400 hover:text-slate-700 text-xl leading-none px-2"
-            aria-label="Close"
-          >
-            ×
-          </button>
+    <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center sm:p-4">
+      <div className="absolute inset-0 bg-slate-950/60" onClick={onClose} aria-hidden="true" />
+      <div role="dialog" aria-modal="true" aria-label={title}
+        className={`relative max-h-[96dvh] w-full overflow-y-auto overscroll-contain rounded-t-2xl bg-white shadow-2xl slim-scroll fade-up sm:max-h-[92dvh] sm:rounded-xl ${wide ? "sm:max-w-3xl" : "sm:max-w-lg"}`}>
+        <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-t-2xl border-b border-slate-100 bg-white px-4 py-3 sm:px-5 sm:py-4">
+          <h3 className="min-w-0 break-words text-sm font-semibold text-slate-900 sm:text-base">{title}</h3>
+          <button type="button" onClick={onClose} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-2xl text-slate-500 hover:bg-slate-100 hover:text-slate-900" aria-label="Close dialog">×</button>
         </div>
-        <div className="p-5">{children}</div>
+        <div className="p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-5">{children}</div>
       </div>
     </div>
   );
@@ -198,7 +194,7 @@ export function Field({
 }
 
 export const inputCls =
-  "w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-matesther-700/40 focus:border-matesther-700 bg-white";
+  "min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-base outline-none focus:border-matesther-700 focus:ring-2 focus:ring-matesther-700/40 sm:text-sm";
 
 export function Btn({
   children,
@@ -227,7 +223,7 @@ export function Btn({
       type={type}
       onClick={onClick}
       disabled={disabled}
-      className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${styles[variant]} ${className}`}
+      className={`inline-flex min-h-11 items-center justify-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${styles[variant]} ${className}`}
     >
       {children}
     </button>
@@ -268,14 +264,12 @@ export function PageHeader({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
-      <div>
-        <h1 className="text-xl sm:text-2xl font-bold text-slate-900">{title}</h1>
-        {subtitle && (
-          <p className="text-sm text-slate-500 mt-1">{subtitle}</p>
-        )}
+    <div className="mb-5 flex min-w-0 flex-wrap items-start justify-between gap-3">
+      <div className="min-w-0 flex-1 basis-60">
+        <h1 className="break-words text-xl font-bold text-slate-900 sm:text-2xl">{title}</h1>
+        {subtitle && <p className="mt-1 break-words text-sm leading-relaxed text-slate-500">{subtitle}</p>}
       </div>
-      {action && <div className="flex gap-2">{action}</div>}
+      {action && <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">{action}</div>}
     </div>
   );
 }

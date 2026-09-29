@@ -4,6 +4,7 @@ import { sql } from "drizzle-orm";
 import { db } from "@/db";
 import { organizations, users } from "@/db/schema";
 import { hashPassword } from "@/lib/password";
+import { rejectCrossSiteMutation } from "@/lib/request-security";
 
 function keysMatch(input: string, expected: string): boolean {
   const hash = (s: string) => createHash("sha256").update(s).digest();
@@ -15,6 +16,8 @@ function keysMatch(input: string, expected: string): boolean {
  * variable prevents a stranger from claiming the first owner account.
  */
 export async function POST(req: Request) {
+  const crossSite = rejectCrossSiteMutation(req);
+  if (crossSite) return crossSite;
   const setupKey = process.env.MATESTHER_SETUP_KEY;
   if (!setupKey)
     return NextResponse.json(

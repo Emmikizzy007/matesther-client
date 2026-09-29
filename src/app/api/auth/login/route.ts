@@ -4,6 +4,7 @@ import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { verifyPassword } from "@/lib/password";
 import { attachNewSession, clearExpiredSessions } from "@/lib/session";
+import { rejectCrossSiteMutation } from "@/lib/request-security";
 
 // Per-instance throttling is a small first barrier; use an edge/WAF rate limit for internet-facing deployments.
 const attempts = new Map<string, { count: number; first: number }>();
@@ -19,6 +20,8 @@ function rateLimited(key: string) {
 }
 
 export async function POST(req: Request) {
+  const crossSite = rejectCrossSiteMutation(req);
+  if (crossSite) return crossSite;
   try {
     const body = await req.json();
     const email = String(body.email ?? "").trim().toLowerCase();

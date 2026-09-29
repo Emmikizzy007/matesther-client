@@ -4,7 +4,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { ArrowRight, CheckCircle2, Plus, Scissors } from "lucide-react";
 import { Card, Field, Loading, PageHeader, inputCls, Btn } from "@/components/ui";
-import { fmtDate, stageLabel } from "@/lib/format";
+import { fmtDate } from "@/lib/format";
 
 type ProductionItem = { id: number; name: string; quantity: number; sizes: { size: string; quantity: number }[];
   assigned: { size: string | null; color: string | null; quantity: number }[] };
@@ -17,6 +17,7 @@ const newForm = (): Form => ({ orderId: "", itemId: "", size: "", color: "", qua
 export default function AssignProductionPage() {
   const [orders, setOrders] = useState<ProductionOrder[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
+  const [canAssignCutting, setCanAssignCutting] = useState(false);
   const [form, setForm] = useState<Form>(newForm);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -27,13 +28,18 @@ export default function AssignProductionPage() {
     setLoading(true);
     setError("");
     try {
-      const [orderResponse, workerResponse] = await Promise.all([
+      const [orderResponse, workerResponse, accessResponse] = await Promise.all([
         fetch("/api/production-orders", { cache: "no-store" }),
         fetch("/api/workers", { cache: "no-store" }),
+        fetch("/api/production-access", { cache: "no-store" }),
       ]);
-      const [orderData, workerData] = await Promise.all([orderResponse.json(), workerResponse.json()]);
+      const [orderData, workerData, accessData] = await Promise.all([orderResponse.json(), workerResponse.json(), accessResponse.json()]);
       if (!orderResponse.ok) throw new Error(orderData.error || "Could not load production orders.");
       if (!workerResponse.ok) throw new Error(workerData.error || "Could not load available workers.");
+      if (!accessResponse.ok) throw new Error(accessData.error || "Could not verify assignment permissions.");
+      const cuttingAllowed = accessData.canAssignCutting === true;
+      setCanAssignCutting(cuttingAllowed);
+      if (!cuttingAllowed) setForm((current) => ({ ...current, cutterId: "", cuttingRate: "" }));
       setOrders(Array.isArray(orderData) ? orderData : []);
       setWorkers(Array.isArray(workerData) ? workerData : []);
     } catch (cause) {
@@ -70,8 +76,8 @@ export default function AssignProductionPage() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           orderId: order.id, orderItemId: item.id, quantity,
-          size: form.size, color: form.color.trim(), workerId: form.cutterId || null,
-          cuttingRate: cutter?.paymentType === "PER_PIECE" ? Number(form.cuttingRate) : null,
+          size: form.size, color: form.color.trim(), workerId: canAssignCutting ? form.cutterId || null : null,
+          cuttingRate: canAssignCutting && cutter?.paymentType === "PER_PIECE" ? Number(form.cuttingRate) : null,
           tailorId: form.tailorId || null,
           sewingRate: tailor?.paymentType === "PER_PIECE" ? Number(form.sewingRate) : null,
           expectedCompletionDate: form.expectedCompletionDate || null,
@@ -118,9 +124,9 @@ export default function AssignProductionPage() {
             <div className="self-end rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">{item ? <><strong>{available}</strong> garment{available === 1 ? "" : "s"} left to allocate{size ? ` for size ${size.size}` : ""}.</> : "Select a garment to see the available quantity."}{order?.dueDate && <span className="block mt-1">School deadline: {fmtDate(order.dueDate)}</span>}</div>
           </div>
           <div className="rounded-xl border border-slate-200 p-4"><p className="mb-3 text-sm font-bold text-slate-800">Cutting assignment</p>
-            <div className="grid gap-3 sm:grid-cols-2"><Field label="Cutter"><select className={inputCls} value={form.cutterId} onChange={(event) => setForm({ ...form, cutterId: event.target.value, cuttingRate: "" })}><option value="">Assign later</option>{workers.filter((person) => person.status === "ACTIVE" && person.specialty === "Cutter").map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>
+            {canAssignCutting ? <div className="grid gap-3 sm:grid-cols-2"><Field label="Cutter"><select className={inputCls} value={form.cutterId} onChange={(event) => setForm({ ...form, cutterId: event.target.value, cuttingRate: "" })}><option value="">Assign later</option>{workers.filter((person) => person.status === "ACTIVE" && person.specialty === "Cutter").map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>
               {cutter?.paymentType === "PER_PIECE" && <Field label="Agreed pay per approved piece (₦) *"><input className={inputCls} type="number" min="1" step="1" required value={form.cuttingRate} onChange={(event) => setForm({ ...form, cuttingRate: event.target.value })} /></Field>}
-            </div>
+            </div> : <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-relaxed text-amber-900">As a cutter-supervisor, you can prepare this batch and assign its Tailor. The Owner or a non-cutting supervisor must choose the Cutter and their agreed rate before Cutting begins.</p>}
           </div>
           <div className="rounded-xl border border-slate-200 p-4"><p className="mb-3 text-sm font-bold text-slate-800">Sewing assignment</p>
             <div className="grid gap-3 sm:grid-cols-2"><Field label="Tailor"><select className={inputCls} value={form.tailorId} onChange={(event) => setForm({ ...form, tailorId: event.target.value, sewingRate: "" })}><option value="">Assign after cutting</option>{workers.filter((person) => person.status === "ACTIVE" && person.specialty === "Tailor").map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>

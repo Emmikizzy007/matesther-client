@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { sessions, users, workers } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { hashSessionToken, readSessionToken } from "@/lib/session";
+import { rejectCrossSiteMutation } from "@/lib/request-security";
 
 /** Role groups for API authorization. */
 export const OWNER = ["OWNER"];
@@ -51,6 +52,8 @@ export async function getSessionUser(req: Request): Promise<SessionUser | null> 
 
 /** API guard: 401 without a session; 403 for the wrong role. */
 export async function guard(req: Request, roles: string[]) {
+  const crossSite = rejectCrossSiteMutation(req);
+  if (crossSite) return crossSite;
   const user = await getSessionUser(req);
   if (!user)
     return NextResponse.json(
@@ -74,7 +77,7 @@ function comparableName(value: string): string {
  * Never match a substring or return another worker's production history.
  */
 export async function getLinkedWorkerId(user: SessionUser): Promise<number | null> {
-  if (!(["WORKER", "PRODUCTION_MANAGER"] as string[]).includes(user.role) || !user.organizationId) return null;
+  if (!["WORKER", "PRODUCTION_MANAGER"].includes(user.role) || !user.organizationId) return null;
   // Supervisors opt in to the factory role through Users. Regular Workers can
   // still be added before their Workers record and matched unambiguously later.
   if (user.role === "PRODUCTION_MANAGER" && !user.workerId) return null;
@@ -95,4 +98,18 @@ export async function getLinkedWorkerId(user: SessionUser): Promise<number | nul
   const competing = accounts.some((account) => account.id !== user.id && ["WORKER", "PRODUCTION_MANAGER"].includes(account.role) &&
     (account.workerId === candidates[0].id || comparableName(account.name) === name));
   return competing ? null : candidates[0].id;
+}
+
+/** Self-dealing safeguards for a supervisor who is also a Cutter. */
+export async function productionAccess(user: SessionUser) {
+  const workerId = user.role === "PRODUCTION_MANAGER" ? await getLinkedWorkerId(user) : null;
+  const [profile] = workerId
+    ? await db.select({ specialty: workers.specialty }).from(workers).where(eq(workers.id, workerId)).limit(1)
+    : [];
+  const cutterSupervisor = user.role === "PRODUCTION_MANAGER" && profile?.specialty.toLowerCase() === "cutter";
+  return {
+    workerId,
+    cutterSupervisor,
+    canAssignCutting: user.role === "OWNER" || (user.role === "PRODUCTION_MANAGER" && !cutterSupervisor),
+  };
 }

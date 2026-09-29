@@ -8,7 +8,7 @@ import { fmtDate, stageLabel } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 
 type QueueJob = { id: number; orderId: number | null; orderNumber: string; customer: string; stage: string;
-  garment: string | null; size: string | null; color: string | null; batchNumber: string; workerName: string | null;
+  garment: string | null; size: string | null; color: string | null; batchNumber: string; workerName: string | null; workerId: number | null;
   pendingInspection: number; expectedCompletionDate: string | null; quantityCompleted: number; quantityApproved: number };
 type Inspection = { id: number; orderId: number | null; orderNumber: string; customer: string; stage: string;
   batchNumber: string; inspectedBy: string; inspectedAt: string | null; quantityApproved: number;
@@ -32,6 +32,7 @@ export default function InspectionQueuePage() {
   const { user } = useAuth();
   const [data, setData] = useState<QueueData | null>(null);
   const [inspectors, setInspectors] = useState<{ id: number; name: string; specialty: string }[]>([]);
+  const [ownWorkerId, setOwnWorkerId] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("awaiting");
   const [search, setSearch] = useState("");
   const [openGroup, setOpenGroup] = useState<string | null>(null);
@@ -45,16 +46,25 @@ export default function InspectionQueuePage() {
   async function load(openRequested = false) {
     setError("");
     try {
-      const response = await fetch("/api/dashboard?view=pm", { cache: "no-store" });
-      const result = await response.json();
+      const [response, accessResponse] = await Promise.all([
+        fetch("/api/dashboard?view=pm", { cache: "no-store" }),
+        fetch("/api/production-access", { cache: "no-store" }),
+      ]);
+      const [result, access] = await Promise.all([response.json(), accessResponse.json()]);
       if (!response.ok || !Array.isArray(result.inspection?.awaiting) || !Array.isArray(result.inspection?.recentApproved) || !Array.isArray(result.inspection?.reworkRequired))
         throw new Error(result.error || "Could not load submitted work.");
+      if (!accessResponse.ok) throw new Error(access.error || "Could not verify inspector permissions.");
+      setOwnWorkerId(typeof access.workerId === "number" ? access.workerId : null);
       setData(result);
       setOpenGroup((current) => current ?? (result.inspection.awaiting[0]?.orderId ? String(result.inspection.awaiting[0].orderId) : null));
       if (openRequested) {
         const requestedId = new URLSearchParams(window.location.search).get("op");
         const found = result.inspection.awaiting.find((job: QueueJob) => String(job.id) === requestedId);
-        if (found) inspect(found);
+        if (found) {
+          if (user?.role === "PRODUCTION_MANAGER" && typeof access.workerId === "number" && found.workerId === access.workerId)
+            setNotice("You cannot inspect your own production work. Ask the Owner or a different supervisor to inspect this job.");
+          else inspect(found);
+        }
       }
       // Workers list is optional supporting context; it must not block the queue.
       fetch("/api/workers", { cache: "no-store" })
@@ -66,6 +76,10 @@ export default function InspectionQueuePage() {
   useEffect(() => { void load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
   function inspect(job: QueueJob) {
+    if (user?.role === "PRODUCTION_MANAGER" && ownWorkerId !== null && job.workerId === ownWorkerId) {
+      setNotice("You cannot inspect your own production work. Ask the Owner or a different supervisor to inspect this job.");
+      return;
+    }
     setSelected(job);
     setSplit({ approved: String(job.pendingInspection), rework: "0", rejected: "0", notes: "" });
     setFormError("");
@@ -145,7 +159,9 @@ export default function InspectionQueuePage() {
                   <p className="mt-1 text-xs text-slate-500">{job.batchNumber} • {job.workerName || "Unassigned"}{job.expectedCompletionDate ? ` • Expected ${fmtDate(job.expectedCompletionDate)}` : ""}</p></div>
                 <div className="text-right"><p className="text-xl font-extrabold text-violet-700">{job.pendingInspection}</p><p className="text-[11px] text-slate-500">pieces to check</p></div>
               </div>
-              <button type="button" onClick={() => inspect(job)} className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-matesther-800 px-4 text-sm font-bold text-white hover:bg-matesther-900 sm:w-auto"><ClipboardCheck className="h-4 w-4" /> Inspect this job</button>
+              {user?.role === "PRODUCTION_MANAGER" && ownWorkerId !== null && job.workerId === ownWorkerId
+                ? <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs font-semibold text-amber-900">Your work: the Owner or a different supervisor must inspect it.</p>
+                : <button type="button" onClick={() => inspect(job)} className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-matesther-800 px-4 text-sm font-bold text-white hover:bg-matesther-900 sm:w-auto"><ClipboardCheck className="h-4 w-4" /> Inspect this job</button>}
             </div>) : (group.rows as Inspection[]).map((record) => <div key={record.id} className="px-4 py-3 sm:px-5">
               <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-semibold text-slate-900">{stageLabel(record.stage)} <span className="font-normal text-slate-500">• {record.batchNumber}</span></p><span className="text-xs text-slate-500">{fmtDate(record.inspectedAt)}</span></div>
               <p className="mt-1 flex flex-wrap gap-2 text-xs"><span className="font-semibold text-emerald-700"><CheckCircle2 className="mr-0.5 inline h-3 w-3" />{record.quantityApproved} approved</span>{record.quantityRework > 0 && <span className="font-semibold text-amber-700"><RefreshCcw className="mr-0.5 inline h-3 w-3" />{record.quantityRework} rework</span>}{record.quantityRejected > 0 && <span className="font-semibold text-red-700"><XCircle className="mr-0.5 inline h-3 w-3" />{record.quantityRejected} rejected</span>}</p>

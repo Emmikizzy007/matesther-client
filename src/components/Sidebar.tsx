@@ -30,7 +30,7 @@ import {
   Menu,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAuth, roleLabel, Role } from "@/lib/auth";
 import { BrandLogo } from "@/components/BrandLogo";
 
@@ -160,6 +160,15 @@ export default function Sidebar() {
   const { user, logout } = useAuth();
   const [open, setOpen] = useState(false);
 
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => { document.body.style.overflow = previous; window.removeEventListener("keydown", onKey); };
+  }, [open]);
+
   const groups = navForRole(user?.role ?? "WORKER");
 
   const list = (
@@ -234,11 +243,12 @@ export default function Sidebar() {
       {open && (
         <div className="lg:hidden fixed inset-0 z-50">
           <div className="absolute inset-0 bg-slate-950/60" onClick={() => setOpen(false)} />
-          <div className="relative w-72 h-full bg-matesther-900 flex flex-col">
-            <Brand />
-            <div className="flex-1 min-h-0 overflow-y-auto slim-scroll">
-              {list}
+          <div className="relative flex h-[100dvh] w-[min(88vw,320px)] flex-col bg-matesther-900 shadow-2xl" role="dialog" aria-modal="true" aria-label="Matesther navigation">
+            <div className="flex items-center justify-between border-b border-white/10 pr-3">
+              <Brand />
+              <button type="button" onClick={() => setOpen(false)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-white hover:bg-white/10" aria-label="Close navigation"><X className="h-5 w-5" /></button>
             </div>
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain slim-scroll">{list}</div>
             {userBox}
           </div>
         </div>

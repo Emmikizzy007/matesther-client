@@ -124,9 +124,10 @@ function OwnerDashboard({ d }: any) {
             subtitle="The history of Matesther's progress, month by month, with a year-end valuation"
             action={<Link href="/reports" className="text-xs font-medium text-matesther-700 hover:underline flex items-center gap-1">Full reports <ChevronRight className="w-3.5 h-3.5" /></Link>}
           />
-          <div className="p-5">
-            <div className="flex items-end gap-2 sm:gap-5 h-44">
-              {growth.months.map((m: any) => (
+           <div className="p-4 sm:p-5">
+             <div className="overflow-x-auto pb-2 slim-scroll" aria-label="Monthly business growth chart. Scroll sideways to see more months.">
+             <div className="flex h-44 items-end gap-3 sm:gap-5" style={{ minWidth: Math.max(560, growth.months.length * 86) }}>
+               {growth.months.map((m: any) => (
                 <div key={m.key} className="flex-1 h-full flex flex-col items-center justify-end">
                   <div className="w-full flex items-end justify-center gap-0.5 sm:gap-1 h-full">
                     <div
@@ -147,14 +148,15 @@ function OwnerDashboard({ d }: any) {
                   </div>
                   <p className="text-[10px] font-bold text-slate-500 mt-1.5">{m.label}</p>
                   <p className={`text-[10px] font-semibold ${m.profit >= 0 ? "text-matesther-700" : "text-red-600"}`}>{naira(m.profit)}</p>
-                </div>
-              ))}
-            </div>
-            <div className="flex flex-wrap gap-4 text-[11px] text-slate-500 mt-4">
+                 </div>
+               ))}
+             </div>
+             </div>
+             <div className="flex flex-wrap gap-4 text-[11px] text-slate-500 mt-4">
               <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-matesther-600 inline-block" /> Revenue (orders received)</span>
               <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-red-400 inline-block" /> Expenses (spent + materials used)</span>
               <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-gold-500 inline-block" /> Profit</span>
-              <span className="text-slate-400">Hover a bar for the exact figure</span>
+               <span className="text-slate-400">Swipe for more months on a phone. Hold a bar for the exact amount.</span>
             </div>
 
             {/* Year valuations */}
@@ -367,12 +369,19 @@ function ProductionDashboard({ d }: any) {
       </Card>
 
       <SectionTitle title="Worker Activity" right={<Link href="/workers" className="text-xs font-semibold text-matesther-700 hover:underline">Workers</Link>} />
-      <Card className="mb-5">
-        <div className="overflow-x-auto slim-scroll">
-          <table className="w-full text-sm min-w-[640px]">
-            <thead>
-              <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">
-                <th className="px-5 py-3">Worker</th>
+       <Card className="mb-5">
+         <div className="divide-y divide-slate-100 sm:hidden">
+           {d.workerActivity.map((w: any) => <div key={w.name} className="p-4">
+             <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="font-semibold text-slate-900">{w.name}</p><p className="text-xs text-slate-500">{w.specialty}</p></div>{w.overdue > 0 && <span className="rounded-full bg-red-50 px-2 py-1 text-xs font-semibold text-red-700">{w.overdue} overdue</span>}</div>
+             <div className="mt-3 grid grid-cols-3 gap-2 rounded-lg bg-slate-50 p-2 text-center text-xs"><div><p className="text-slate-500">Active</p><strong className="text-sm">{w.activeJobs}</strong></div><div><p className="text-slate-500">Submitted</p><strong className="text-sm">{w.submitted}</strong></div><div><p className="text-slate-500">Approved</p><strong className="text-sm text-matesther-700">{w.approved}</strong></div></div>
+           </div>)}
+           {d.workerActivity.length === 0 && <p className="p-5 text-sm text-slate-500">No worker activity.</p>}
+         </div>
+         <div className="hidden overflow-x-auto slim-scroll sm:block">
+           <table className="w-full text-sm min-w-[640px]">
+             <thead>
+               <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">
+                 <th className="px-5 py-3">Worker</th>
                 <th className="px-3 py-3">Specialty</th>
                 <th className="px-3 py-3 text-right">Active Jobs</th>
                 <th className="px-3 py-3 text-right">Assigned</th>

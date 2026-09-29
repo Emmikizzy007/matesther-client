@@ -19,6 +19,8 @@ const COL_LABEL: Record<string, string> = {
 export default function ProductionPage() {
   const [ops, setOps] = useState<any[]>([]);
   const [workers, setWorkers] = useState<any[]>([]);
+  const [canAssignCutting, setCanAssignCutting] = useState(false);
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [stage, setStage] = useState(() => {
@@ -32,13 +34,18 @@ export default function ProductionPage() {
   function load() {
     setLoading(true);
     Promise.all([
-      fetch("/api/operations", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers", { cache: "no-store" }).then((r) => r.json()),
+      fetch("/api/operations", { cache: "no-store" }),
+      fetch("/api/workers", { cache: "no-store" }),
+      fetch("/api/production-access", { cache: "no-store" }),
     ])
-      .then(([o, w]) => {
+      .then(async ([jobs, people, access]) => {
+        const [o, w, rights] = await Promise.all([jobs.json(), people.json(), access.json()]);
+        if (!jobs.ok || !people.ok || !access.ok) throw new Error(o.error || w.error || rights.error || "Unable to load production.");
         setOps(Array.isArray(o) ? o : []);
         setWorkers(Array.isArray(w) ? w : []);
+        setCanAssignCutting(rights.canAssignCutting === true);
       })
+      .catch((cause) => setErr(cause instanceof Error ? cause.message : "Unable to load production."))
       .finally(() => setLoading(false));
   }
   useEffect(load, []);
@@ -78,8 +85,9 @@ export default function ProductionPage() {
     <div>
       <PageHeader
         title="Active Production"
-        subtitle="Every production job by stage. Workers submit finished pieces; only inspected & approved pieces move to the next stage."
+        subtitle="Every production job by stage. Workers submit finished pieces; only inspected and approved pieces move to the next stage."
       />
+      {notice && <div role="status" className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{notice}</div>}
       <Card className="mb-4 p-3 flex flex-wrap gap-3">
         <div className="relative flex-1 min-w-[200px]">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -116,8 +124,16 @@ export default function ProductionPage() {
                   {items.map((o) => (
                     <button
                       key={o.id}
-                      onClick={() => { setErr(""); setSelected({ ...o }); }}
-                      className="w-full text-left bg-white rounded-lg border border-slate-200 p-3 shadow-sm hover:border-matesther-600 transition-colors"
+                      onClick={() => {
+                        setErr("");
+                        if (o.stage === "CUTTING" && !canAssignCutting) {
+                          setNotice("Cutting jobs are view-only for cutter-supervisors. The Owner or a non-cutting supervisor assigns Cutters. Submit your own finished Cutting work from My Jobs.");
+                          return;
+                        }
+                        setNotice("");
+                        setSelected({ ...o });
+                      }}
+                      className={`w-full rounded-lg border bg-white p-3 text-left shadow-sm transition-colors ${o.stage === "CUTTING" && !canAssignCutting ? "border-amber-200" : "border-slate-200 hover:border-matesther-600"}`}
                     >
                       <div className="flex items-center justify-between">
                         <span className="text-[11px] font-bold uppercase tracking-wide text-matesther-800">
@@ -148,6 +164,7 @@ export default function ProductionPage() {
                       <p className="text-[11px] text-slate-500 mt-1.5">
                         Due {fmtDate(o.expectedCompletionDate)} • Order due {fmtDate(o.dueDate)}
                       </p>
+                      {o.stage === "CUTTING" && !canAssignCutting && <p className="mt-1.5 text-[11px] font-semibold text-amber-800">View only • Owner assigns Cutters</p>}
                     </button>
                   ))}
                   {items.length === 0 && (

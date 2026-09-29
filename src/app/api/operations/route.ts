@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { productionOperations, productionBatches, orders, customers, workers, orderItems, products } from "@/db/schema";
 import { refreshBatchAndOrder } from "@/lib/server";
-import { guard, getSessionUser, getLinkedWorkerId, ANYONE } from "@/lib/authz";
+import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE } from "@/lib/authz";
 
 const STATUSES = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD", "CANCELLED"];
 const STAGE_SPECIALTIES: Record<string, string> = {
@@ -69,7 +69,13 @@ export async function PUT(req: Request) {
     const [current] = await db.select().from(productionOperations).where(eq(productionOperations.id, id)).limit(1);
     if (!current) return NextResponse.json({ error: "Job not found." }, { status: 404 });
     const session = await getSessionUser(req);
-    if (session?.role === "WORKER" || (session?.role === "PRODUCTION_MANAGER" && body.submitQty !== undefined)) {
+    if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
+    const access = session.role === "PRODUCTION_MANAGER" ? await productionAccess(session) : null;
+    if (session.role === "PRODUCTION_MANAGER" && access?.cutterSupervisor && current.stage === "CUTTING" && body.submitQty === undefined)
+      return NextResponse.json({
+        error: "A cutter-supervisor cannot assign, change or complete Cutting jobs. An Owner or non-cutting supervisor must handle Cutting. Submit your own pieces through My Jobs.",
+      }, { status: 403 });
+    if (session.role === "WORKER" || (session.role === "PRODUCTION_MANAGER" && body.submitQty !== undefined)) {
       const workerId = await getLinkedWorkerId(session);
       if (!workerId || current.workerId !== workerId)
         return NextResponse.json({ error: "You can only submit your own assigned jobs." }, { status: 403 });
@@ -92,8 +98,10 @@ export async function PUT(req: Request) {
     const workerId = body.workerId === undefined ? current.workerId : body.workerId ? Number(body.workerId) : null;
     const changedWorker = workerId !== current.workerId;
     const [person] = workerId ? await db.select().from(workers).where(eq(workers.id, workerId)).limit(1) : [];
-    if (workerId && (!person || person.status !== "ACTIVE" || person.organizationId !== session?.organizationId))
+    if (workerId && (!person || person.status !== "ACTIVE" || person.organizationId !== session.organizationId))
       return NextResponse.json({ error: "Choose an active Matesther worker." }, { status: 400 });
+    if (access?.cutterSupervisor && person?.specialty.toLowerCase() === "cutter" && workerId !== current.workerId)
+      return NextResponse.json({ error: "Cutter assignments must be made by the Owner or a non-cutting supervisor." }, { status: 403 });
     if (person && STAGE_SPECIALTIES[current.stage] && person.specialty.toLowerCase() !== STAGE_SPECIALTIES[current.stage].toLowerCase())
       return NextResponse.json({ error: `${current.stage.replaceAll("_", " ")} needs a ${STAGE_SPECIALTIES[current.stage]}.` }, { status: 400 });
     if (changedWorker && (current.quantityCompleted > 0 || current.quantityInspected > 0 || current.quantityApproved > 0))

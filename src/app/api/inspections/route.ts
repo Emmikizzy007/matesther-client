@@ -10,7 +10,7 @@ import {
 } from "@/db/schema";
 import { eq, and, desc } from "drizzle-orm";
 import { refreshBatchAndOrder } from "@/lib/server";
-import { guard, getSessionUser, getLinkedWorkerId, ANYONE, STAFF } from "@/lib/authz";
+import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE, STAFF } from "@/lib/authz";
 
 /**
  * GET /api/inspections?operationId=&orderId=
@@ -108,6 +108,13 @@ export async function POST(req: Request) {
       .from(productionOperations)
       .where(eq(productionOperations.id, opId));
     if (!op) return NextResponse.json({ error: "Operation not found." }, { status: 404 });
+    if (inspector.role === "PRODUCTION_MANAGER") {
+      const access = await productionAccess(inspector);
+      if (access.workerId && op.workerId === access.workerId)
+        return NextResponse.json({
+          error: "You cannot inspect your own production work. Ask the Owner or another supervisor to inspect this job.",
+        }, { status: 403 });
+    }
     const [assigned] = op.workerId ? await db.select().from(workers).where(eq(workers.id, op.workerId)).limit(1) : [];
     const agreedRate = assigned?.paymentType === "PER_PIECE" ? op.pieceRate ?? assigned.paymentRate : null;
 

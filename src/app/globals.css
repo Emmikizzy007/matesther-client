@@ -36,6 +36,42 @@ body {
   background: transparent;
 }
 
+/* Keep cards, tables and long school names inside phone viewports. */
+body { overflow-x: clip; }
+main { min-width: 0; }
+.slim-scroll { overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; }
+:focus-visible { outline: 2px solid #c9a227; outline-offset: 2px; }
+
+@media (max-width: 640px) {
+  input, select, textarea { font-size: 16px !important; }
+  main button { min-height: 40px; }
+  .slim-scroll:has(> table)::before {
+    content: "Swipe sideways for more columns  →";
+    position: sticky;
+    left: 0;
+    display: block;
+    width: max-content;
+    padding: 9px 12px;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .slim-scroll > table th:first-child,
+  .slim-scroll > table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: #fff;
+    box-shadow: 1px 0 0 #e2e8f0;
+  }
+  .slim-scroll > table thead th:first-child { z-index: 2; }
+  .matesther-letter { min-height: 0; padding: 22px 16px; }
+  .letter-references { grid-template-columns: 1fr 1fr; row-gap: 8px; }
+  .letter-references p:last-child { text-align: left; }
+  .letter-body { overflow-x: auto; }
+  .letter-contact, .letter-heading, .letter-footer { overflow-wrap: anywhere; }
+}
+
 @keyframes fadeUp {
   from {
     opacity: 0;

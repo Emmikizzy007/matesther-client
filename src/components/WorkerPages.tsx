@@ -11,7 +11,7 @@ import { Coins, Banknote, Briefcase, Clock } from "lucide-react";
 type Mode = "jobs" | "journal" | "earnings" | "profile";
 
 export default function WorkerPages({ mode }: { mode: Mode }) {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const [d, setD] = useState<any>(null);
   const [inspections, setInspections] = useState<any[]>([]);
   const [err, setErr] = useState("");
@@ -22,32 +22,54 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
   const [submitErr, setSubmitErr] = useState("");
 
   useEffect(() => {
-    if (!user || user.role !== "WORKER") return;
+    if (authLoading) return;
+    if (!user || !["WORKER", "PRODUCTION_MANAGER"].includes(user.role)) {
+      setD(null);
+      setErr("This page is for Matesther production staff. Please sign in with a Worker or Project Manager account.");
+      return;
+    }
+
     let active = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 18000);
     setD(null);
     setErr("");
-    fetch("/api/dashboard", { cache: "no-store" })
+    setInspections([]);
+    const url = user.role === "PRODUCTION_MANAGER" ? "/api/dashboard?view=my-work" : "/api/dashboard";
+
+    fetch(url, { cache: "no-store", credentials: "same-origin", signal: controller.signal })
       .then(async (response) => {
         const result = await response.json();
         if (!response.ok || result.error) throw new Error(result.error || "Your work is temporarily unavailable.");
-        if (result.view !== "worker") throw new Error("Your session changed. Please sign in again.");
+        if (result.view !== "worker" || !Array.isArray(result.journal) || !Array.isArray(result.todayJobs) || !result.earnings)
+          throw new Error("Your personal work details are unavailable. Please try again or sign out and back in.");
         return result;
       })
       .then((data) => {
         if (!active) return;
         setD(data);
-        const ids = (data.journal ?? []).map((job: any) => job.id);
-        if (!ids.length) { setInspections([]); return; }
-        fetch("/api/inspections?limit=200", { cache: "no-store" })
+        const ids = data.journal.map((job: { id: number }) => job.id);
+        if (!ids.length) return;
+        fetch("/api/inspections?limit=200", { cache: "no-store", credentials: "same-origin", signal: controller.signal })
           .then((response) => response.ok ? response.json() : [])
           .then((rows: any) => {
-            if (active) setInspections(Array.isArray(rows) ? rows.filter((check: any) => ids.includes(check.productionOperationId)) : []);
+            if (active) setInspections(Array.isArray(rows) ? rows.filter((check: { productionOperationId: number }) => ids.includes(check.productionOperationId)) : []);
           })
           .catch(() => { if (active) setInspections([]); });
       })
-      .catch((cause) => { if (active) setErr(cause instanceof Error ? cause.message : "Your work is temporarily unavailable."); });
-    return () => { active = false; };
-  }, [user?.email, user?.role, retry]);
+      .catch((cause) => {
+        if (active) setErr(cause instanceof Error && cause.name === "AbortError"
+          ? "Your work took too long to load. Check your connection and try again."
+          : cause instanceof Error ? cause.message : "Your work is temporarily unavailable.");
+      })
+      .finally(() => window.clearTimeout(timeout));
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [authLoading, user?.email, user?.role, retry]);
 
   async function doSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -107,10 +129,17 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
           <StatCard label="This Month" value={naira(d.earnings.month)} icon={<Coins className="w-5 h-5" />} tone="gold" />
           <StatCard label="Total" value={naira(d.earnings.total)} icon={<Banknote className="w-5 h-5" />} tone="green" />
         </div>
-        <Card>
-          <CardHeader title="Approved work and earnings" subtitle="Each inspection uses the agreed rate on that production job" />
-          <div className="overflow-x-auto slim-scroll">
-            <table className="w-full text-sm min-w-[680px]">
+         <Card>
+           <CardHeader title="Approved work and earnings" subtitle="Each inspection uses the agreed rate on that production job" />
+           <div className="divide-y divide-slate-100 sm:hidden">
+             {d.earnings.events.map((entry: any) => <div key={entry.id} className="p-4">
+               <div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-900">{stageLabel(entry.stage)}</p><p className="text-xs text-slate-500">{entry.customer} • {entry.orderNumber} • {entry.batchNumber}</p></div><strong className="whitespace-nowrap text-matesther-700">{naira(entry.amount)}</strong></div>
+               <div className="mt-2 flex flex-wrap gap-x-3 text-xs text-slate-600"><span>{fmtDateTime(entry.inspectedAt)}</span><span>{entry.quantityApproved} approved × {naira(entry.pieceRate)}</span></div>
+             </div>)}
+             {d.earnings.events.length === 0 && <p className="p-5 text-sm text-slate-500">Your earnings appear after work is approved.</p>}
+           </div>
+           <div className="hidden overflow-x-auto slim-scroll sm:block">
+             <table className="w-full text-sm min-w-[680px]">
               <thead>
                 <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">
                   <th className="px-5 py-3">Date</th>
@@ -196,7 +225,18 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
     <div>
       <PageHeader title="My Jobs" subtitle="Active production jobs assigned to you - submit finished pieces for inspection" />
       <Card>
-        <div className="overflow-x-auto slim-scroll">
+        <div className="divide-y divide-slate-100 sm:hidden">
+          {d.todayJobs.map((job: any) => <div key={job.id} className="p-4">
+            <div className="flex items-start justify-between gap-2"><div className="min-w-0"><p className="font-semibold text-slate-900">{job.customer}</p><p className="mt-0.5 text-xs text-slate-500">{job.orderNumber} • {job.batchNumber}</p></div><Badge status={job.status} /></div>
+            <p className="mt-3 font-semibold text-matesther-900">{job.garment}{job.size ? ` • Size ${job.size}` : ""}{job.color ? ` • ${job.color}` : ""}</p>
+            <p className="mt-1 text-sm text-slate-600">{stageLabel(job.stage)} • Due {fmtDate(job.expectedCompletionDate)}</p>
+            <div className="mt-3 grid grid-cols-3 gap-2 rounded-lg bg-slate-50 p-2 text-center text-xs"><div><p className="text-slate-500">Received</p><strong>{job.quantityReceived}</strong></div><div><p className="text-slate-500">Left</p><strong>{job.quantityRemaining}</strong></div><div><p className="text-slate-500">To inspect</p><strong className="text-violet-700">{job.pendingInspection}</strong></div></div>
+            <p className="mt-2 text-xs font-semibold text-matesther-800">{p.paymentType === "PER_PIECE" ? `${naira(job.pieceRate ?? p.paymentRate)} per approved piece` : "Monthly salary"}</p>
+            {["IN_PROGRESS", "SUBMITTED"].includes(job.status) && job.availableToSubmit > 0 && <Btn className="mt-3 w-full" variant="secondary" onClick={() => { setSubmitErr(""); setQty(String(job.availableToSubmit)); setSubmit(job); }}>Submit finished pieces</Btn>}
+          </div>)}
+          {d.todayJobs.length === 0 && <p className="p-5 text-sm text-slate-500">No active jobs right now.</p>}
+        </div>
+        <div className="hidden overflow-x-auto slim-scroll sm:block">
           <table className="w-full text-sm min-w-[860px]">
             <thead>
               <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">

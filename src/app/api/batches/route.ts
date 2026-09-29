@@ -4,7 +4,7 @@ import { db } from "@/db";
 import { orders, orderItems, orderItemSizes, productionBatches, productionOperations, workers } from "@/db/schema";
 import { STAGES } from "@/lib/format";
 import { refreshBatchAndOrder } from "@/lib/server";
-import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
+import { guard, getSessionUser, productionAccess, OWNER, STAFF } from "@/lib/authz";
 
 type Assignment = { id: number | null; rate: number | null };
 
@@ -36,8 +36,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Choose an order and a positive whole-number batch quantity." }, { status: 400 });
     const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
     const session = await getSessionUser(req);
-    if (!order || order.organizationId !== session?.organizationId || ["CANCELLED", "COMPLETED"].includes(order.status))
+    if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
+    if (!order || order.organizationId !== session.organizationId || ["CANCELLED", "COMPLETED"].includes(order.status))
       return NextResponse.json({ error: "This order is not available for production." }, { status: 400 });
+    const access = await productionAccess(session);
+    if (!access.canAssignCutting && body.workerId)
+      return NextResponse.json({
+        error: "As a cutter-supervisor, you cannot assign cutting work to yourself or another Cutter. Leave Cutting unassigned for the Owner or a non-cutting supervisor.",
+      }, { status: 403 });
     const [item] = itemId ? await db.select().from(orderItems).where(eq(orderItems.id, itemId)).limit(1) : [];
     if (itemId && (!item || item.orderId !== orderId))
       return NextResponse.json({ error: "Choose a garment from this order." }, { status: 400 });
