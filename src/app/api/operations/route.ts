@@ -1,181 +1,139 @@
 import { NextResponse } from "next/server";
-import { db } from "@/db";
-import {
-  productionOperations,
-  productionBatches,
-  orders,
-  customers,
-  workers,
-} from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { productionOperations, productionBatches, orders, customers, workers, orderItems, products } from "@/db/schema";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, ANYONE } from "@/lib/authz";
 
-/**
- * GET /api/operations?status=&orderId=&workerId=
- * All production job steps with inspection counters.
- */
+const STATUSES = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD", "CANCELLED"];
+const STAGE_SPECIALTIES: Record<string, string> = {
+  CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole",
+  BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer",
+};
+
 export async function GET(req: Request) {
-  const __g = await guard(req, ANYONE);
-  if (__g) return __g;
-  const __user = await getSessionUser(req);
-  const __onlyMyJobs = __user?.role === "WORKER" ? await getLinkedWorkerId(__user) : null;
+  const denied = await guard(req, ANYONE);
+  if (denied) return denied;
+  const session = await getSessionUser(req);
+  const myWorkerId = session?.role === "WORKER" ? await getLinkedWorkerId(session) : null;
+  if (session?.role === "WORKER" && myWorkerId === null)
+    return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
   try {
-    const { searchParams } = new URL(req.url);
-    const status = searchParams.get("status");
-    const orderId = searchParams.get("orderId");
-    const workerId = searchParams.get("workerId");
-
-    const [opRows, batchRows, orderRows, customerRows, workerRows] =
-      await Promise.all([
-        db.select().from(productionOperations),
-        db.select().from(productionBatches),
-        db.select().from(orders),
-        db.select().from(customers),
-        db.select().from(workers),
-      ]);
-    const bMap = new Map(batchRows.map((b) => [b.id, b]));
-    const oMap = new Map(orderRows.map((o) => [o.id, o]));
-    const cMap = new Map(customerRows.map((c) => [c.id, c]));
-    const wMap = new Map(workerRows.map((w) => [w.id, w]));
-
-    let rows = opRows.map((o) => {
-      const batch = bMap.get(o.productionBatchId);
-      const order = batch ? oMap.get(batch.orderId) : undefined;
+    const query = new URL(req.url).searchParams;
+    const [ops, batches, orderRows, customerRows, workerRows, items, catalog] = await Promise.all([
+      db.select().from(productionOperations), db.select().from(productionBatches), db.select().from(orders),
+      db.select().from(customers), db.select().from(workers), db.select().from(orderItems),
+      db.select({ id: products.id, name: products.name }).from(products),
+    ]);
+    const byBatch = new Map(batches.map((batch) => [batch.id, batch]));
+    const byOrder = new Map(orderRows.map((order) => [order.id, order]));
+    const byCustomer = new Map(customerRows.map((customer) => [customer.id, customer]));
+    const byWorker = new Map(workerRows.map((person) => [person.id, person]));
+    const byItem = new Map(items.map((item) => [item.id, item]));
+    const byProduct = new Map(catalog.map((product) => [product.id, product.name]));
+    const rows = ops.filter((op) =>
+      (!query.get("status") || op.status === query.get("status")) &&
+      (!query.get("workerId") || op.workerId === Number(query.get("workerId"))) &&
+      (!myWorkerId || op.workerId === myWorkerId) &&
+      (!query.get("orderId") || byBatch.get(op.productionBatchId)?.orderId === Number(query.get("orderId")))
+    ).map((op) => {
+      const batch = byBatch.get(op.productionBatchId);
+      const order = batch ? byOrder.get(batch.orderId) : undefined;
+      const item = batch?.orderItemId ? byItem.get(batch.orderItemId) : undefined;
       return {
-        ...o,
-        pendingInspection: Math.max(
-          0,
-          (o.quantityCompleted ?? 0) - (o.quantityInspected ?? 0)
-        ),
-        batchNumber: batch?.batchNumber ?? "-",
-        batchQuantity: batch?.quantity ?? 0,
-        orderId: order?.id ?? null,
-        orderNumber: order?.orderNumber ?? "-",
-        dueDate: order?.dueDate ?? null,
-        customer: cMap.get(order?.customerId ?? -1)?.name ?? "-",
-        workerName: wMap.get(o.workerId ?? -1)?.name ?? null,
+        ...op,
+        batchNumber: batch?.batchNumber ?? "-", batchQuantity: batch?.quantity ?? 0,
+        size: batch?.size ?? null, color: batch?.color ?? null,
+        garment: item?.productId ? byProduct.get(item.productId) ?? "Uniform item" : "Full order",
+        orderId: order?.id ?? null, orderNumber: order?.orderNumber ?? "-", dueDate: order?.dueDate ?? null,
+        customer: byCustomer.get(order?.customerId ?? -1)?.name ?? "-",
+        workerName: byWorker.get(op.workerId ?? -1)?.name ?? null,
+        paymentType: byWorker.get(op.workerId ?? -1)?.paymentType ?? null,
+        pendingInspection: Math.max(0, op.quantityCompleted - op.quantityInspected),
       };
     });
-    if (status) rows = rows.filter((r) => r.status === status);
-    if (orderId) rows = rows.filter((r) => r.orderId === Number(orderId));
-    if (workerId) rows = rows.filter((r) => r.workerId === Number(workerId));
-    if (__onlyMyJobs !== null)
-      rows = rows.filter((r) => r.workerId === __onlyMyJobs);
-    return NextResponse.json(rows);
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    return NextResponse.json(rows, { headers: { "Cache-Control": "private, no-store" } });
+  } catch (error) {
+    console.error("Production jobs load failed", error);
+    return NextResponse.json({ error: "Unable to load production jobs." }, { status: 500 });
   }
 }
 
-/**
- * PUT /api/operations
- * - Workers: submit finished pieces for inspection  { id, submitQty }  or  { id, status: "SUBMITTED" }
- * - Manager/Owner: assign worker, set status, dates, notes
- *
- * A stage can NEVER be marked COMPLETED without inspection approval.
- */
 export async function PUT(req: Request) {
   const denied = await guard(req, ANYONE);
   if (denied) return denied;
   try {
-    const b = await req.json();
-    const id = Number(b.id);
-    const [existing] = await db
-      .select()
-      .from(productionOperations)
-      .where(eq(productionOperations.id, id));
-    if (!existing) return NextResponse.json({ error: "Operation not found." }, { status: 404 });
-
-    // A worker may only submit finished garments on their own active job.
-    const sessionUser = await getSessionUser(req);
-    if (sessionUser?.role === "WORKER") {
-      const workerId = await getLinkedWorkerId(sessionUser);
-      if (!workerId || existing.workerId !== workerId)
+    const body = await req.json();
+    const id = Number(body.id);
+    if (!Number.isSafeInteger(id) || id < 1) return NextResponse.json({ error: "Choose a production job." }, { status: 400 });
+    const [current] = await db.select().from(productionOperations).where(eq(productionOperations.id, id)).limit(1);
+    if (!current) return NextResponse.json({ error: "Job not found." }, { status: 404 });
+    const session = await getSessionUser(req);
+    if (session?.role === "WORKER") {
+      const workerId = await getLinkedWorkerId(session);
+      if (!workerId || current.workerId !== workerId)
         return NextResponse.json({ error: "You can only submit your own assigned jobs." }, { status: 403 });
-      if (Object.keys(b).some((key) => !["id", "submitQty"].includes(key)))
-        return NextResponse.json(
-          { error: "Workers can only submit a quantity for inspection. The Owner or Project Manager handles assignments and approvals." },
-          { status: 403 }
-        );
-      if (!["IN_PROGRESS", "SUBMITTED"].includes(existing.status))
+      if (Object.keys(body).some((key) => !["id", "submitQty"].includes(key)))
+        return NextResponse.json({ error: "Only your completed quantity can be submitted for inspection." }, { status: 403 });
+      if (!["IN_PROGRESS", "SUBMITTED"].includes(current.status))
         return NextResponse.json({ error: "This job is not active. Contact your supervisor." }, { status: 400 });
-      const pendingInspection = Math.max(0, (existing.quantityCompleted ?? 0) - (existing.quantityInspected ?? 0));
-      const available = Math.max(0, (existing.quantityRemaining ?? 0) - pendingInspection);
-      const qty = Number(b.submitQty);
-      if (!Number.isInteger(qty) || qty <= 0 || qty > available)
-        return NextResponse.json(
-          { error: `You can submit between 1 and ${available} pieces for this job.` },
-          { status: 400 }
-        );
+      const pending = Math.max(0, current.quantityCompleted - current.quantityInspected);
+      const available = Math.max(0, current.quantityRemaining - pending);
+      const qty = Number(body.submitQty);
+      if (!Number.isSafeInteger(qty) || qty < 1 || qty > available)
+        return NextResponse.json({ error: `You can submit between 1 and ${available} pieces.` }, { status: 400 });
+      const [submitted] = await db.update(productionOperations).set({
+        quantityCompleted: current.quantityCompleted + qty, status: "SUBMITTED", submittedAt: new Date(),
+      }).where(eq(productionOperations.id, id)).returning();
+      await refreshBatchAndOrder(current.productionBatchId);
+      return NextResponse.json(submitted);
     }
 
-    let completed = existing.quantityCompleted ?? 0;
-    let received = existing.quantityReceived ?? 0;
-    let rejected = existing.quantityRejected ?? 0;
-    let status = existing.status;
-    let submittedAt = existing.submittedAt ?? null;
+    const workerId = body.workerId === undefined ? current.workerId : body.workerId ? Number(body.workerId) : null;
+    const changedWorker = workerId !== current.workerId;
+    const [person] = workerId ? await db.select().from(workers).where(eq(workers.id, workerId)).limit(1) : [];
+    if (workerId && (!person || person.status !== "ACTIVE" || person.organizationId !== session?.organizationId))
+      return NextResponse.json({ error: "Choose an active Matesther worker." }, { status: 400 });
+    if (person && STAGE_SPECIALTIES[current.stage] && person.specialty.toLowerCase() !== STAGE_SPECIALTIES[current.stage].toLowerCase())
+      return NextResponse.json({ error: `${current.stage.replaceAll("_", " ")} needs a ${STAGE_SPECIALTIES[current.stage]}.` }, { status: 400 });
+    if (changedWorker && (current.quantityCompleted > 0 || current.quantityInspected > 0 || current.quantityApproved > 0))
+      return NextResponse.json({ error: "This job already has production history. Keep the assigned worker; use a new batch to split the work." }, { status: 400 });
 
-    // Worker: submit N more pieces for inspection
-    if (b.submitQty !== undefined && Number(b.submitQty) > 0) {
-      const n = Number(b.submitQty);
-      completed += n;
-      status = "SUBMITTED";
-      submittedAt = new Date();
-    } else {
-      if (b.quantityReceived !== undefined) received = Math.max(0, Number(b.quantityReceived));
-      if (b.quantityCompleted !== undefined) completed = Math.max(0, Number(b.quantityCompleted));
-      if (b.quantityRejected !== undefined) rejected = Math.max(0, Number(b.quantityRejected));
-      if (b.status) {
-        if (b.status === "SUBMITTED") {
-          status = "SUBMITTED";
-          if (completed > (existing.quantityInspected ?? 0)) submittedAt = new Date();
-        } else if (b.status === "COMPLETED") {
-          // Quality gate: completion requires inspection approval
-          const approved = existing.quantityApproved ?? 0;
-          const remaining = Math.max(0, received - approved - rejected);
-          if (approved <= 0 || remaining > 0)
-            return NextResponse.json(
-              {
-                error:
-                  "This stage cannot be completed yet - the Project Manager or Owner must first inspect and approve all submitted pieces (Inspection Queue).",
-              },
-              { status: 400 }
-            );
-          status = "COMPLETED";
-        } else {
-          status = b.status;
-        }
-      }
-    }
-
-    const remaining = Math.max(0, received - (existing.quantityApproved ?? 0) - rejected);
-
-    const [row] = await db
-      .update(productionOperations)
-      .set({
-        workerId:
-          b.workerId !== undefined ? (b.workerId ? Number(b.workerId) : null) : existing.workerId,
-        quantityReceived: received,
-        quantityCompleted: completed,
-        quantityRejected: rejected,
-        quantityRemaining: remaining,
-        status,
-        submittedAt,
-        expectedCompletionDate:
-          b.expectedCompletionDate !== undefined
-            ? b.expectedCompletionDate || null
-            : existing.expectedCompletionDate,
-        completedAt:
-          status === "COMPLETED" ? existing.completedAt ?? new Date() : null,
-        notes: b.notes !== undefined ? b.notes : existing.notes,
-      })
-      .where(eq(productionOperations.id, id))
-      .returning();
-
-    await refreshBatchAndOrder(existing.productionBatchId);
-    return NextResponse.json(row);
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    let pieceRate = current.pieceRate;
+    if (person?.paymentType === "PER_PIECE") {
+      const proposed = body.pieceRate === undefined || body.pieceRate === "" || body.pieceRate === null
+        ? (changedWorker ? null : pieceRate) : Number(body.pieceRate);
+      if (changedWorker && (!Number.isSafeInteger(proposed) || (proposed ?? 0) < 1))
+        return NextResponse.json({ error: `Enter the agreed per-piece rate for ${person.name} on this job.` }, { status: 400 });
+      if (proposed !== null && (!Number.isSafeInteger(proposed) || proposed < 1))
+        return NextResponse.json({ error: "Agreed per-piece rate must be a positive whole amount." }, { status: 400 });
+      if (proposed !== pieceRate && (current.quantityCompleted > 0 || current.quantityInspected > 0))
+        return NextResponse.json({ error: "The job rate is locked once work is submitted. The original agreement and inspection history must stay intact." }, { status: 400 });
+      pieceRate = proposed;
+    } else if (changedWorker) pieceRate = null;
+    if (!person && body.workerId !== undefined) pieceRate = null;
+    const received = body.quantityReceived === undefined ? current.quantityReceived : Number(body.quantityReceived);
+    const completed = body.quantityCompleted === undefined ? current.quantityCompleted : Number(body.quantityCompleted);
+    const rejected = body.quantityRejected === undefined ? current.quantityRejected : Number(body.quantityRejected);
+    if (![received, completed, rejected].every((number) => Number.isSafeInteger(number) && number >= 0) || completed < current.quantityInspected)
+      return NextResponse.json({ error: "Quantities must be non-negative whole numbers. Submitted work cannot be less than work already inspected." }, { status: 400 });
+    const status = body.status ?? current.status;
+    if (!STATUSES.includes(status)) return NextResponse.json({ error: "Choose a valid status." }, { status: 400 });
+    const remaining = Math.max(0, received - current.quantityApproved - rejected);
+    if (status === "COMPLETED" && (current.quantityApproved < 1 || remaining > 0))
+      return NextResponse.json({ error: "Inspect and approve the work before completing this stage." }, { status: 400 });
+    const [updated] = await db.update(productionOperations).set({
+      workerId, pieceRate, quantityReceived: received, quantityCompleted: completed,
+      quantityRejected: rejected, quantityRemaining: remaining, status,
+      submittedAt: status === "SUBMITTED" && completed > current.quantityInspected ? current.submittedAt ?? new Date() : current.submittedAt,
+      expectedCompletionDate: body.expectedCompletionDate === undefined ? current.expectedCompletionDate : body.expectedCompletionDate || null,
+      completedAt: status === "COMPLETED" ? current.completedAt ?? new Date() : null,
+      notes: body.notes === undefined ? current.notes : String(body.notes).slice(0, 2000),
+    }).where(eq(productionOperations.id, id)).returning();
+    await refreshBatchAndOrder(current.productionBatchId);
+    return NextResponse.json(updated);
+  } catch (error) {
+    console.error("Production job update failed", error);
+    return NextResponse.json({ error: "Could not update this production job." }, { status: 500 });
   }
 }

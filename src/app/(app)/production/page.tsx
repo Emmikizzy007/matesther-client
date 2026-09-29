@@ -6,6 +6,7 @@ import { Search, ClipboardCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
 import { fmtDate, stageLabel, STAGES } from "@/lib/format";
 
+const STAGE_SPECIALTIES: Record<string, string> = { CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole", BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer", DELIVERY: "Packer" };
 const COLS = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD"];
 const COL_LABEL: Record<string, string> = {
   PENDING: "Pending",
@@ -126,10 +127,12 @@ export default function ProductionPage() {
                       </div>
                       <p className="text-sm font-semibold mt-1 text-matesther-800">{o.orderNumber}</p>
                       <p className="text-xs text-slate-500 truncate">{o.customer}</p>
+                      <p className="mt-1 text-[11px] font-semibold text-slate-700">{o.garment}{o.size ? ` • Size ${o.size}` : ""}{o.color ? ` • ${o.color}` : ""}</p>
                       <p className="text-xs mt-1.5">
                         <span className="text-slate-500">Worker: </span>
                         <span className="font-medium">{o.workerName || <span className="text-amber-600">Unassigned</span>}</span>
                       </p>
+                      {o.pieceRate !== null && <p className="mt-0.5 text-[11px] font-semibold text-matesther-700">Agreed pay: ₦{Number(o.pieceRate).toLocaleString("en-NG")} per piece</p>}
                       <div className="flex flex-wrap gap-1 mt-2 text-[10px]">
                         <span className="bg-slate-100 rounded px-1.5 py-0.5">Rcvd {o.quantityReceived}</span>
                         <span className="bg-violet-50 text-violet-800 rounded px-1.5 py-0.5 font-semibold">Subm {o.quantityCompleted}</span>
@@ -161,7 +164,7 @@ export default function ProductionPage() {
         {selected && (
           <form onSubmit={save} className="grid sm:grid-cols-2 gap-3">
             <p className="sm:col-span-2 text-xs text-slate-500">
-              {selected.orderNumber} • {selected.customer} • Batch qty {selected.batchQuantity}
+              {selected.orderNumber} • {selected.customer} • {selected.garment}{selected.size ? ` • Size ${selected.size}` : ""}{selected.color ? ` • ${selected.color}` : ""} • Batch qty {selected.batchQuantity}
             </p>
             <Field label="Status">
               <select value={selected.status} onChange={(e) => setSelected({ ...selected, status: e.target.value })} className={inputCls}>
@@ -174,11 +177,16 @@ export default function ProductionPage() {
               </select>
             </Field>
             <Field label="Worker">
-              <select value={selected.workerId || ""} onChange={(e) => setSelected({ ...selected, workerId: e.target.value ? Number(e.target.value) : null })} className={inputCls}>
+              <select value={selected.workerId || ""} onChange={(e) => setSelected({ ...selected, workerId: e.target.value ? Number(e.target.value) : null, pieceRate: null })} className={inputCls}>
                 <option value="">Unassigned</option>
-                {workers.filter((w) => w.status === "ACTIVE").map((w) => <option key={w.id} value={w.id}>{w.name} - {w.specialty}</option>)}
+                {workers.filter((w) => w.status === "ACTIVE" && (!STAGE_SPECIALTIES[selected.stage] || w.specialty === STAGE_SPECIALTIES[selected.stage])).map((w) => <option key={w.id} value={w.id}>{w.name} - {w.specialty}</option>)}
               </select>
             </Field>
+            {workers.find((w) => w.id === Number(selected.workerId))?.paymentType === "PER_PIECE" && <Field label="Agreed pay per approved garment (₦) *">
+              <input type="number" min="1" step="1" required={selected.quantityCompleted === 0 && selected.pieceRate === null}
+                disabled={selected.quantityCompleted > 0 || selected.quantityInspected > 0} value={selected.pieceRate ?? ""}
+                onChange={(e) => setSelected({ ...selected, pieceRate: e.target.value === "" ? null : Number(e.target.value) })} className={inputCls} />
+            </Field>}
             <Field label="Qty received"><input type="number" min="0" value={selected.quantityReceived ?? 0} onChange={(e) => setSelected({ ...selected, quantityReceived: Number(e.target.value) })} className={inputCls} /></Field>
             <Field label="Qty submitted"><input type="number" min="0" value={selected.quantityCompleted ?? 0} onChange={(e) => setSelected({ ...selected, quantityCompleted: Number(e.target.value) })} className={inputCls} /></Field>
             <Field label="Qty rejected"><input type="number" min="0" value={selected.quantityRejected ?? 0} onChange={(e) => setSelected({ ...selected, quantityRejected: Number(e.target.value) })} className={inputCls} /></Field>

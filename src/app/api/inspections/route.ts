@@ -20,6 +20,8 @@ export async function GET(req: Request) {
   const __g = await guard(req, ANYONE);
   if (__g) return __g;
   const __user = await getSessionUser(req);
+  if (__user?.role === "WORKER" && (await getLinkedWorkerId(__user)) === null)
+    return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
   try {
     const { searchParams } = new URL(req.url);
     const operationId = searchParams.get("operationId");
@@ -83,10 +85,12 @@ export async function POST(req: Request) {
   try {
     const b = await req.json();
     const opId = Number(b.operationId);
-    const approved = Math.max(0, Number(b.quantityApproved) || 0);
-    const rework = Math.max(0, Number(b.quantityRework) || 0);
-    const rejected = Math.max(0, Number(b.quantityRejected) || 0);
+    const approved = Number(b.quantityApproved) || 0;
+    const rework = Number(b.quantityRework) || 0;
+    const rejected = Number(b.quantityRejected) || 0;
     const total = approved + rework + rejected;
+    if (![approved, rework, rejected].every((value) => Number.isSafeInteger(value) && value >= 0))
+      return NextResponse.json({ error: "Inspection quantities must be non-negative whole garments." }, { status: 400 });
 
     if (!opId) return NextResponse.json({ error: "Operation is required." }, { status: 400 });
     if (total <= 0)
@@ -102,6 +106,8 @@ export async function POST(req: Request) {
       .from(productionOperations)
       .where(eq(productionOperations.id, opId));
     if (!op) return NextResponse.json({ error: "Operation not found." }, { status: 404 });
+    const [assigned] = op.workerId ? await db.select().from(workers).where(eq(workers.id, op.workerId)).limit(1) : [];
+    const agreedRate = assigned?.paymentType === "PER_PIECE" ? op.pieceRate ?? assigned.paymentRate : null;
 
     const pending = (op.quantityCompleted ?? 0) - (op.quantityInspected ?? 0);
     if (total > pending)
@@ -114,6 +120,7 @@ export async function POST(req: Request) {
     await db.insert(stageInspections).values({
       productionOperationId: opId,
       inspectedBy: String(b.inspectedBy),
+      pieceRate: agreedRate,
       quantityApproved: approved,
       quantityRework: rework,
       quantityRejected: rejected,

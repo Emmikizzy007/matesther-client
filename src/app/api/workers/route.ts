@@ -1,156 +1,153 @@
 import { NextResponse } from "next/server";
-import { db } from "@/db";
-import {
-  workers,
-  productionOperations,
-  productionBatches,
-  orders,
-  customers,
-} from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { workers, users, productionOperations, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime } from "@/db/schema";
 import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
+import { inspectionEarnings } from "@/lib/job-pay";
 
 export async function GET(req: Request) {
-  const __g = await guard(req, STAFF);
-  if (__g) return __g;
+  const denied = await guard(req, STAFF);
+  if (denied) return denied;
   try {
-    const managerView = (await getSessionUser(req))?.role === "PRODUCTION_MANAGER";
-    const publicWorker = (person: typeof workers.$inferSelect) => managerView
-      ? { id: person.id, name: person.name, phone: person.phone, specialty: person.specialty,
-          status: person.status, isInspector: person.isInspector, createdAt: person.createdAt }
+    const isManager = (await getSessionUser(req))?.role === "PRODUCTION_MANAGER";
+    const query = new URL(req.url).searchParams;
+    const [people, operations, inspections, payRows, overtimeRows] = await Promise.all([
+      db.select().from(workers), db.select().from(productionOperations), db.select().from(stageInspections),
+      db.select().from(workerPayments), db.select().from(workerOvertime),
+    ]);
+    const personView = (person: typeof workers.$inferSelect) => isManager
+      ? { id: person.id, name: person.name, phone: person.phone, specialty: person.specialty, status: person.status,
+          paymentType: person.paymentType, isInspector: person.isInspector, createdAt: person.createdAt }
       : person;
-    const { searchParams } = new URL(req.url);
-    const id = searchParams.get("id");
-    const rows = await db.select().from(workers);
-    const opRows = await db.select().from(productionOperations);
-
-    if (id) {
-      const w = rows.find((x) => x.id === Number(id));
-      if (!w) return NextResponse.json({ error: "Worker not found" }, { status: 404 });
-      const myOps = opRows.filter((o) => o.workerId === w.id);
-      const [batches, orderRows, customerRows] = await Promise.all([
-        db.select().from(productionBatches),
-        db.select().from(orders),
-        db.select().from(customers),
-      ]);
-      const bMap = new Map(batches.map((b) => [b.id, b]));
-      const oMap = new Map(orderRows.map((o) => [o.id, o]));
-      const cMap = new Map(customerRows.map((c) => [c.id, c]));
-      return NextResponse.json({
-        ...publicWorker(w),
-        assigned: myOps.reduce((s, o) => s + (o.quantityReceived ?? 0), 0),
-        completed: myOps.reduce((s, o) => s + (o.quantityCompleted ?? 0), 0),
-        approved: myOps.reduce((s, o) => s + (o.quantityApproved ?? 0), 0),
-        rejected: myOps.reduce((s, o) => s + (o.quantityRejected ?? 0), 0),
-        ...(managerView ? {} : {
-          earnings: w.paymentType === "PER_PIECE"
-            ? myOps.reduce((s, o) => s + (o.quantityApproved ?? 0), 0) * (w.paymentRate ?? 0)
-            : w.paymentType === "MONTHLY" ? (w.paymentRate ?? 0) : 0,
-        }),
-        history: myOps.map((o) => {
-          const batch = bMap.get(o.productionBatchId);
-          const order = batch ? oMap.get(batch.orderId) : undefined;
-          return {
-            ...o,
-            batchNumber: batch?.batchNumber ?? "-",
-            orderNumber: order?.orderNumber ?? "-",
-            orderId: order?.id,
-            customer: cMap.get(order?.customerId ?? -1)?.name ?? "-",
-          };
-        }),
-      });
-    }
-
-    const data = rows.map((w) => {
-      const myOps = opRows.filter((o) => o.workerId === w.id);
-      const approved = myOps.reduce((s, o) => s + (o.quantityApproved ?? 0), 0);
+    const expanded = people.map((person) => {
+      const mine = operations.filter((op) => op.workerId === person.id);
+      const byId = new Map(mine.map((op) => [op.id, op]));
+      const approved = mine.reduce((sum, op) => sum + op.quantityApproved, 0);
+      const earned = person.paymentType === "PER_PIECE"
+        ? inspections.reduce((sum, check) => {
+            const op = byId.get(check.productionOperationId);
+            return op ? sum + inspectionEarnings(check, op, person) : sum;
+          }, 0)
+        : person.paymentType === "MONTHLY" ? person.paymentRate : 0;
       return {
-        ...publicWorker(w),
-        currentTasks: myOps.filter((o) => o.status === "IN_PROGRESS" || o.status === "PENDING").length,
-        assigned: myOps.reduce((s, o) => s + (o.quantityReceived ?? 0), 0),
-        completed: myOps.reduce((s, o) => s + (o.quantityCompleted ?? 0), 0),
-        rejected: myOps.reduce((s, o) => s + (o.quantityRejected ?? 0), 0),
+        ...personView(person),
+        currentTasks: mine.filter((op) => ["IN_PROGRESS", "SUBMITTED"].includes(op.status)).length,
+        assigned: mine.reduce((sum, op) => sum + op.quantityReceived, 0),
+        completed: mine.reduce((sum, op) => sum + op.quantityCompleted, 0),
+        rejected: mine.reduce((sum, op) => sum + op.quantityRejected, 0),
         approved,
-        ...(managerView ? {} : {
-          earnings: w.paymentType === "PER_PIECE"
-            ? approved * (w.paymentRate ?? 0)
-            : w.paymentType === "MONTHLY" ? (w.paymentRate ?? 0) : 0,
-        }),
+        hasHistory: mine.length > 0 || payRows.some((p) => p.workerId === person.id) || overtimeRows.some((p) => p.workerId === person.id),
+        ...(!isManager ? { earnings: earned } : {}),
       };
     });
-    return NextResponse.json(data);
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    const id = Number(query.get("id"));
+    if (query.get("id")) {
+      const profile = expanded.find((person) => person.id === id);
+      if (!profile) return NextResponse.json({ error: "Worker not found." }, { status: 404 });
+      const [batches, orderRows, schools] = await Promise.all([
+        db.select().from(productionBatches), db.select().from(orders), db.select().from(customers),
+      ]);
+      const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
+      const orderMap = new Map(orderRows.map((order) => [order.id, order]));
+      const schoolMap = new Map(schools.map((school) => [school.id, school]));
+      const history = operations.filter((op) => op.workerId === id).map((op) => {
+        const batch = batchMap.get(op.productionBatchId);
+        const order = batch ? orderMap.get(batch.orderId) : undefined;
+        return {
+          ...op, ...(!isManager ? {} : { pieceRate: undefined }),
+          batchNumber: batch?.batchNumber ?? "-", size: batch?.size ?? null, color: batch?.color ?? null,
+          orderId: order?.id, orderNumber: order?.orderNumber ?? "-",
+          customer: schoolMap.get(order?.customerId ?? -1)?.name ?? "-",
+        };
+      });
+      return NextResponse.json({ ...profile, history }, { headers: { "Cache-Control": "private, no-store" } });
+    }
+    const list = query.get("showArchived") === "1" ? expanded : expanded.filter((person) => person.status === "ACTIVE");
+    return NextResponse.json(list, { headers: { "Cache-Control": "private, no-store" } });
+  } catch (error) {
+    console.error("Workers load failed", error);
+    return NextResponse.json({ error: "Unable to load workers." }, { status: 500 });
   }
 }
 
 export async function POST(req: Request) {
-  const __g = await guard(req, OWNER);
-  if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const b = await req.json();
-    if (!b.name) return NextResponse.json({ error: "Worker name is required" }, { status: 400 });
-    const [row] = await db
-      .insert(workers)
-      .values({
-        organizationId: 1,
-        name: b.name,
-        phone: b.phone || null,
-        specialty: b.specialty || "Tailor",
-        paymentType: b.paymentType || "PER_PIECE",
-        paymentRate: Number(b.paymentRate) || 0,
-        isInspector: !!b.isInspector,
-        status: "ACTIVE",
-      })
-      .returning();
-    return NextResponse.json(row, { status: 201 });
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    const body = await req.json();
+    const name = String(body.name ?? "").trim();
+    if (!name) return NextResponse.json({ error: "Worker name is required." }, { status: 400 });
+    const paymentType = ["PER_PIECE", "MONTHLY", "DAILY"].includes(body.paymentType) ? body.paymentType : "PER_PIECE";
+    const rate = Number(body.paymentRate) || 0;
+    if (!Number.isSafeInteger(rate) || rate < 0 || (paymentType === "MONTHLY" && rate < 1))
+      return NextResponse.json({ error: "Enter a valid monthly salary, or set the per-piece amount when assigning the job." }, { status: 400 });
+    const [created] = await db.insert(workers).values({
+      organizationId: 1, name, phone: String(body.phone ?? "").trim() || null,
+      specialty: String(body.specialty ?? "Tailor").trim() || "Tailor",
+      paymentType, paymentRate: rate, status: "ACTIVE", isInspector: !!body.isInspector,
+    }).returning();
+    return NextResponse.json(created, { status: 201 });
+  } catch (error) {
+    console.error("Worker creation failed", error);
+    return NextResponse.json({ error: "Unable to add this worker." }, { status: 500 });
   }
 }
 
 export async function PUT(req: Request) {
-  const __g = await guard(req, OWNER);
-  if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const b = await req.json();
-    const [row] = await db
-      .update(workers)
-      .set({
-        name: b.name,
-        phone: b.phone,
-        specialty: b.specialty,
-        paymentType: b.paymentType,
-        paymentRate: Number(b.paymentRate) || 0,
-        isInspector: !!b.isInspector,
-        status: b.status,
-      })
-      .where(eq(workers.id, Number(b.id)))
-      .returning();
-    return NextResponse.json(row);
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    const body = await req.json();
+    const id = Number(body.id);
+    if (!Number.isSafeInteger(id) || id < 1) return NextResponse.json({ error: "Select a worker." }, { status: 400 });
+    const [existing] = await db.select().from(workers).where(eq(workers.id, id)).limit(1);
+    if (!existing) return NextResponse.json({ error: "Worker not found." }, { status: 404 });
+    const paymentType = ["PER_PIECE", "MONTHLY", "DAILY"].includes(body.paymentType) ? body.paymentType : existing.paymentType;
+    const rate = Number(body.paymentRate);
+    if (!Number.isSafeInteger(rate) || rate < 0 || (paymentType === "MONTHLY" && rate < 1))
+      return NextResponse.json({ error: "Enter a valid salary. Per-piece pay is set on each production job." }, { status: 400 });
+    const status = body.status === "INACTIVE" ? "INACTIVE" : "ACTIVE";
+    const [updated] = await db.update(workers).set({
+      name: String(body.name ?? "").trim() || existing.name,
+      phone: String(body.phone ?? "").trim() || null,
+      specialty: String(body.specialty ?? existing.specialty),
+      paymentType, paymentRate: rate,
+      isInspector: !!body.isInspector,
+      status,
+      archivedAt: status === "INACTIVE" ? existing.archivedAt ?? new Date() : null,
+    }).where(eq(workers.id, id)).returning();
+    return NextResponse.json(updated);
+  } catch (error) {
+    console.error("Worker update failed", error);
+    return NextResponse.json({ error: "Unable to update this worker." }, { status: 500 });
   }
 }
 
+/** Hard-delete only unused people; archive anyone with a production/payroll trail. */
 export async function DELETE(req: Request) {
-  const __g = await guard(req, OWNER);
-  if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const { searchParams } = new URL(req.url);
-    const id = searchParams.get("id");
-    const linked = await db
-      .select()
-      .from(productionOperations)
-      .where(eq(productionOperations.workerId, Number(id)));
-    if (linked.length > 0)
-      return NextResponse.json(
-        { error: `Cannot delete - this worker has ${linked.length} production record(s). Set status to INACTIVE instead.` },
-        { status: 400 }
-      );
-    await db.delete(workers).where(eq(workers.id, Number(id)));
-    return NextResponse.json({ ok: true });
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    const id = Number(new URL(req.url).searchParams.get("id"));
+    if (!Number.isSafeInteger(id) || id < 1) return NextResponse.json({ error: "Select a worker." }, { status: 400 });
+    const [person] = await db.select().from(workers).where(eq(workers.id, id)).limit(1);
+    if (!person) return NextResponse.json({ error: "Worker not found." }, { status: 404 });
+    const [jobs, wages, overtime] = await Promise.all([
+      db.select({ id: productionOperations.id }).from(productionOperations).where(eq(productionOperations.workerId, id)).limit(1),
+      db.select({ id: workerPayments.id }).from(workerPayments).where(eq(workerPayments.workerId, id)).limit(1),
+      db.select({ id: workerOvertime.id }).from(workerOvertime).where(eq(workerOvertime.workerId, id)).limit(1),
+    ]);
+    const archived = jobs.length > 0 || wages.length > 0 || overtime.length > 0;
+    await db.transaction(async (tx) => {
+      await tx.update(users).set({ status: "INACTIVE" }).where(eq(users.workerId, id));
+      if (archived) await tx.update(workers).set({ status: "INACTIVE", archivedAt: person.archivedAt ?? new Date() }).where(eq(workers.id, id));
+      else await tx.delete(workers).where(eq(workers.id, id));
+    });
+    return NextResponse.json({ ok: true, archived, message: archived
+      ? "Worker archived. Production and pay history remain available under Show archived. Any linked login was disabled."
+      : "Unused worker deleted. Any linked login was disabled." });
+  } catch (error) {
+    console.error("Worker removal failed", error);
+    return NextResponse.json({ error: "Unable to remove this worker." }, { status: 500 });
   }
 }

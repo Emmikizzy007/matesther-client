@@ -8,11 +8,13 @@ import {
   productionBatches,
   productionOperations,
   workers,
+  stageInspections,
   materials,
   materialPurchases,
   materialUsage,
   expenses,
 } from "@/db/schema";
+import { inspectionEarnings } from "@/lib/job-pay";
 
 export async function GET(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
@@ -28,6 +30,7 @@ export async function GET(req: Request) {
       purchaseRows,
       usageRows,
       expenseRows,
+      inspectionRows,
     ] = await Promise.all([
       db.select().from(orders),
       db.select().from(customers),
@@ -39,6 +42,7 @@ export async function GET(req: Request) {
       db.select().from(materialPurchases),
       db.select().from(materialUsage),
       db.select().from(expenses),
+      db.select().from(stageInspections),
     ]);
     const cMap = new Map(customerRows.map((c) => [c.id, c]));
 
@@ -117,13 +121,14 @@ export async function GET(req: Request) {
     // Worker earnings - pieceworkers earn on APPROVED pieces; monthly workers show their wage
     const workerEarnings = workerRows.map((w) => {
       const mine = opRows.filter((o) => o.workerId === w.id);
+      const byId = new Map(mine.map((operation) => [operation.id, operation]));
       const approved = mine.reduce((s, o) => s + (o.quantityApproved ?? 0), 0);
-      const earnings =
-        w.paymentType === "PER_PIECE"
-          ? approved * (w.paymentRate ?? 0)
-          : w.paymentType === "MONTHLY"
-            ? (w.paymentRate ?? 0)
-            : 0;
+      const earnings = w.paymentType === "PER_PIECE"
+        ? inspectionRows.reduce((sum, check) => {
+            const operation = byId.get(check.productionOperationId);
+            return operation ? sum + inspectionEarnings(check, operation, w) : sum;
+          }, 0)
+        : w.paymentType === "MONTHLY" ? (w.paymentRate ?? 0) : 0;
       return {
         id: w.id,
         name: w.name,

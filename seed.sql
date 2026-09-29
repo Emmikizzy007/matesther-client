@@ -265,3 +265,18 @@ INSERT INTO stage_inspections (production_operation_id, inspected_by, quantity_a
 (35, 'Esther Adejugba', 120, 0, 0, 'Delivered - school store signed the waybill.', '2026-07-29 11:00');
 UPDATE workers SET is_inspector = true WHERE name IN ('Alhaji Musa Ibrahim', 'Mrs. Funke Adeleke');
 INSERT INTO order_item_sizes (order_item_id, size, quantity, completed) VALUES (1,'S',40,40),(1,'M',70,45),(1,'L',70,50),(1,'XL',60,15),(1,'XXL',10,5);
+-- Preserve the existing sample worker's assignments and earnings.
+UPDATE public.users AS account SET worker_id = profile.id
+FROM public.workers AS profile
+WHERE account.role = 'WORKER'
+  AND account.organization_id = profile.organization_id
+  AND lower(btrim(account.name)) = lower(btrim(profile.name));
+-- Historical demo jobs keep their original per-piece agreement.
+UPDATE public.production_operations AS job SET piece_rate = worker.payment_rate
+FROM public.workers AS worker
+WHERE job.worker_id = worker.id AND job.piece_rate IS NULL
+  AND worker.payment_type = 'PER_PIECE' AND worker.payment_rate > 0;
+UPDATE public.stage_inspections AS check_record SET piece_rate = job.piece_rate
+FROM public.production_operations AS job
+WHERE check_record.production_operation_id = job.id
+  AND check_record.piece_rate IS NULL AND job.piece_rate IS NOT NULL;

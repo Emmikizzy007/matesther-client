@@ -7,6 +7,7 @@ import {
   workerOvertime,
 } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { inspectionEarnings } from "@/lib/job-pay";
 
 /* ---------------- month helpers ---------------- */
 
@@ -71,17 +72,18 @@ export async function accrualForWorker(workerId: number, month: string): Promise
     db.select().from(workerPayments).where(eq(workerPayments.workerId, workerId)),
     db.select().from(workerOvertime).where(eq(workerOvertime.workerId, workerId)),
   ]);
-  const opIds = new Set(ops.map((o) => o.id));
-
+  const operationsById = new Map(ops.map((operation) => [operation.id, operation]));
   let pieces = 0;
-  for (const i of insps) {
-    if (opIds.has(i.productionOperationId) && monthKey(i.inspectedAt) === month) {
-      pieces += i.quantityApproved ?? 0;
-    }
+  let piecework = 0;
+  for (const inspection of insps) {
+    const operation = operationsById.get(inspection.productionOperationId);
+    if (!operation || monthKey(inspection.inspectedAt) !== month) continue;
+    pieces += inspection.quantityApproved;
+    piecework += inspectionEarnings(inspection, operation, w);
   }
-  const rate = w.paymentRate ?? 0;
-  const piecework = w.paymentType === "PER_PIECE" ? pieces * rate : 0;
-  const salary = w.paymentType === "MONTHLY" && w.status === "ACTIVE" ? rate : 0;
+  const rate = w.paymentRate ?? 0; // monthly/daily salary or historical fallback only
+  const activeDuringMonth = w.status === "ACTIVE" || (!!w.archivedAt && month <= monthKey(w.archivedAt));
+  const salary = w.paymentType === "MONTHLY" && activeDuringMonth && (!w.createdAt || month >= monthKey(w.createdAt)) ? rate : 0;
   const overtime = ots
     .filter((o) => monthKey(o.workedOn) === month)
     .reduce((s, o) => s + (o.amount ?? 0), 0);

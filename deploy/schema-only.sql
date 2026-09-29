@@ -348,3 +348,18 @@ BEGIN
     REVOKE ALL ON SEQUENCE public.delivery_lines_id_seq FROM authenticated;
   END IF;
 END $matesther_documents$;
+
+-- One Worker login per production profile. Existing production records remain
+-- in workers and production_operations if a login is later renamed or removed.
+ALTER TABLE public.users ADD COLUMN worker_id integer;
+ALTER TABLE public.users
+  ADD CONSTRAINT users_worker_id_workers_id_fk
+  FOREIGN KEY (worker_id) REFERENCES public.workers(id) ON DELETE SET NULL;
+ALTER TABLE public.users ADD CONSTRAINT users_worker_id_unique UNIQUE (worker_id);
+
+-- Batch-specific garment details and agreed production pay.
+ALTER TABLE public.production_batches ADD COLUMN size text;
+ALTER TABLE public.production_batches ADD COLUMN color text;
+ALTER TABLE public.production_operations ADD COLUMN piece_rate integer;
+ALTER TABLE public.stage_inspections ADD COLUMN piece_rate integer;
+ALTER TABLE public.workers ADD COLUMN archived_at timestamp;

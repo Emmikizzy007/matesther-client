@@ -26,6 +26,9 @@ export const organizations = pgTable("organizations", {
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   organizationId: integer("organization_id").references(() => organizations.id),
+  // One login is linked to one production profile. Keep payroll and job history
+  // on workers, so changing the account name does not disconnect its records.
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }).unique(),
   name: text("name").notNull(),
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash"),
@@ -109,6 +112,7 @@ export const workers = pgTable("workers", {
   paymentRate: integer("payment_rate").notNull().default(0),
   isInspector: boolean("is_inspector").notNull().default(false),
   status: text("status").notNull().default("ACTIVE"),
+  archivedAt: timestamp("archived_at"),
   createdAt: timestamp("created_at").defaultNow(),
 });
 
@@ -132,6 +136,8 @@ export const productionBatches = pgTable("production_batches", {
   orderItemId: integer("order_item_id").references(() => orderItems.id),
   batchNumber: text("batch_number").notNull(),
   quantity: integer("quantity").notNull().default(0),
+  size: text("size"),
+  color: text("color"),
   status: text("status").notNull().default("PENDING"),
   createdAt: timestamp("created_at").defaultNow(),
 });
@@ -144,6 +150,9 @@ export const productionOperations = pgTable("production_operations", {
     .notNull(),
   stage: text("stage").notNull(),
   workerId: integer("worker_id").references(() => workers.id),
+  // Agreed price for THIS job/stage, not the worker's general profile.
+  // Null on historical records falls back to their legacy rate.
+  pieceRate: integer("piece_rate"),
   quantityReceived: integer("quantity_received").notNull().default(0),
   quantityCompleted: integer("quantity_completed").notNull().default(0),
   quantityRejected: integer("quantity_rejected").notNull().default(0),
@@ -168,6 +177,8 @@ export const stageInspections = pgTable("stage_inspections", {
     .references(() => productionOperations.id, { onDelete: "cascade" })
     .notNull(),
   inspectedBy: text("inspected_by").notNull(),
+  // Snapshot agreed pay per approved piece at inspection time.
+  pieceRate: integer("piece_rate"),
   quantityApproved: integer("quantity_approved").notNull().default(0),
   quantityRework: integer("quantity_rework").notNull().default(0),
   quantityRejected: integer("quantity_rejected").notNull().default(0),

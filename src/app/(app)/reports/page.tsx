@@ -284,8 +284,7 @@ export default function ReportsPage() {
                   <td className="px-3 py-2.5 text-xs">{w.paymentType.replace("_", " ")}</td>
                   <td className="px-3 py-2.5 text-right font-semibold">{w.approved.toLocaleString()}</td>
                   <td className="px-3 py-2.5 text-right">
-                    {naira(w.paymentRate)}
-                    <span className="text-[11px] text-slate-400">{w.paymentType === "PER_PIECE" ? " / pc" : w.paymentType === "MONTHLY" ? " / month" : " / day"}</span>
+                    {w.paymentType === "PER_PIECE" ? <span className="text-xs font-semibold text-slate-600">By job</span> : <>{naira(w.paymentRate)}<span className="text-[11px] text-slate-400">{w.paymentType === "MONTHLY" ? " / month" : " / day"}</span></>}
                   </td>
                   <td className="px-3 py-2.5 text-right font-bold text-matesther-700">{naira(w.earnings)}</td>
                 </tr>

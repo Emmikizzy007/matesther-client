@@ -18,31 +18,36 @@ export default function InspectionQueuePage() {
   const [inspectors, setInspectors] = useState<any[]>([]);
   const [inspBy, setInspBy] = useState(user?.name || "");
 
-  function load() {
-    fetch("/api/dashboard?view=pm", { cache: "no-store" })
-      .then((r) => r.json())
-      .then(setD)
-      .catch((e) => setErr(e.message));
-    fetch("/api/workers", { cache: "no-store" })
-      .then((r) => r.json())
-      .then((w) => {
-        if (Array.isArray(w)) setInspectors(w.filter((x: any) => x.isInspector && x.status === "ACTIVE"));
-      })
-      .catch(() => {});
-  }
-  useEffect(() => {
-    load();
-    const op = new URLSearchParams(window.location.search).get("op");
-    if (op && d) {
-      const match = d.inspection.awaiting.find((x: any) => String(x.id) === op);
-      if (match) openInspect(match);
+  async function load(openRequested = false) {
+    setErr("");
+    try {
+      const [response, staffResponse] = await Promise.all([
+        fetch("/api/dashboard?view=pm", { cache: "no-store" }),
+        fetch("/api/workers", { cache: "no-store" }),
+      ]);
+      const payload = await response.json();
+      if (!response.ok || !payload.inspection?.awaiting || !payload.inspection?.recentApproved || !payload.inspection?.reworkRequired)
+        throw new Error(payload.error || "Could not load the Inspection Queue. Please try again.");
+      setD(payload);
+      if (staffResponse.ok) {
+        const people = await staffResponse.json();
+        if (Array.isArray(people)) setInspectors(people.filter((person: any) => person.isInspector && person.status === "ACTIVE"));
+      }
+      if (openRequested) {
+        const op = new URLSearchParams(window.location.search).get("op");
+        const matchingJob = payload.inspection.awaiting.find((job: any) => String(job.id) === op);
+        if (matchingJob) openInspect(matchingJob);
+      }
+    } catch (cause) {
+      setErr(cause instanceof Error ? cause.message : "Could not load the Inspection Queue.");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }
+  useEffect(() => { void load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
   function openInspect(o: any) {
     setForm({ quantityApproved: String(o.pendingInspection), quantityRework: "0", quantityRejected: "0", notes: "" });
     setFormErr("");
+    setInspBy(user?.name || "");
     setSelected(o);
   }
 
@@ -74,8 +79,14 @@ export default function InspectionQueuePage() {
     }
   }
 
-  if (err) return <p className="text-sm text-red-700">Failed to load: {err}</p>;
-  if (!d) return <Card><Loading label="Loading inspection queue…" /></Card>;
+  if (err) return (
+    <Card className="p-6">
+      <p className="font-semibold text-red-700">Could not open Inspection Queue</p>
+      <p className="mt-1 text-sm text-slate-600">{err}</p>
+      <Btn className="mt-4" onClick={() => void load()}>Try again</Btn>
+    </Card>
+  );
+  if (!d) return <Card><Loading label="Loading inspection queue..." /></Card>;
 
   return (
     <div>

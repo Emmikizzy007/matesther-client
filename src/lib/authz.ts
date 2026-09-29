@@ -14,6 +14,8 @@ export interface SessionUser {
   name: string;
   email: string;
   role: string;
+  organizationId: number | null;
+  workerId: number | null;
 }
 
 /** Resolve a server-managed session cookie, never trust a browser-supplied role. */
@@ -33,7 +35,14 @@ export async function getSessionUser(req: Request): Promise<SessionUser | null> 
     }
     const [user] = await db.select().from(users).where(eq(users.id, session.userId)).limit(1);
     if (!user || user.status !== "ACTIVE") return null;
-    return { id: user.id, name: user.name, email: user.email, role: user.role };
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      organizationId: user.organizationId,
+      workerId: user.workerId,
+    };
   } catch (error) {
     console.error("Session validation failed", error);
     return null;
@@ -53,16 +62,34 @@ export async function guard(req: Request, roles: string[]) {
   return null;
 }
 
-function normName(value: string) {
-  return (value || "")
-    .toLowerCase()
-    .replace(/\b(mr|mrs|ms|miss|alaji|alhaji|dr)\b\.?/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+function comparableName(value: string): string {
+  return value.toLowerCase()
+    .replace(/\b(mr|mrs|ms|miss|alhaji|dr)\.?\s+/g, "")
+    .replace(/\s+/g, " ").trim();
 }
 
-/** Worker accounts must match their Workers record by name. */
+/**
+ * Existing saved links are honoured. For Worker logins made before a factory
+ * record exists, find one exact, unambiguous name match in the same company.
+ * Never match a substring or return another worker's production history.
+ */
 export async function getLinkedWorkerId(user: SessionUser): Promise<number | null> {
-  const staff = await db.select().from(workers);
-  return staff.find((person) => normName(person.name) === normName(user.name))?.id ?? null;
+  if (user.role !== "WORKER" || !user.organizationId) return null;
+  if (user.workerId) {
+    const [linked] = await db.select({ id: workers.id, organizationId: workers.organizationId, status: workers.status })
+      .from(workers).where(eq(workers.id, user.workerId)).limit(1);
+    return linked?.organizationId === user.organizationId && linked.status === "ACTIVE" ? linked.id : null;
+  }
+  const [profiles, accounts] = await Promise.all([
+    db.select({ id: workers.id, name: workers.name, status: workers.status }).from(workers)
+      .where(eq(workers.organizationId, user.organizationId)),
+    db.select({ id: users.id, name: users.name, role: users.role, workerId: users.workerId }).from(users)
+      .where(eq(users.organizationId, user.organizationId)),
+  ]);
+  const name = comparableName(user.name);
+  const candidates = profiles.filter((person) => person.status === "ACTIVE" && comparableName(person.name) === name);
+  if (candidates.length !== 1) return null;
+  const competing = accounts.some((account) => account.id !== user.id && account.role === "WORKER" &&
+    (account.workerId === candidates[0].id || comparableName(account.name) === name));
+  return competing ? null : candidates[0].id;
 }

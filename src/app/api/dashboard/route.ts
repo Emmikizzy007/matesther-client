@@ -19,28 +19,27 @@ import { desc } from "drizzle-orm";
 import { batchProgress } from "@/lib/server";
 import { workerAccruals, buildGrowth, currentMonth } from "@/lib/payroll";
 import { guard, getSessionUser, ANYONE } from "@/lib/authz";
+import { getWorkerDashboard } from "@/lib/worker-dashboard";
 
 const STAGES = ["CUTTING", "SEWING", "MONOGRAMMING", "BUTTONHOLE", "BUTTON_TACKING", "IRONING", "PACKING", "DELIVERY"];
 
-function norm(s: string) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/\b(mr|mrs|ms|miss|alaji|alhaba|dr)\b\.?/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 export async function GET(req: Request) {
-  const __g = await guard(req, ANYONE);
-  if (__g) return __g;
-  const __u = await getSessionUser(req);
+  const denied = await guard(req, ANYONE);
+  if (denied) return denied;
+  const sessionUser = await getSessionUser(req);
+  if (!sessionUser) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
   try {
-    const { searchParams } = new URL(req.url);
-    // The view is forced by the signed-in role - never by a client parameter.
-    const view =
-      __u?.role === "PRODUCTION_MANAGER" ? "pm" : __u?.role === "WORKER" ? "worker" : "owner";
-    const userName =
-      __u?.role === "WORKER" ? __u.name : (searchParams.get("name") || "");
+    // Workers never fetch business-wide financial records. A login without a
+    // linked worker profile receives an empty dashboard instead of an error.
+    if (sessionUser.role === "WORKER") {
+      return NextResponse.json(await getWorkerDashboard(sessionUser), {
+        headers: { "Cache-Control": "private, no-store" },
+      });
+    }
+    // Owner has every production-supervision permission as well as business access.
+    // PM can NEVER request the owner view, but Owner may use the production view.
+    const requestedView = new URL(req.url).searchParams.get("view");
+    const view = sessionUser.role === "PRODUCTION_MANAGER" || requestedView === "pm" ? "pm" : "owner";
 
     const [
       orderRows,
@@ -244,59 +243,6 @@ export async function GET(req: Request) {
           recentApproved: inspectionRows.slice(0, 6).map(inspectionContext),
           reworkRequired: inspectionRows.filter((i) => i.quantityRework > 0).slice(0, 6).map(inspectionContext),
         },
-      });
-    }
-
-    /* ================= WORKER view - personal journal & earnings ================= */
-    if (view === "worker") {
-      const worker =
-        workerRows.find((w) => norm(w.name) === norm(userName)) ||
-        (userName ? workerRows.find((w) => norm(w.name).includes(norm(userName))) : undefined);
-      if (!worker)
-        return NextResponse.json(
-          { error: "No production profile is linked to this login. Ask the owner to match your worker record." },
-          { status: 400 }
-        );
-
-      const mine = opRows.filter((o) => o.workerId === worker.id);
-      const active = mine
-        .filter((o) => o.status === "IN_PROGRESS" || o.status === "SUBMITTED" || o.status === "PENDING")
-        .map(opContext);
-
-      const perPiece = worker.paymentType === "PER_PIECE";
-      const myInspections = inspectionRows.filter((i) => mine.some((o) => o.id === i.productionOperationId));
-      const events = myInspections
-        .filter((i) => i.quantityApproved > 0 && perPiece)
-        .map((i) => {
-          const ctx = inspectionContext(i);
-          return {
-            ...ctx,
-            amount: i.quantityApproved * (worker.paymentRate ?? 0),
-          };
-        });
-      const sumIn = (from: Date) =>
-        events
-          .filter((e) => new Date(e.inspectedAt ?? 0) >= from)
-          .reduce((s, e) => s + e.amount, 0);
-      const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-      const weekAgo = new Date(today.getTime() - 7 * 86400000);
-
-      return NextResponse.json({
-        view: "worker",
-        profile: { ...worker, perPiece },
-        todayJobs: active,
-        earnings: {
-          today: sumIn(today),
-          week: sumIn(weekAgo),
-          month: sumIn(monthStart),
-          total: sumIn(new Date(2000, 0, 1)),
-          events: events.slice(0, 30),
-        },
-        recentJobs: mine
-          .filter((o) => o.status === "COMPLETED")
-          .map(opContext)
-          .slice(0, 10),
-        journal: mine.map(opContext),
       });
     }
 

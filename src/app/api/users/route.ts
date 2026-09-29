@@ -1,129 +1,130 @@
 import { NextResponse } from "next/server";
-import { guard, OWNER } from "@/lib/authz";
-import { db } from "@/db";
-import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { users, workers } from "@/db/schema";
+import { guard, OWNER } from "@/lib/authz";
 import { hashPassword } from "@/lib/password";
 
-const VALID_ROLES = ["OWNER", "PRODUCTION_MANAGER", "WORKER"];
+const ROLES = ["OWNER", "PRODUCTION_MANAGER", "WORKER"];
+const STATUSES = ["ACTIVE", "INACTIVE"];
+type User = typeof users.$inferSelect;
+const nameKey = (name: string) => name.toLowerCase().replace(/\b(mr|mrs|ms|miss|alhaji|dr)\.?\s+/g, "").replace(/\s+/g, " ").trim();
 
-function safe(u: typeof users.$inferSelect) {
-  const { passwordHash: _omit, ...rest } = u;
-  return { ...rest, hasPassword: !!u.passwordHash };
+function safe(user: User, workerName?: string | null) {
+  const { passwordHash, ...rest } = user;
+  return { ...rest, hasPassword: !!passwordHash, workerName: workerName ?? null };
+}
+function databaseError(error: unknown) {
+  const value = error as { code?: string; cause?: { code?: string } };
+  return value?.cause?.code ?? value?.code;
 }
 
-/** List all staff users (passwords never returned) */
 export async function GET(req: Request) {
-  const __g = await guard(req, OWNER); if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const rows = await db.select().from(users);
-    return NextResponse.json(rows.map(safe));
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    const [accounts, profiles] = await Promise.all([
+      db.select().from(users),
+      db.select({ id: workers.id, name: workers.name, organizationId: workers.organizationId, status: workers.status }).from(workers),
+    ]);
+    return NextResponse.json(accounts.map((account) => {
+      const worker = account.workerId
+        ? profiles.find((person) => person.id === account.workerId)
+        : profiles.filter((person) => person.organizationId === account.organizationId && person.status === "ACTIVE" && nameKey(person.name) === nameKey(account.name))
+          .length === 1 ? profiles.find((person) => person.organizationId === account.organizationId && person.status === "ACTIVE" && nameKey(person.name) === nameKey(account.name)) : null;
+      return safe(account, worker?.name);
+    }), { headers: { "Cache-Control": "private, no-store" } });
+  } catch (error) {
+    console.error("Staff list failed", error);
+    return NextResponse.json({ error: "Could not load staff accounts." }, { status: 500 });
   }
 }
 
-/** Create a staff user (owner creates production managers / workers) */
+/** Worker sign-ins may be created before the matching record under Workers. */
 export async function POST(req: Request) {
-  const __g = await guard(req, OWNER); if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const b = await req.json();
-    if (!b.name) return NextResponse.json({ error: "Name is required." }, { status: 400 });
-    if (!b.email) return NextResponse.json({ error: "Email is required." }, { status: 400 });
-    if (!b.password || String(b.password).length < 6)
-      return NextResponse.json(
-        { error: "Password is required (minimum 6 characters)." },
-        { status: 400 }
-      );
-    if (!VALID_ROLES.includes(b.role))
-      return NextResponse.json({ error: "Choose a valid role." }, { status: 400 });
-
-    const [row] = await db
-      .insert(users)
-      .values({
-        organizationId: 1,
-        name: b.name,
-        email: String(b.email).trim().toLowerCase(),
-        passwordHash: hashPassword(String(b.password)),
-        role: b.role,
-        phone: b.phone || null,
-        status: "ACTIVE",
-      })
-      .returning();
-    return NextResponse.json(safe(row), { status: 201 });
-  } catch (e: any) {
-    const msg = String(e.message || "");
-    if (msg.includes("unique") || msg.includes("duplicate"))
-      return NextResponse.json(
-        { error: "That email is already used by another staff account." },
-        { status: 400 }
-      );
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const body = await req.json();
+    const name = String(body.name ?? "").trim();
+    const email = String(body.email ?? "").trim().toLowerCase();
+    const role = String(body.role ?? "");
+    const password = String(body.password ?? "");
+    if (!name || !/^\S+@\S+\.\S+$/.test(email))
+      return NextResponse.json({ error: "A full name and valid email are required." }, { status: 400 });
+    if (password.length < 6)
+      return NextResponse.json({ error: "Password must have at least 6 characters." }, { status: 400 });
+    if (!ROLES.includes(role))
+      return NextResponse.json({ error: "Choose a valid staff role." }, { status: 400 });
+    const [created] = await db.insert(users).values({
+      organizationId: 1, name, email, role, workerId: null,
+      passwordHash: hashPassword(password),
+      phone: String(body.phone ?? "").trim() || null,
+      status: "ACTIVE",
+    }).returning();
+    return NextResponse.json(safe(created), { status: 201 });
+  } catch (error) {
+    if (databaseError(error) === "23505")
+      return NextResponse.json({ error: "That email already has a staff account." }, { status: 409 });
+    console.error("Staff creation failed", error);
+    return NextResponse.json({ error: "Could not create the staff account." }, { status: 500 });
   }
 }
 
-/** Update a staff user - name, role, phone, status, and/or new password */
 export async function PUT(req: Request) {
-  const __g = await guard(req, OWNER); if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const b = await req.json();
-    if (!b.id) return NextResponse.json({ error: "User id is required." }, { status: 400 });
-    const [target] = await db.select().from(users).where(eq(users.id, Number(b.id)));
-    if (!target) return NextResponse.json({ error: "User not found." }, { status: 404 });
-    if (target.role === "OWNER" && target.status === "ACTIVE" &&
-        (b.role && b.role !== "OWNER" || b.status && b.status !== "ACTIVE")) {
-      const allOwners = await db.select().from(users).where(eq(users.role, "OWNER"));
-      if (allOwners.filter((account) => account.status === "ACTIVE").length <= 1)
+    const body = await req.json();
+    const id = Number(body.id);
+    if (!Number.isSafeInteger(id) || id <= 0)
+      return NextResponse.json({ error: "Valid account ID required." }, { status: 400 });
+    const [current] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    if (!current) return NextResponse.json({ error: "Staff account not found." }, { status: 404 });
+    const role = body.role === undefined ? current.role : String(body.role);
+    const status = body.status === undefined ? current.status : String(body.status);
+    if (!ROLES.includes(role) || !STATUSES.includes(status))
+      return NextResponse.json({ error: "Choose a valid role and status." }, { status: 400 });
+    if (current.role === "OWNER" && current.status === "ACTIVE" && (role !== "OWNER" || status !== "ACTIVE")) {
+      const owners = await db.select({ status: users.status }).from(users).where(eq(users.role, "OWNER"));
+      if (owners.filter((account) => account.status === "ACTIVE").length <= 1)
         return NextResponse.json({ error: "Keep at least one active Owner account." }, { status: 409 });
     }
-    const patch: Partial<typeof users.$inferInsert> = {};
-    if (b.name !== undefined) patch.name = b.name;
-    if (b.phone !== undefined) patch.phone = b.phone || null;
-    if (b.role !== undefined) {
-      if (!VALID_ROLES.includes(b.role))
-        return NextResponse.json({ error: "Choose a valid role." }, { status: 400 });
-      patch.role = b.role;
-    }
-    if (b.status !== undefined) patch.status = b.status;
-    if (b.password) {
-      if (String(b.password).length < 6)
-        return NextResponse.json(
-          { error: "New password must be at least 6 characters." },
-          { status: 400 }
-        );
-      patch.passwordHash = hashPassword(String(b.password));
-    }
-    const [row] = await db
-      .update(users)
-      .set(patch)
-      .where(eq(users.id, Number(b.id)))
-      .returning();
-    if (!row) return NextResponse.json({ error: "User not found." }, { status: 404 });
-    return NextResponse.json(safe(row));
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+    const password = body.password ? String(body.password) : "";
+    if (password && password.length < 6)
+      return NextResponse.json({ error: "New password must have at least 6 characters." }, { status: 400 });
+    const name = body.name === undefined ? current.name : String(body.name).trim();
+    if (!name) return NextResponse.json({ error: "Staff name is required." }, { status: 400 });
+    const [updated] = await db.update(users).set({
+      name, role, status, workerId: role === "WORKER" ? current.workerId : null,
+      phone: body.phone === undefined ? current.phone : String(body.phone).trim() || null,
+      ...(password ? { passwordHash: hashPassword(password) } : {}),
+    }).where(eq(users.id, id)).returning();
+    return NextResponse.json(safe(updated));
+  } catch (error) {
+    console.error("Staff update failed", error);
+    return NextResponse.json({ error: "Could not update the staff account." }, { status: 500 });
   }
 }
 
-/** Delete a staff user (cannot delete the last owner) */
 export async function DELETE(req: Request) {
-  const __g = await guard(req, OWNER); if (__g) return __g;
+  const denied = await guard(req, OWNER);
+  if (denied) return denied;
   try {
-    const { searchParams } = new URL(req.url);
-    const id = Number(searchParams.get("id"));
-    const [target] = await db.select().from(users).where(eq(users.id, id));
-    if (!target) return NextResponse.json({ error: "User not found." }, { status: 404 });
-    if (target.role === "OWNER" && target.status === "ACTIVE") {
-      const owners = await db.select().from(users).where(eq(users.role, "OWNER"));
-      if (owners.filter((account) => account.status === "ACTIVE").length <= 1)
-        return NextResponse.json(
-          { error: "Cannot delete the last active Owner account." },
-          { status: 409 }
-        );
+    const id = Number(new URL(req.url).searchParams.get("id"));
+    if (!Number.isSafeInteger(id) || id <= 0)
+      return NextResponse.json({ error: "Valid account ID required." }, { status: 400 });
+    const [account] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    if (!account) return NextResponse.json({ error: "Staff account not found." }, { status: 404 });
+    if (account.role === "OWNER" && account.status === "ACTIVE") {
+      const owners = await db.select({ status: users.status }).from(users).where(eq(users.role, "OWNER"));
+      if (owners.filter((owner) => owner.status === "ACTIVE").length <= 1)
+        return NextResponse.json({ error: "Cannot delete the last active Owner." }, { status: 409 });
     }
     await db.delete(users).where(eq(users.id, id));
     return NextResponse.json({ ok: true });
-  } catch (e: any) {
-    return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
+  } catch (error) {
+    console.error("Staff deletion failed", error);
+    return NextResponse.json({ error: "Could not delete the staff account." }, { status: 500 });
   }
 }

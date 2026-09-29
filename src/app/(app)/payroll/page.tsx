@@ -187,7 +187,7 @@ export default function PayrollPage() {
                     <tr key={w.workerId} className="hover:bg-slate-50">
                       <td className="px-5 py-3 font-semibold">
                         {w.name}
-                        <span className="block text-xs font-normal text-slate-500">{w.specialty} • {naira(w.rate)}{w.paymentType === "PER_PIECE" ? " / pc" : " / month"}</span>
+                        <span className="block text-xs font-normal text-slate-500">{w.specialty} • {w.paymentType === "PER_PIECE" ? "Agreed rate varies by job" : `${naira(w.rate)} / month`}</span>
                       </td>
                       <td className="px-3 py-3 text-xs">{w.paymentType.replace("_", " ")}</td>
                       <td className="px-3 py-3 text-right">{w.pieces.toLocaleString()}</td>
@@ -328,7 +328,7 @@ export default function PayrollPage() {
         ) : historyFor?.history ? (
           <div>
             <p className="text-xs text-slate-500 mb-3">
-              {historyFor.specialty} • {historyFor.paymentType.replace("_", " ")} {naira(historyFor.rate)}{historyFor.paymentType === "PER_PIECE" ? " per piece" : " per month"}
+              {historyFor.specialty} • {historyFor.paymentType === "PER_PIECE" ? "Per-piece rates agreed by job" : `${historyFor.paymentType.replace("_", " ")} ${naira(historyFor.rate)} per month`}
             </p>
             <div className="overflow-x-auto slim-scroll rounded-lg border border-slate-200">
               <table className="w-full text-sm min-w-[560px]">

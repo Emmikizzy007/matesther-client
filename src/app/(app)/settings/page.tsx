@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { Plus } from "lucide-react";
 import { Card, CardHeader, PageHeader, Loading, Modal, Field, inputCls, Btn, Badge } from "@/components/ui";
 import { naira } from "@/lib/format";
@@ -19,10 +20,6 @@ export default function SettingsPage() {
   const [prodForm, setProdForm] = useState({ id: null as number | null, name: "", description: "", category: "Shirts", sellingPrice: "" });
   const [err, setErr] = useState("");
   const [saving, setSaving] = useState(false);
-  const [userModal, setUserModal] = useState(false);
-  const [editingUser, setEditingUser] = useState<any>(null);
-  const [userForm, setUserForm] = useState({ name: "", email: "", password: "", role: "PRODUCTION_MANAGER", phone: "", status: "ACTIVE" });
-  const [userErr, setUserErr] = useState("");
   const [logoFile, setLogoFile] = useState<File | null>(null);
   const [logoConfigured, setLogoConfigured] = useState(false);
   const [logoVersion, setLogoVersion] = useState(0);
@@ -159,21 +156,7 @@ export default function SettingsPage() {
               <CardHeader
                 title="Users & Roles"
                 subtitle="Staff logins - create accounts, set passwords, activate / deactivate"
-                action={
-                  user?.role === "OWNER" ? (
-                    <Btn
-                      variant="secondary"
-                      onClick={() => {
-                        setEditingUser(null);
-                        setUserForm({ name: "", email: "", password: "", role: "PRODUCTION_MANAGER", phone: "", status: "ACTIVE" });
-                        setUserErr("");
-                        setUserModal(true);
-                      }}
-                    >
-                      <Plus className="w-4 h-4" /> Add Staff
-                    </Btn>
-                  ) : undefined
-                }
+                action={<Link href="/users" className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-matesther-700 hover:bg-slate-50">Manage staff accounts</Link>}
               />
               <div className="divide-y divide-slate-100">
                 {users.map((u: any) => (
@@ -189,22 +172,11 @@ export default function SettingsPage() {
                         </span>
                         <span className="text-slate-400"> • {u.hasPassword ? "password set" : "no password yet"}</span>
                       </p>
+                      {u.role === "WORKER" && <p className="mt-0.5 text-[11px] text-slate-500">Production jobs are managed under Workers.</p>}
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <Badge status={u.status === "ACTIVE" ? "COMPLETED" : "CANCELLED"} />
-                      {user?.role === "OWNER" && (
-                        <button
-                          onClick={() => {
-                            setEditingUser(u);
-                            setUserForm({ name: u.name, email: u.email, password: "", role: u.role, phone: u.phone || "", status: u.status || "ACTIVE" });
-                            setUserErr("");
-                            setUserModal(true);
-                          }}
-                          className="text-xs font-semibold text-matesther-700 hover:underline"
-                        >
-                          Manage
-                        </button>
-                      )}
+                      <Link href="/users" className="text-xs font-semibold text-matesther-700 hover:underline">Manage</Link>
                     </div>
                   </div>
                 ))}
@@ -218,7 +190,7 @@ export default function SettingsPage() {
             </Card>
 
             <Card>
-              <CardHeader title="Matesther Production Workflow" subtitle="Fixed 7-stage flow for every batch" />
+              <CardHeader title="Matesther Production Workflow" subtitle="Fixed 8-stage flow for every batch" />
               <div className="p-5 flex flex-wrap items-center gap-2">
                 {STAGES.map((s, i) => (
                   <span key={s} className="flex items-center gap-2">
@@ -259,85 +231,6 @@ export default function SettingsPage() {
           </Card>
         </div>
       )}
-
-      <Modal open={userModal} onClose={() => setUserModal(false)} title={editingUser ? `Manage - ${editingUser.name}` : "Add Staff Account"}>
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            setSaving(true);
-            setUserErr("");
-            try {
-              const body: any = {
-                id: editingUser?.id,
-                name: userForm.name,
-                email: userForm.email,
-                role: userForm.role,
-                phone: userForm.phone,
-                status: userForm.status,
-              };
-              if (userForm.password) body.password = userForm.password;
-              const res = await fetch("/api/users", {
-                method: editingUser ? "PUT" : "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-              });
-              const d = await res.json();
-              if (!res.ok) throw new Error(d.error || "Failed to save");
-              setUserModal(false);
-              load();
-            } catch (e: any) {
-              setUserErr(e.message);
-            } finally {
-              setSaving(false);
-            }
-          }}
-          className="grid sm:grid-cols-2 gap-3"
-        >
-          <Field label="Full name *"><input required value={userForm.name} onChange={(e) => setUserForm({ ...userForm, name: e.target.value })} className={inputCls} placeholder="e.g. Itesh Justina" /></Field>
-          <Field label="Phone"><input value={userForm.phone} onChange={(e) => setUserForm({ ...userForm, phone: e.target.value })} className={inputCls} placeholder="+234 ..." /></Field>
-          <Field label="Email (login) *" className="sm:col-span-2">
-            <input type="email" required disabled={!!editingUser} value={userForm.email} onChange={(e) => setUserForm({ ...userForm, email: e.target.value })} className={`${inputCls} disabled:bg-slate-100`} placeholder="manager@matesther.ng" />
-          </Field>
-          <Field label="Role">
-            <select value={userForm.role} onChange={(e) => setUserForm({ ...userForm, role: e.target.value })} className={inputCls}>
-              <option value="OWNER">Owner / Admin</option>
-              <option value="PRODUCTION_MANAGER">Production Manager</option>
-              <option value="WORKER">Worker</option>
-            </select>
-          </Field>
-          <Field label="Status">
-            <select value={userForm.status} onChange={(e) => setUserForm({ ...userForm, status: e.target.value })} className={inputCls}>
-              <option value="ACTIVE">Active</option>
-              <option value="INACTIVE">Deactivated</option>
-            </select>
-          </Field>
-          <Field label={editingUser ? "New password (leave blank to keep current)" : "Password (min 6 characters) *"} className="sm:col-span-2">
-            <input type="password" required={!editingUser} minLength={6} value={userForm.password} onChange={(e) => setUserForm({ ...userForm, password: e.target.value })} className={inputCls} placeholder="••••••" />
-          </Field>
-          {userErr && <p className="sm:col-span-2 text-sm text-red-600">{userErr}</p>}
-          <div className="sm:col-span-2 flex items-center justify-between">
-            {editingUser && editingUser.email !== user?.email ? (
-              <button
-                type="button"
-                onClick={async () => {
-                  if (!confirm(`Delete ${editingUser.name}'s account? They will no longer be able to sign in.`)) return;
-                  const res = await fetch(`/api/users?id=${editingUser.id}`, { method: "DELETE" });
-                  const d = await res.json();
-                  if (!res.ok) setUserErr(d.error);
-                  else { setUserModal(false); load(); }
-                }}
-                className="text-xs font-semibold text-red-700 hover:underline"
-              >
-                Delete account
-              </button>
-            ) : <span />}
-            <div className="flex gap-2">
-              <Btn variant="secondary" onClick={() => setUserModal(false)}>Cancel</Btn>
-              <Btn type="submit" disabled={saving}>{saving ? "Saving…" : editingUser ? "Save Changes" : "Create Account"}</Btn>
-            </div>
-          </div>
-        </form>
-      </Modal>
 
       <Modal open={prodModal} onClose={() => setProdModal(false)} title={prodForm.id ? "Edit Product" : "Add Uniform Product"}>
         <form onSubmit={saveProduct} className="grid sm:grid-cols-2 gap-3">

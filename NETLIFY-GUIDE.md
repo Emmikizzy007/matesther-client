@@ -44,7 +44,7 @@ A domain is an address, **not** a separate database or server. Phone users insta
 5. Open the NEW `.netlify.app` URL, not the old prototype URL. The login page should say **“Set up the client site.”** Enter Esther Adejugba (or the real owner's name), her email `estheradejugba@gmail.com`, **a NEW strong password that you choose**, and the private `MATESTHER_SETUP_KEY` you saved. Click **Create Owner account**; you'll be signed in. The old prototype password `owner123` will **not** be the client password.
 6. If the page instead shows **“Sign in”**, your new database already has at least one user or this site is pointed at the old database. Check the new site's `DATABASE_URL` against the NEW Supabase project's Connect string before making changes. Do not reset an existing database to fix this; you may be looking at the prototype!
 7. Go to **Settings → Business Profile** to confirm the contact details. Then **Settings → Original company logo → Upload original logo**; choose the PNG saved in step 1. The file is stored in the NEW Supabase project unchanged. Reload the website to update the sidebar and favicon. The phone icons are size-adjusted copies of that exact file, never redrawn artwork.
-8. Add real school customers, products, workers and orders. Create Project Manager and Worker sign-in accounts under **Users**. When making a Worker account, its name must match their record under **Workers** so the worker sees their own jobs.
+8. Add real school customers, products, workers and orders. Worker sign-in accounts can be created in **Users** either before or after their production record in **Workers**. Use the same full name for an unambiguous match. Until the Worker record exists, their personal dashboard shows a safe empty state instead of an error. Project Managers have their own dashboard and may also be listed as cutters under Workers if they do factory work.
 
 ## 4. Buy/connect a domain (without losing the prototype)
 
@@ -73,6 +73,19 @@ If your client Netlify site and its Supabase project already contain real orders
 6. Each document has **Print / Save as PDF**, **Share details**, and **Email details**. The browser email button drafts text, not a PDF attachment. To email the complete letterheaded sheet, save as PDF first, then attach the PDF manually. Do not email the private owner-only document URL to schools.
 
 Both sheets include Matesther's printed motto: "perfecting the right stitches with efficiency, quality materials and timely delivery...". They use the business contact details saved in Settings, not the older address printed on the reference letterhead.
+
+## Repair Worker sign-in on an existing client site
+
+This fixes an existing Worker account that signs in but fails to load its dashboard. It is not a website-storage limit. **Do not delete the Project Manager, Worker account, or production history.**
+
+1. Identify the **Supabase project used by the affected Netlify site**. Back it up if it contains real data. Do not run `full-setup.sql` or `schema-only.sql` on it.
+2. In that project's Supabase SQL Editor, run **`deploy/upgrade-worker-accounts.sql`**. It adds a nullable `worker_id` link, a foreign key and a unique constraint. It preserves all staff, orders, jobs, and payments. If an existing Worker login and a production Worker record have the same unambiguous name, it connects them automatically. It is safe to run again.
+3. In Netlify, deploy the **updated app code** to the site that uses that Supabase project. Run the SQL **before** deploying, because the new code expects the `worker_id` column.
+4. Sign in as Owner. Go to **Users**. If a Worker row says **Profile not connected**, open **Workers** and create that person's production record if it doesn't exist. Return to **Users > Manage**, choose **Link to worker profile**, and save. No new Worker password or login is required.
+5. Sign out and sign in as that Worker. The dashboard, My Jobs, My Journal, and My Earnings now open normally. If no work is assigned yet they will show an empty state, not a crash. They cannot see another worker's jobs.
+6. If an account was deleted, its production Worker record and history can still exist. After the database upgrade, create a new login linked to that existing Worker record. Deleting a Project Manager account does not free space or fix Worker sign-in.
+
+For a completely new client database, use `deploy/schema-only.sql` instead; it already includes this link. On an older demo database that already has workers, the upgrade auto-links exact one-to-one matches.
 
 ## 6. Two separate sign-ins; test before presenting
 

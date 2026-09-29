@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Plus, Pencil, Phone } from "lucide-react";
+import { Plus, Pencil, Phone, Trash2, Archive, RotateCcw } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, EmptyState, Modal, Field, inputCls, Btn } from "@/components/ui";
 import { naira, fmtDate, stageLabel, WORKER_SPECIALTIES } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
@@ -12,6 +12,8 @@ export default function WorkersPage() {
   const isOwner = user?.role === "OWNER";
   const [rows, setRows] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showArchived, setShowArchived] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const [modal, setModal] = useState(false);
   const [editing, setEditing] = useState<any>(null);
   const [form, setForm] = useState({ name: "", phone: "", specialty: "Tailor", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false });
@@ -22,12 +24,38 @@ export default function WorkersPage() {
 
   function load() {
     setLoading(true);
-    fetch("/api/workers", { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d) => setRows(Array.isArray(d) ? d : []))
+    setLoadError("");
+    fetch(`/api/workers${showArchived ? "?showArchived=1" : ""}`, { cache: "no-store" })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to load workers.");
+        setRows(Array.isArray(data) ? data : []);
+      })
+      .catch((cause) => setLoadError(cause instanceof Error ? cause.message : "Unable to load workers."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  useEffect(load, [showArchived]);
+
+  async function removeWorker(person: any) {
+    const action = person.hasHistory ? "archive" : "permanently delete";
+    if (!confirm(`${action.charAt(0).toUpperCase() + action.slice(1)} ${person.name}? ${person.hasHistory ? "Production and payroll history will remain available." : "This worker has no production or payroll history."}`)) return;
+    try {
+      const response = await fetch(`/api/workers?id=${person.id}`, { method: "DELETE" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Unable to remove this worker.");
+      await load();
+    } catch (cause) { alert(cause instanceof Error ? cause.message : "Unable to remove worker."); }
+  }
+
+  async function restoreWorker(person: any) {
+    try {
+      const response = await fetch("/api/workers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...person, status: "ACTIVE" }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Unable to restore this worker.");
+      await load();
+      alert("Worker restored. If their login was deactivated, reactivate it under Users.");
+    } catch (cause) { alert(cause instanceof Error ? cause.message : "Unable to restore worker."); }
+  }
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
@@ -68,14 +96,15 @@ export default function WorkersPage() {
       <PageHeader
         title="Workers"
         subtitle="Cutters, tailors, buttonhole, button tacking, ironers and packers - who is doing what"
-        action={isOwner ? (
-          <Btn onClick={() => { setEditing(null); setForm({ name: "", phone: "", specialty: "Tailor", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false }); setErr(""); setModal(true); }}>
+        action={<>
+          <Btn variant="secondary" onClick={() => setShowArchived((current) => !current)}>{showArchived ? "Active only" : "Show archived"}</Btn>
+          {isOwner && <Btn onClick={() => { setEditing(null); setForm({ name: "", phone: "", specialty: "Tailor", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false }); setErr(""); setModal(true); }}>
             <Plus className="w-4 h-4" /> Add Worker
-          </Btn>
-        ) : undefined}
+          </Btn>}
+        </>}
       />
       <Card>
-        {loading ? <Loading /> : rows.length === 0 ? <EmptyState title="No workers" /> : (
+        {loading ? <Loading /> : loadError ? <div className="p-5 text-sm text-red-700">{loadError} <button onClick={load} className="font-semibold underline">Try again</button></div> : rows.length === 0 ? <EmptyState title={showArchived ? "No archived workers" : "No active workers"} /> : (
           <div className="overflow-x-auto slim-scroll">
             <table className="w-full text-sm min-w-[900px]">
               <thead>
@@ -109,7 +138,7 @@ export default function WorkersPage() {
                     </td>
                     {isOwner && <td className="px-3 py-3 text-xs">
                       {w.paymentType.replace("_", " ")}<br />
-                      <span className="font-semibold">{naira(w.paymentRate)}</span>
+                      <span className="font-semibold">{w.paymentType === "PER_PIECE" ? "Agreed per job" : naira(w.paymentRate)}</span>
                     </td>}
                     <td className="px-3 py-3 text-right font-bold">{w.currentTasks}</td>
                     <td className="px-3 py-3 text-right">{w.assigned.toLocaleString()}</td>
@@ -119,17 +148,17 @@ export default function WorkersPage() {
                     <td className="px-3 py-3"><Badge status={w.status} /></td>
                     <td className="px-3 py-3 text-right whitespace-nowrap">
                       <button onClick={() => openHistory(w.id)} className="text-xs font-semibold text-matesther-700 hover:underline mr-3">History</button>
-                      {isOwner && <button
-                        onClick={() => {
+                      {isOwner && <>
+                        <button title={`Edit ${w.name}`} aria-label={`Edit ${w.name}`} onClick={() => {
                           setEditing(w);
                           setForm({ name: w.name, phone: w.phone || "", specialty: w.specialty, paymentType: w.paymentType, paymentRate: String(w.paymentRate), status: w.status, isInspector: !!w.isInspector });
-                          setErr("");
-                          setModal(true);
-                        }}
-                        className="p-1 text-slate-500 hover:text-matesther-700"
-                      >
-                        <Pencil className="w-4 h-4" />
-                      </button>}
+                          setErr(""); setModal(true);
+                        }} className="p-1 text-slate-500 hover:text-matesther-700"><Pencil className="w-4 h-4" /></button>
+                        {w.status === "ACTIVE" ? <button title={w.hasHistory ? `Archive ${w.name}` : `Delete ${w.name}`} aria-label={w.hasHistory ? `Archive ${w.name}` : `Delete ${w.name}`}
+                          onClick={() => void removeWorker(w)} className="p-1 text-slate-500 hover:text-red-700">
+                          {w.hasHistory ? <Archive className="w-4 h-4" /> : <Trash2 className="w-4 h-4" />}
+                        </button> : <button title={`Restore ${w.name}`} aria-label={`Restore ${w.name}`} onClick={() => void restoreWorker(w)} className="p-1 text-slate-500 hover:text-matesther-700"><RotateCcw className="w-4 h-4" /></button>}
+                      </>}
                     </td>
                   </tr>
                 ))}
@@ -155,7 +184,8 @@ export default function WorkersPage() {
               <option value="MONTHLY">Monthly</option>
             </select>
           </Field>
-          <Field label="Payment rate (₦)"><input type="number" min="0" value={form.paymentRate} onChange={(e) => setForm({ ...form, paymentRate: e.target.value })} className={inputCls} /></Field>
+          {form.paymentType === "PER_PIECE" ? <p className="self-end rounded-lg border border-matesther-100 bg-matesther-50 p-2 text-xs text-matesther-800">Agree the price per garment when assigning each production job. This profile does not fix one price for all clothes.</p>
+            : <Field label={form.paymentType === "MONTHLY" ? "Monthly salary (₦)" : "Daily rate (₦)"}><input type="number" min="0" value={form.paymentRate} onChange={(e) => setForm({ ...form, paymentRate: e.target.value })} className={inputCls} /></Field>}
           <label className="flex items-center gap-2 text-sm text-slate-700 sm:col-span-2">
             <input type="checkbox" checked={!!form.isInspector} onChange={(e) => setForm({ ...form, isInspector: e.target.checked })} className="accent-matesther-700" />
             <span>
