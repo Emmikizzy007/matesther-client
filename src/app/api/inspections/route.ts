@@ -98,8 +98,10 @@ export async function POST(req: Request) {
         { error: "Record at least one piece as approved, rework or rejected." },
         { status: 400 }
       );
-    if (!b.inspectedBy)
-      return NextResponse.json({ error: "Inspector name is required." }, { status: 400 });
+    const inspector = await getSessionUser(req);
+    if (!inspector) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
+    if ((rework > 0 || rejected > 0) && !String(b.notes ?? "").trim())
+      return NextResponse.json({ error: "Explain why garments need rework or were rejected." }, { status: 400 });
 
     const [op] = await db
       .select()
@@ -119,7 +121,7 @@ export async function POST(req: Request) {
     // 1. Record the inspection (audit trail)
     await db.insert(stageInspections).values({
       productionOperationId: opId,
-      inspectedBy: String(b.inspectedBy),
+      inspectedBy: inspector.name,
       pieceRate: agreedRate,
       quantityApproved: approved,
       quantityRework: rework,
@@ -146,7 +148,7 @@ export async function POST(req: Request) {
         quantityRework: (op.quantityRework ?? 0) + rework,
         quantityRejected: (op.quantityRejected ?? 0) + rejected,
         quantityRemaining: newRemaining,
-        inspector: String(b.inspectedBy),
+        inspector: inspector.name,
         inspectedAt: new Date(),
         status,
         completedAt: newRemaining <= 0 ? op.completedAt ?? new Date() : null,

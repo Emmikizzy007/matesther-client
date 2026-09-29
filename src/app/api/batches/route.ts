@@ -4,7 +4,7 @@ import { db } from "@/db";
 import { orders, orderItems, orderItemSizes, productionBatches, productionOperations, workers } from "@/db/schema";
 import { STAGES } from "@/lib/format";
 import { refreshBatchAndOrder } from "@/lib/server";
-import { guard, OWNER, STAFF } from "@/lib/authz";
+import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
 
 type Assignment = { id: number | null; rate: number | null };
 
@@ -35,7 +35,8 @@ export async function POST(req: Request) {
     if (!Number.isSafeInteger(orderId) || orderId < 1 || !Number.isSafeInteger(quantity) || quantity < 1)
       return NextResponse.json({ error: "Choose an order and a positive whole-number batch quantity." }, { status: 400 });
     const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
-    if (!order || order.status === "CANCELLED")
+    const session = await getSessionUser(req);
+    if (!order || order.organizationId !== session?.organizationId || ["CANCELLED", "COMPLETED"].includes(order.status))
       return NextResponse.json({ error: "This order is not available for production." }, { status: 400 });
     const [item] = itemId ? await db.select().from(orderItems).where(eq(orderItems.id, itemId)).limit(1) : [];
     if (itemId && (!item || item.orderId !== orderId))
@@ -51,13 +52,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `Add size ${size} under the order's Sizes tab first.` }, { status: 400 });
     const targetSize = sizes.find((row) => row.size.toUpperCase() === size);
     const existing = await db.select().from(productionBatches).where(eq(productionBatches.orderId, orderId));
+    const itemAllocated = existing.filter((batch) => batch.orderItemId === itemId && batch.status !== "CANCELLED")
+      .reduce((sum, batch) => sum + batch.quantity, 0);
+    if (item && itemAllocated + quantity > item.quantity)
+      return NextResponse.json({ error: `Only ${Math.max(0, item.quantity - itemAllocated)} garment(s) remain to be assigned for this item.` }, { status: 400 });
     if (targetSize) {
       const allocated = existing.filter((batch) => batch.orderItemId === itemId && batch.size?.toUpperCase() === size && batch.status !== "CANCELLED")
         .reduce((sum, batch) => sum + batch.quantity, 0);
       if (allocated + quantity > targetSize.quantity)
         return NextResponse.json({ error: `Only ${Math.max(0, targetSize.quantity - allocated)} unassigned ${size} garment(s) remain for this item.` }, { status: 400 });
-    } else if (item && quantity > item.quantity)
-      return NextResponse.json({ error: "Batch quantity cannot exceed the ordered quantity for this garment." }, { status: 400 });
+    }
 
     async function resolveWorker(raw: unknown, rawRate: unknown, specialty: string): Promise<Assignment> {
       if (!raw) return { id: null, rate: null };

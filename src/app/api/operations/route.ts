@@ -69,7 +69,7 @@ export async function PUT(req: Request) {
     const [current] = await db.select().from(productionOperations).where(eq(productionOperations.id, id)).limit(1);
     if (!current) return NextResponse.json({ error: "Job not found." }, { status: 404 });
     const session = await getSessionUser(req);
-    if (session?.role === "WORKER") {
+    if (session?.role === "WORKER" || (session?.role === "PRODUCTION_MANAGER" && body.submitQty !== undefined)) {
       const workerId = await getLinkedWorkerId(session);
       if (!workerId || current.workerId !== workerId)
         return NextResponse.json({ error: "You can only submit your own assigned jobs." }, { status: 403 });

@@ -54,6 +54,7 @@ const OWNER_NAV: NavGroup[] = [
     label: "Production",
     items: [
       { href: "/production", label: "Active Production", icon: Factory },
+      { href: "/production/assign", label: "Assign Production", icon: UserCheck },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
       { href: "/production/history", label: "Production History", icon: History },
       { href: "/workers", label: "Workers", icon: ContactRound },
@@ -97,6 +98,7 @@ const PM_NAV: NavGroup[] = [
   {
     label: "Production",
     items: [
+      { href: "/production/assign", label: "Assign Production", icon: UserCheck },
       { href: "/production", label: "Active Production", icon: Factory },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
       { href: "/production/history", label: "Production History", icon: History },
@@ -107,6 +109,15 @@ const PM_NAV: NavGroup[] = [
     items: [
       { href: "/workers", label: "Workers", icon: ContactRound },
       { href: "/workers/assignments", label: "Worker Assignments", icon: UserCheck },
+    ],
+  },
+  {
+    label: "My Factory Work",
+    items: [
+      { href: "/worker/jobs", label: "My Jobs", icon: Briefcase },
+      { href: "/worker/journal", label: "My Journal", icon: BookOpen },
+      { href: "/worker/earnings", label: "My Earnings", icon: Coins },
+      { href: "/worker/profile", label: "My Profile", icon: User },
     ],
   },
 ];

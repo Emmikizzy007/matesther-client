@@ -8,14 +8,16 @@ import { useAuth } from "@/lib/auth";
 
 type Account = {
   id: number; name: string; email: string; role: string; status: string;
-  phone: string | null; workerName: string | null; hasPassword: boolean;
+  phone: string | null; workerName: string | null; workerId: number | null; hasPassword: boolean;
 };
-type AccountForm = { name: string; email: string; password: string; role: string; phone: string; status: string };
-const emptyForm = (): AccountForm => ({ name: "", email: "", password: "", role: "PRODUCTION_MANAGER", phone: "", status: "ACTIVE" });
+type FactoryProfile = { id: number; name: string; specialty: string; status: string };
+type AccountForm = { name: string; email: string; password: string; role: string; phone: string; status: string; workerId: string };
+const emptyForm = (): AccountForm => ({ name: "", email: "", password: "", role: "PRODUCTION_MANAGER", phone: "", status: "ACTIVE", workerId: "" });
 
 export default function UsersPage() {
   const { user } = useAuth();
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [factoryWorkers, setFactoryWorkers] = useState<FactoryProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [modal, setModal] = useState(false);
@@ -28,10 +30,15 @@ export default function UsersPage() {
     setLoading(true);
     setLoadError("");
     try {
-      const response = await fetch("/api/users", { cache: "no-store" });
+      const [response, workersResponse] = await Promise.all([
+        fetch("/api/users", { cache: "no-store" }),
+        fetch("/api/workers", { cache: "no-store" }),
+      ]);
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Unable to load staff accounts.");
+      const profiles = workersResponse.ok ? await workersResponse.json() : [];
       setAccounts(Array.isArray(result) ? result : []);
+      setFactoryWorkers(Array.isArray(profiles) ? profiles : []);
     } catch (cause) {
       setLoadError(cause instanceof Error ? cause.message : "Unable to load staff accounts.");
     } finally { setLoading(false); }
@@ -41,7 +48,7 @@ export default function UsersPage() {
   function openNew() { setEditing(null); setForm(emptyForm()); setError(""); setModal(true); }
   function openEdit(account: Account) {
     setEditing(account);
-    setForm({ name: account.name, email: account.email, password: "", role: account.role, phone: account.phone ?? "", status: account.status });
+    setForm({ name: account.name, email: account.email, password: "", role: account.role, phone: account.phone ?? "", status: account.status, workerId: account.workerId ? String(account.workerId) : "" });
     setError(""); setModal(true);
   }
   async function save(event: FormEvent<HTMLFormElement>) {
@@ -49,7 +56,7 @@ export default function UsersPage() {
     try {
       const response = await fetch("/api/users", {
         method: editing ? "PUT" : "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, id: editing?.id }),
+        body: JSON.stringify({ ...form, id: editing?.id, workerId: form.role === "PRODUCTION_MANAGER" ? form.workerId || null : undefined }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Could not save staff account.");
@@ -87,6 +94,7 @@ export default function UsersPage() {
                 {account.role === "WORKER" && <p className={`mt-0.5 text-xs ${account.workerName ? "text-emerald-700" : "text-amber-700"}`}>
                   {account.workerName ? `Workers record: ${account.workerName}` : <>No matching Workers record yet. <Link href="/workers" className="font-semibold underline">Add worker</Link></>}
                 </p>}
+                {account.role === "PRODUCTION_MANAGER" && <p className="mt-0.5 text-xs text-matesther-700">{account.workerId ? `Also works as ${account.workerName || "factory staff"}` : "Supervisor only"}</p>}
               </td>
               <td className="px-3 py-3 text-xs">{account.phone || "-"}</td>
               <td className="px-3 py-3"><Badge status={account.status} /></td>
@@ -109,6 +117,17 @@ export default function UsersPage() {
           <option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option>
         </select></Field>
         {form.role === "WORKER" && <p className="sm:col-span-2 text-xs text-slate-500">Add this person on the <strong>Workers</strong> page with the same full name to show their jobs and earnings. You can create this login now or add their Workers record first.</p>}
+        {form.role === "PRODUCTION_MANAGER" && <div className="sm:col-span-2">
+          <Field label="Also works in the factory (optional)">
+            <select value={form.workerId} onChange={(event) => setForm({ ...form, workerId: event.target.value })} className={inputCls}>
+              <option value="">Supervision only</option>
+              {factoryWorkers.filter((profile) => profile.status === "ACTIVE" && !accounts.some((account) => account.workerId === profile.id && account.id !== editing?.id)).map((profile) => (
+                <option key={profile.id} value={profile.id}>{profile.name} ({profile.specialty})</option>
+              ))}
+            </select>
+          </Field>
+          <p className="mt-1 text-xs text-slate-500">A cutter-inspector uses this same login to supervise production and view their own assigned work and earnings. If they already have a Worker login, manage that account and change its role to Project Manager.</p>
+        </div>}
         <Field label={editing ? "New password (optional)" : "Password (at least 6 characters) *"} className="sm:col-span-2"><input type="password" required={!editing} minLength={6} className={inputCls} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></Field>
         {error && <p className="sm:col-span-2 text-sm text-red-700" role="alert">{error}</p>}
         <div className="flex justify-end gap-2 sm:col-span-2"><Btn variant="secondary" onClick={() => setModal(false)}>Cancel</Btn><Btn type="submit" disabled={saving}>{saving ? "Saving..." : editing ? "Save changes" : "Create account"}</Btn></div>

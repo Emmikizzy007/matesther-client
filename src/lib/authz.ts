@@ -74,7 +74,10 @@ function comparableName(value: string): string {
  * Never match a substring or return another worker's production history.
  */
 export async function getLinkedWorkerId(user: SessionUser): Promise<number | null> {
-  if (user.role !== "WORKER" || !user.organizationId) return null;
+  if (!(["WORKER", "PRODUCTION_MANAGER"] as string[]).includes(user.role) || !user.organizationId) return null;
+  // Supervisors opt in to the factory role through Users. Regular Workers can
+  // still be added before their Workers record and matched unambiguously later.
+  if (user.role === "PRODUCTION_MANAGER" && !user.workerId) return null;
   if (user.workerId) {
     const [linked] = await db.select({ id: workers.id, organizationId: workers.organizationId, status: workers.status })
       .from(workers).where(eq(workers.id, user.workerId)).limit(1);
@@ -89,7 +92,7 @@ export async function getLinkedWorkerId(user: SessionUser): Promise<number | nul
   const name = comparableName(user.name);
   const candidates = profiles.filter((person) => person.status === "ACTIVE" && comparableName(person.name) === name);
   if (candidates.length !== 1) return null;
-  const competing = accounts.some((account) => account.id !== user.id && account.role === "WORKER" &&
+  const competing = accounts.some((account) => account.id !== user.id && ["WORKER", "PRODUCTION_MANAGER"].includes(account.role) &&
     (account.workerId === candidates[0].id || comparableName(account.name) === name));
   return competing ? null : candidates[0].id;
 }

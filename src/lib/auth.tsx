@@ -81,7 +81,7 @@ export function roleLabel(role: Role): string {
 
 export function allowedPaths(role: Role): string[] {
   if (role === "OWNER") return ["*"];
-  if (role === "PRODUCTION_MANAGER") return ["/dashboard", "/production", "/workers"];
+  if (role === "PRODUCTION_MANAGER") return ["/dashboard", "/production", "/workers", "/worker"];
   return ["/dashboard", "/worker"];
 }
 

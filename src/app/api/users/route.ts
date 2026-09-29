@@ -19,6 +19,20 @@ function databaseError(error: unknown) {
   return value?.cause?.code ?? value?.code;
 }
 
+async function managerWorkerId(value: unknown, accountId?: number): Promise<{ id: number | null; error?: string }> {
+  if (value === null || value === undefined || value === "") return { id: null };
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id < 1) return { id: null, error: "Choose a valid worker profile." };
+  const [worker] = await db.select({ id: workers.id, organizationId: workers.organizationId, status: workers.status, name: workers.name })
+    .from(workers).where(eq(workers.id, id)).limit(1);
+  if (!worker || worker.organizationId !== 1 || worker.status !== "ACTIVE")
+    return { id: null, error: "Choose an active Matesther worker profile." };
+  const [linked] = await db.select({ id: users.id }).from(users).where(eq(users.workerId, id)).limit(1);
+  if (linked && linked.id !== accountId)
+    return { id: null, error: `${worker.name} already has a staff login. Manage that account and change its role instead of creating a second login.` };
+  return { id };
+}
+
 export async function GET(req: Request) {
   const denied = await guard(req, OWNER);
   if (denied) return denied;
@@ -56,8 +70,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Password must have at least 6 characters." }, { status: 400 });
     if (!ROLES.includes(role))
       return NextResponse.json({ error: "Choose a valid staff role." }, { status: 400 });
+    const linked = role === "PRODUCTION_MANAGER" ? await managerWorkerId(body.workerId) : { id: null, error: undefined };
+    if (linked.error) return NextResponse.json({ error: linked.error }, { status: 409 });
     const [created] = await db.insert(users).values({
-      organizationId: 1, name, email, role, workerId: null,
+      organizationId: 1, name, email, role, workerId: linked.id,
       passwordHash: hashPassword(password),
       phone: String(body.phone ?? "").trim() || null,
       status: "ACTIVE",
@@ -95,8 +111,12 @@ export async function PUT(req: Request) {
       return NextResponse.json({ error: "New password must have at least 6 characters." }, { status: 400 });
     const name = body.name === undefined ? current.name : String(body.name).trim();
     if (!name) return NextResponse.json({ error: "Staff name is required." }, { status: 400 });
+    const linked = role === "PRODUCTION_MANAGER"
+      ? await managerWorkerId(body.workerId === undefined ? current.workerId : body.workerId, id)
+      : { id: role === "WORKER" ? current.workerId : null, error: undefined };
+    if (linked.error) return NextResponse.json({ error: linked.error }, { status: 409 });
     const [updated] = await db.update(users).set({
-      name, role, status, workerId: role === "WORKER" ? current.workerId : null,
+      name, role, status, workerId: linked.id,
       phone: body.phone === undefined ? current.phone : String(body.phone).trim() || null,
       ...(password ? { passwordHash: hashPassword(password) } : {}),
     }).where(eq(users.id, id)).returning();

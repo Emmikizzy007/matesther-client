@@ -75,7 +75,7 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
   if (d.linked === false || !d.profile) return (
     <div>
       <PageHeader title={{ jobs: "My Jobs", journal: "My Journal", earnings: "My Earnings", profile: "Profile" }[mode]} />
-      <WorkerLinkNotice name={user?.name} />
+      <WorkerLinkNotice name={user?.name} manager={user?.role === "PRODUCTION_MANAGER"} />
     </div>
   );
 

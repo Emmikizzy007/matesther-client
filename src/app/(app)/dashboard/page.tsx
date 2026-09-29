@@ -317,10 +317,20 @@ function ProductionDashboard({ d }: any) {
             Matesther production floor - supervise stages, inspect submissions, keep the pipeline moving.
           </p>
         </div>
-        <Link href="/production/inspection" className="inline-flex items-center gap-1.5 bg-violet-700 hover:bg-violet-800 text-white px-4 py-2 rounded-lg text-sm font-medium">
-          <ClipboardCheck className="w-4 h-4" /> Open Inspection Queue
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <Link href="/production/assign" className="inline-flex items-center gap-1.5 rounded-lg bg-matesther-800 px-4 py-2 text-sm font-medium text-white hover:bg-matesther-900"><Plus className="h-4 w-4" /> Assign production</Link>
+          <Link href="/production/inspection" className="inline-flex items-center gap-1.5 rounded-lg bg-violet-700 px-4 py-2 text-sm font-medium text-white hover:bg-violet-800">
+            <ClipboardCheck className="w-4 h-4" /> Inspection Queue
+          </Link>
+        </div>
       </div>
+
+      {d.personal?.linked && <Card className="mb-5 border-matesther-200 bg-matesther-50/50 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div><p className="text-xs font-bold uppercase tracking-wide text-matesther-800">My factory work • {d.personal.specialty}</p><p className="mt-1 text-sm text-slate-600">{d.personal.activeJobs} current job{d.personal.activeJobs === 1 ? "" : "s"} • {naira(d.personal.earnings.month)} earned on approved work this month</p></div>
+          <div className="flex flex-wrap gap-2"><Link href="/worker/jobs" className="rounded-lg border border-matesther-200 bg-white px-3 py-2 text-xs font-bold text-matesther-800 hover:bg-matesther-100">My jobs</Link><Link href="/worker/earnings" className="rounded-lg border border-matesther-200 bg-white px-3 py-2 text-xs font-bold text-matesther-800 hover:bg-matesther-100">My earnings</Link></div>
+        </div>
+      </Card>}
 
       <SectionTitle title="Today" />
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">

@@ -13,7 +13,7 @@ import {
 import { getLinkedWorkerId, type SessionUser } from "@/lib/authz";
 import { inspectionPieceRate } from "@/lib/job-pay";
 
-/** The only dashboard payload available to a worker. No company-level figures. */
+/** Personal jobs and earnings, also available to a manager for their own factory work. No company-level figures. */
 export async function getWorkerDashboard(user: SessionUser) {
   const workerId = await getLinkedWorkerId(user);
   const [profile] = workerId

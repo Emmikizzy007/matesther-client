@@ -29,16 +29,15 @@ export async function GET(req: Request) {
   const sessionUser = await getSessionUser(req);
   if (!sessionUser) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
   try {
-    // Workers never fetch business-wide financial records. A login without a
-    // linked worker profile receives an empty dashboard instead of an error.
-    if (sessionUser.role === "WORKER") {
+    // A manager can request their OWN work and earnings, never company financials.
+    // Workers always receive only their personal view regardless of URL parameters.
+    const requestedView = new URL(req.url).searchParams.get("view");
+    if (sessionUser.role === "WORKER" || (sessionUser.role === "PRODUCTION_MANAGER" && requestedView === "my-work")) {
       return NextResponse.json(await getWorkerDashboard(sessionUser), {
         headers: { "Cache-Control": "private, no-store" },
       });
     }
-    // Owner has every production-supervision permission as well as business access.
-    // PM can NEVER request the owner view, but Owner may use the production view.
-    const requestedView = new URL(req.url).searchParams.get("view");
+    // Owner can supervise production. A Project Manager can never request owner finances.
     const view = sessionUser.role === "PRODUCTION_MANAGER" || requestedView === "pm" ? "pm" : "owner";
 
     const [
@@ -171,6 +170,8 @@ export async function GET(req: Request) {
       return {
         ...o,
         batchNumber: batch?.batchNumber ?? "-",
+        size: batch?.size ?? null,
+        color: batch?.color ?? null,
         orderId: order?.id ?? null,
         orderNumber: order?.orderNumber ?? "-",
         customer: customerMap.get(order?.customerId ?? -1)?.name ?? "-",
@@ -229,8 +230,15 @@ export async function GET(req: Request) {
         })
         .filter((w) => w.assigned > 0 || w.activeJobs > 0);
 
+      const ownWork = await getWorkerDashboard(sessionUser);
       return NextResponse.json({
         view: "pm",
+        personal: {
+          linked: ownWork.linked,
+          specialty: ownWork.profile?.specialty ?? null,
+          activeJobs: ownWork.todayJobs.length,
+          earnings: ownWork.earnings,
+        },
         today: {
           dueTodayJobs,
           awaitingInspection: awaiting,
