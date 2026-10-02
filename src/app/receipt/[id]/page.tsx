@@ -48,7 +48,7 @@ export default function ReceiptPage({ params }: { params: Promise<{ id: string }
 
   return (
     <main className="document-page min-h-screen bg-[#f2f3ee] px-3 py-6 sm:px-6">
-      <DocumentActions title={`Matesther payment receipt ${receiptNo}`} filename="receipt" customerEmail={customer?.email} message={note} />
+      <DocumentActions title={`Matesther payment receipt ${receiptNo}`} filename="receipt" customerEmail={customer?.email} customerPhone={customer?.phone} message={note} />
       <Letterhead business={business} ourRef={receiptNo} yourRef={payment.reference || order.orderNumber} date={fmtDate(payment.date)} title="Payment Receipt" subtitle={`Payment received for order ${order.orderNumber}`}>
         <div className="grid gap-5 sm:grid-cols-2">
           <div>

@@ -5,6 +5,7 @@ import { orders, orderItems, orderItemSizes, productionBatches, productionOperat
 import { STAGES } from "@/lib/format";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, productionAccess, OWNER, STAFF } from "@/lib/authz";
+import { workerHoldsRole } from "@/lib/worker-roles";
 
 type Assignment = { id: number | null; rate: number | null };
 
@@ -69,12 +70,13 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: `Only ${Math.max(0, targetSize.quantity - allocated)} unassigned ${size} garment(s) remain for this item.` }, { status: 400 });
     }
 
-    async function resolveWorker(raw: unknown, rawRate: unknown, specialty: string): Promise<Assignment> {
+    async function resolveWorker(raw: unknown, rawRate: unknown, role: string): Promise<Assignment> {
       if (!raw) return { id: null, rate: null };
       const id = Number(raw);
       const [person] = await db.select().from(workers).where(eq(workers.id, id)).limit(1);
-      if (!person || person.status !== "ACTIVE" || person.organizationId !== order.organizationId || person.specialty.toLowerCase() !== specialty.toLowerCase())
-        throw new Error(`Select an active ${specialty} from Matesther's Workers page.`);
+      // A person qualifies when the required role is one of the roles they hold.
+      if (!person || person.status !== "ACTIVE" || person.organizationId !== order.organizationId || !(await workerHoldsRole(person, role)))
+        throw new Error(`Select an active ${role} from Matesther's Workers page.`);
       if (person.paymentType !== "PER_PIECE") return { id, rate: null };
       const rate = Number(rawRate);
       if (!Number.isSafeInteger(rate) || rate < 1)

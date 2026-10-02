@@ -4,7 +4,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { CheckCircle2, ChevronDown, ClipboardCheck, RefreshCcw, Search, XCircle } from "lucide-react";
 import { Badge, Btn, Card, EmptyState, Field, inputCls, Loading, Modal, PageHeader } from "@/components/ui";
-import { fmtDate, stageLabel } from "@/lib/format";
+import { fmtDate, stageLabel, personHoldsRole, personRoles } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 
 type QueueJob = { id: number; orderId: number | null; orderNumber: string; customer: string; stage: string;
@@ -31,7 +31,7 @@ function schoolGroups<T extends { orderId: number | null; customer: string; orde
 export default function InspectionQueuePage() {
   const { user } = useAuth();
   const [data, setData] = useState<QueueData | null>(null);
-  const [inspectors, setInspectors] = useState<{ id: number; name: string; specialty: string }[]>([]);
+  const [inspectors, setInspectors] = useState<{ id: number; name: string; specialty: string; roles?: string[] }[]>([]);
   const [ownWorkerId, setOwnWorkerId] = useState<number | null>(null);
   const [tab, setTab] = useState<Tab>("awaiting");
   const [search, setSearch] = useState("");
@@ -69,7 +69,7 @@ export default function InspectionQueuePage() {
       // Workers list is optional supporting context; it must not block the queue.
       fetch("/api/workers", { cache: "no-store" })
         .then((res) => res.ok ? res.json() : [])
-        .then((rows) => setInspectors(Array.isArray(rows) ? rows.filter((person) => person.isInspector && person.status === "ACTIVE") : []))
+        .then((rows) => setInspectors(Array.isArray(rows) ? rows.filter((person) => person.status === "ACTIVE" && (person.isInspector || personHoldsRole(person, "Inspection Officer"))) : []))
         .catch(() => setInspectors([]));
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load the Inspection Queue."); }
   }
@@ -172,7 +172,7 @@ export default function InspectionQueuePage() {
         </Card>;
       })}</div>}
     {tab !== "awaiting" && <Link href="/production/history" className="mt-4 inline-block text-sm font-semibold text-matesther-700 hover:underline">View full production history →</Link>}
-    {inspectors.length > 0 && <details className="mt-5 rounded-lg border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600"><summary className="cursor-pointer font-semibold text-slate-700">Inspectors on duty</summary><p className="mt-2">{inspectors.map((person) => `${person.name} (${person.specialty})`).join(" • ")}</p></details>}
+    {inspectors.length > 0 && <details className="mt-5 rounded-lg border border-slate-200 bg-white px-4 py-3 text-xs text-slate-600"><summary className="cursor-pointer font-semibold text-slate-700">Inspectors on duty</summary><p className="mt-2">{inspectors.map((person) => `${person.name} (${personRoles(person).join(", ")})`).join(" • ")}</p></details>}
 
     <Modal open={!!selected} onClose={() => { if (!saving) setSelected(null); }} title="Check submitted garments">
       {selected && <form onSubmit={submit} className="space-y-4">

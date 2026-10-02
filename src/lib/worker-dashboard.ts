@@ -9,6 +9,8 @@ import {
   orderItems,
   products,
   stageInspections,
+  supportAssignments,
+  supportInspections,
 } from "@/db/schema";
 import { getLinkedWorkerId, type SessionUser } from "@/lib/authz";
 import { inspectionPieceRate } from "@/lib/job-pay";
@@ -29,6 +31,7 @@ export async function getWorkerDashboard(user: SessionUser) {
       earnings: { today: 0, week: 0, month: 0, total: 0, events: [] },
       recentJobs: [],
       journal: [],
+      supportJobs: [],
     };
   }
 
@@ -72,12 +75,13 @@ export async function getWorkerDashboard(user: SessionUser) {
     : [];
   const jobById = new Map(journal.map((job) => [job.id, job]));
   const perPiece = profile.paymentType === "PER_PIECE";
-  const events = inspections
+  const productionEvents = inspections
     .filter((check) => check.quantityApproved > 0 && perPiece)
     .map((check) => {
       const job = jobById.get(check.productionOperationId);
       return {
         id: check.id,
+        source: "PRODUCTION" as const,
         productionOperationId: check.productionOperationId,
         inspectedAt: check.inspectedAt,
         quantityApproved: check.quantityApproved,
@@ -88,8 +92,41 @@ export async function getWorkerDashboard(user: SessionUser) {
         batchNumber: job?.batchNumber ?? "",
         customer: job?.customer ?? "",
       };
-    })
-    .sort((a, b) => (b.inspectedAt?.getTime() ?? 0) - (a.inspectedAt?.getTime() ?? 0));
+    });
+
+  // Tailor support work pays on approved pieces too, at the rate agreed for it.
+  const supportRows = await db
+    .select()
+    .from(supportAssignments)
+    .where(eq(supportAssignments.workerId, profile.id));
+  const supportIds = supportRows.map((row) => row.id);
+  const supportChecks = supportIds.length
+    ? await db.select().from(supportInspections).where(inArray(supportInspections.supportAssignmentId, supportIds))
+    : [];
+  const supportById = new Map(supportRows.map((row) => [row.id, row]));
+  const supportEvents = supportChecks
+    .filter((check) => check.quantityApproved > 0 && perPiece)
+    .map((check) => {
+      const assignment = supportById.get(check.supportAssignmentId);
+      const rate = inspectionPieceRate(check, assignment ?? { pieceRate: null }, profile);
+      return {
+        id: check.id,
+        source: "SUPPORT" as const,
+        productionOperationId: assignment?.productionOperationId ?? null,
+        inspectedAt: check.inspectedAt,
+        quantityApproved: check.quantityApproved,
+        pieceRate: rate,
+        amount: check.quantityApproved * rate,
+        stage: assignment?.operation ?? "Support work",
+        orderNumber: "",
+        batchNumber: "",
+        customer: "Support work",
+      };
+    });
+
+  const events = [...productionEvents, ...supportEvents].sort(
+    (a, b) => (b.inspectedAt?.getTime() ?? 0) - (a.inspectedAt?.getTime() ?? 0)
+  );
 
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -113,5 +150,13 @@ export async function getWorkerDashboard(user: SessionUser) {
     },
     recentJobs: journal.filter((job) => job.status === "COMPLETED").slice(0, 10),
     journal,
+    // Their own support work: what was handed to them and what was approved.
+    supportJobs: supportRows.map((row) => ({
+      ...row,
+      pending: Math.max(
+        0,
+        row.quantitySubmitted - (row.quantityApproved + row.quantityRejected + row.quantityRework)
+      ),
+    })),
   };
 }

@@ -26,7 +26,7 @@ export async function GET(req: Request) {
       return NextResponse.json({ worker, month, history, payments });
     }
 
-    const { workers: rows, totals } = await workerAccruals(month);
+    const { workers: rows, totals, breakdown } = await workerAccruals(month);
     const [payRows, otRows, allWorkers] = await Promise.all([
       db.select().from(workerPayments),
       db.select().from(workerOvertime),
@@ -44,7 +44,7 @@ export async function GET(req: Request) {
       })
       .map((o) => ({ ...o, workerName: wMap.get(o.workerId)?.name ?? "-" }));
 
-    return NextResponse.json({ month, workers: rows, totals, payments, overtime });
+    return NextResponse.json({ month, workers: rows, totals, breakdown, payments, overtime });
   } catch (e: any) {
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }
@@ -52,17 +52,24 @@ export async function GET(req: Request) {
 
 /**
  * POST /api/payroll
- *  { kind: "payment", workerId, periodMonth, paymentDate, pieceworkAmount, salaryAmount, overtimeAmount, amount, method, paidBy, notes }
- *  { kind: "overtime", workerId, workedOn, hours, amount, notes }
+ *  { kind: "payment", workerId, periodMonth, paymentDate, pieceworkAmount, supportAmount,
+ *    salaryAmount, overtimeAmount, otherAmount, amount, method, paidBy, reference,
+ *    idempotencyKey, notes }
+ *  { kind: "overtime", workerId, workedOn, hours, amount, category, notes }
+ *
+ * Payments are only ever inserted, never updated or deleted, so the payroll
+ * history is preserved. An optional `idempotencyKey` makes the same payment
+ * impossible to record twice - a repeat returns 409 with the original row.
  */
 export async function POST(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
   try {
     const b = await req.json();
-    if (b.kind === "overtime") {
+    if (b.kind === "overtime" || b.kind === "other") {
       if (!b.workerId) return NextResponse.json({ error: "Worker is required" }, { status: 400 });
       if (!b.amount || Number(b.amount) <= 0)
-        return NextResponse.json({ error: "Overtime amount must be greater than zero" }, { status: 400 });
+        return NextResponse.json({ error: "The amount must be greater than zero" }, { status: 400 });
+      const category = b.kind === "other" || b.category === "OTHER" ? "OTHER" : "OVERTIME";
       const [row] = await db
         .insert(workerOvertime)
         .values({
@@ -70,6 +77,7 @@ export async function POST(req: Request) {
           workedOn: b.workedOn || new Date().toISOString().slice(0, 10),
           hours: Number(b.hours) || 0,
           amount: Number(b.amount),
+          category,
           notes: b.notes || null,
         })
         .returning();
@@ -80,18 +88,51 @@ export async function POST(req: Request) {
     if (!b.workerId) return NextResponse.json({ error: "Worker is required" }, { status: 400 });
     if (!b.amount || Number(b.amount) <= 0)
       return NextResponse.json({ error: "Payment amount must be greater than zero" }, { status: 400 });
+    const amount = Number(b.amount);
+    if (!Number.isSafeInteger(amount))
+      return NextResponse.json({ error: "Payment amount must be a whole naira amount." }, { status: 400 });
+
+    const PARTS = ["pieceworkAmount", "supportAmount", "salaryAmount", "overtimeAmount", "otherAmount"] as const;
+    const part = (key: (typeof PARTS)[number]) => Number(b[key]) || 0;
+    const itemised = PARTS.some((key) => b[key] !== undefined);
+    const partsSum = PARTS.reduce((sum, key) => sum + part(key), 0);
+    if (itemised && partsSum !== amount)
+      return NextResponse.json(
+        { error: "The breakdown must add up to the total paid." },
+        { status: 400 }
+      );
+
+    // Duplicate/double-payment guard: the same key can only ever be stored once.
+    const idempotencyKey = b.idempotencyKey ? String(b.idempotencyKey).slice(0, 200) : null;
+    if (idempotencyKey) {
+      const [existing] = await db
+        .select()
+        .from(workerPayments)
+        .where(eq(workerPayments.idempotencyKey, idempotencyKey))
+        .limit(1);
+      if (existing)
+        return NextResponse.json(
+          { error: "This payment has already been recorded.", payment: existing },
+          { status: 409 }
+        );
+    }
+
     const [row] = await db
       .insert(workerPayments)
       .values({
         workerId: Number(b.workerId),
         paymentDate: b.paymentDate || new Date().toISOString().slice(0, 10),
         periodMonth: b.periodMonth || currentMonth(),
-        pieceworkAmount: Number(b.pieceworkAmount) || 0,
-        salaryAmount: Number(b.salaryAmount) || 0,
-        overtimeAmount: Number(b.overtimeAmount) || 0,
-        amount: Number(b.amount),
+        pieceworkAmount: part("pieceworkAmount"),
+        supportAmount: part("supportAmount"),
+        salaryAmount: part("salaryAmount"),
+        overtimeAmount: part("overtimeAmount"),
+        otherAmount: part("otherAmount"),
+        amount,
         method: b.method || "Cash",
         paidBy: b.paidBy || null,
+        reference: b.reference ? String(b.reference).slice(0, 200) : null,
+        idempotencyKey,
         notes: b.notes || null,
       })
       .returning();

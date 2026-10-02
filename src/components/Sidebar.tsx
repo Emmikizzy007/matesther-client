@@ -29,10 +29,12 @@ import {
   LogOut,
   Menu,
   X,
+  HandHelping,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useAuth, roleLabel, Role } from "@/lib/auth";
 import { BrandLogo } from "@/components/BrandLogo";
+import { InstallPrompt } from "@/components/InstallPrompt";
 
 type NavItem = { href: string; label: string; icon: any };
 type NavGroup = { label: string; items: NavItem[] };
@@ -55,6 +57,7 @@ const OWNER_NAV: NavGroup[] = [
     items: [
       { href: "/production", label: "Active Production", icon: Factory },
       { href: "/production/assign", label: "Assign Production", icon: UserCheck },
+      { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
       { href: "/production/history", label: "Production History", icon: History },
       { href: "/workers", label: "Workers", icon: ContactRound },
@@ -100,6 +103,7 @@ const PM_NAV: NavGroup[] = [
     items: [
       { href: "/production/assign", label: "Assign Production", icon: UserCheck },
       { href: "/production", label: "Active Production", icon: Factory },
+      { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
       { href: "/production/history", label: "Production History", icon: History },
     ],
@@ -128,6 +132,7 @@ const WORKER_NAV: NavGroup[] = [
     items: [
       { href: "/dashboard", label: "Dashboard", icon: Briefcase },
       { href: "/worker/jobs", label: "My Jobs", icon: Factory },
+      { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/worker/journal", label: "My Journal", icon: BookOpen },
       { href: "/worker/earnings", label: "My Earnings", icon: Coins },
       { href: "/worker/profile", label: "Profile", icon: User },
@@ -143,7 +148,7 @@ function navForRole(role: Role): NavGroup[] {
 
 function Brand() {
   return (
-    <div className="flex items-center gap-3 px-5 py-5">
+    <div className="flex items-center gap-3 px-5 pb-5 pt-[max(1.25rem,env(safe-area-inset-top))]">
       <BrandLogo className="h-10 w-10 rounded-lg" />
       <div>
         <p className="font-extrabold tracking-wide text-white text-lg leading-none">MATESTHER</p>
@@ -206,7 +211,8 @@ export default function Sidebar() {
   );
 
   const userBox = (
-    <div className="px-5 py-4 border-t border-white/10">
+    <div className="px-5 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] border-t border-white/10">
+      <InstallPrompt />
       <p className="text-sm font-semibold text-white truncate">
         {user?.name ?? "Matesther User"}
       </p>
@@ -225,15 +231,16 @@ export default function Sidebar() {
   return (
     <>
       {/* mobile top bar */}
-      <div className="lg:hidden flex items-center justify-between bg-matesther-900 px-4 py-3 sticky top-0 z-40">
+      <div className="lg:hidden flex items-center justify-between bg-matesther-900 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] sticky top-0 z-40">
         <div className="flex items-center gap-2">
           <BrandLogo className="h-8 w-8 rounded-lg" />
           <span className="font-extrabold text-white tracking-wide">MATESTHER</span>
         </div>
         <button
           onClick={() => setOpen(!open)}
-          className="text-white p-1"
+          className="flex h-11 w-11 items-center justify-center rounded-lg text-white hover:bg-white/10"
           aria-label="Toggle menu"
+          aria-expanded={open}
         >
           {open ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
         </button>

@@ -4,6 +4,7 @@ import { sessions, users, workers } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { hashSessionToken, readSessionToken } from "@/lib/session";
 import { rejectCrossSiteMutation } from "@/lib/request-security";
+import { rolesForWorker, rolesInclude } from "@/lib/worker-roles";
 
 /** Role groups for API authorization. */
 export const OWNER = ["OWNER"];
@@ -100,15 +101,20 @@ export async function getLinkedWorkerId(user: SessionUser): Promise<number | nul
   return competing ? null : candidates[0].id;
 }
 
-/** Self-dealing safeguards for a supervisor who is also a Cutter. */
+/**
+ * Self-dealing safeguards for a supervisor who is also a Cutter.
+ *
+ * A person may hold several roles, so "is a cutter" means the Cutter role is
+ * among their assigned roles - not that it is their only specialty.
+ */
 export async function productionAccess(user: SessionUser) {
   const workerId = user.role === "PRODUCTION_MANAGER" ? await getLinkedWorkerId(user) : null;
-  const [profile] = workerId
-    ? await db.select({ specialty: workers.specialty }).from(workers).where(eq(workers.id, workerId)).limit(1)
-    : [];
-  const cutterSupervisor = user.role === "PRODUCTION_MANAGER" && profile?.specialty.toLowerCase() === "cutter";
+  const roles = workerId ? await rolesForWorker(workerId) : [];
+  const cutterSupervisor =
+    user.role === "PRODUCTION_MANAGER" && rolesInclude(roles, "Cutter");
   return {
     workerId,
+    roles,
     cutterSupervisor,
     canAssignCutting: user.role === "OWNER" || (user.role === "PRODUCTION_MANAGER" && !cutterSupervisor),
   };

@@ -82,7 +82,9 @@ export function roleLabel(role: Role): string {
 export function allowedPaths(role: Role): string[] {
   if (role === "OWNER") return ["*"];
   if (role === "PRODUCTION_MANAGER") return ["/dashboard", "/production", "/workers", "/worker"];
-  return ["/dashboard", "/worker"];
+  // A Worker may also reach Support Work: a tailor's helper submits and reviews
+  // the support work handed to them. The API returns only their own records.
+  return ["/dashboard", "/worker", "/production/support"];
 }
 
 export function canAccess(role: Role, path: string): boolean {

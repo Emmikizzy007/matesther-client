@@ -402,6 +402,10 @@ Material costs should contribute to order profitability.
 
 # 12. STAFF, SALARIED EMPLOYEES, AND TAILOR SUPPORT WORKERS
 
+> **STATUS: IMPLEMENTED.** See section 36 for what was built, where it lives,
+> and which regression tests guard it. The requirements below are kept unchanged
+> as the specification.
+
 Matesther has people who receive payment from the company but do not all
 perform the normal 8-stage garment-production workflow. The ERP must not
 assume that every person who receives money is a production worker.
@@ -627,6 +631,9 @@ information.
 
 # 33. LAST UNFINISHED REQUEST --- MONTHLY PAYMENT SHEET
 
+> **STATUS: IMPLEMENTED** as the Owner-only `/payment-sheet/[month]` page backed
+> by `GET /api/payment-sheet`. See section 36.
+
 The final user instruction before the Arena session stopped requested:
 
 > Add a printable page layout for the payment list after the end of
@@ -693,6 +700,9 @@ The final user request also asked:
 This was **not confirmed as implemented before the Arena session
 stopped**.
 
+> **STATUS: IMPLEMENTED.** Sharing now exists on the payment receipt,
+> the delivery document and the monthly payment sheet. See section 37.
+
 Desired documents/pages should have a WhatsApp sharing action where
 appropriate:
 
@@ -710,6 +720,9 @@ a sensible fallback such as "Copy link" or "Share" if WhatsApp is
 unavailable.
 
 Inspect the existing document routes/components before implementing.
+(Done: `DocumentActions` was the single shared action bar behind all
+three printables, so sharing was added there once rather than three
+times.)
 
 ------------------------------------------------------------------------
 
@@ -751,6 +764,11 @@ modals that fit the viewport; - mobile sidebar that scrolls
 independently; - readable KPI cards; - production/assignment pages
 grouped instead of giant tables; - charts should remain usable on narrow
 screens; - documents should fit printable/mobile previews.
+
+> **STATUS: VERIFIED AND COMPLETED.** Every item in that list was checked
+> against the code during Task 5. Most were already satisfied; four real
+> gaps were found and fixed. See section 38 for what was already in place
+> and what changed.
 
 ------------------------------------------------------------------------
 
@@ -952,6 +970,28 @@ If it is not available, do not silently claim that a recreated SVG is
 the exact original. Ask for/provide a way to add the original image
 asset.
 
+> **STATUS: THE OFFICIAL LOGO IS PRESENT AND IN USE.**
+> The logo is used everywhere this section asks for - sidebar,
+> mobile header, login screen and the printed letterhead (via
+> `Letterhead`), plus the favicon, Apple touch icon and the PWA manifest
+> icons. All of them point at one endpoint, `GET /api/branding/logo`.
+>
+> **The application does not read the logo from `public/` at all.** The
+> original bytes live in PostgreSQL (`organizations.logo_data`) and are
+> uploaded by the Owner through **Settings -> Branding**. `POST
+> /api/branding/logo` accepts only a real PNG/JPEG/WebP at least
+> 512 x 512 and under 2 MB, and explicitly rejects an SVG, so an
+> approximation cannot be substituted for the original.
+>
+> The official mark the user provided is committed at
+> `public/matesther-logo.png` (on `main` at `fd1cd40`; the working branch
+> is cut from an earlier `main` commit, so it was brought across with one
+> additive checkout). `GET /api/branding/logo` now serves those bytes as
+> the fallback whenever the Owner has not uploaded their own file, so every
+> slot shows the real logo with no database write. An Owner upload through
+> Settings still wins. Nothing has been redrawn, traced or approximated.
+> The gold "M" appears only while the image is loading.
+
 ------------------------------------------------------------------------
 
 # 33. Historical feature additions
@@ -1108,19 +1148,19 @@ payments; - worker pages; - printable/shareable documents.
 The session stopped immediately after the user requested these three
 things:
 
-## A. Multi-role workers
+## A. Multi-role workers --- DONE (section 36)
 
 Allow a worker to be assigned multiple roles/specialties, such as: -
 Project Supervisor - Cutter - Tailor - any other production role.
 
 Their work area should show all jobs assigned to them across all roles.
 
-## B. Monthly bank payment sheet
+## B. Monthly bank payment sheet --- DONE (section 36)
 
 Add a printable monthly payment list showing how much is expected to be
 paid to each staff member, suitable for sending to the bank.
 
-## C. WhatsApp sharing
+## C. WhatsApp sharing --- DONE (section 37)
 
 Add WhatsApp sharing to the documents created so far: - receipts; -
 delivery documents; - payment page/payment document; - other appropriate
@@ -1128,6 +1168,10 @@ customer-facing documents.
 
 These three requests are the **starting point for the next development
 session**.
+
+> **STATUS: ALL THREE NOW COMPLETE** (A and B in section 36, C in
+> section 37). This list is historical; it is no longer the starting
+> point for the next session.
 
 ------------------------------------------------------------------------
 
@@ -1448,3 +1492,343 @@ The human/developer should:
 
 **Do not start from an empty repository. Do not ask the agent to rebuild
 MATESTHER.**
+
+------------------------------------------------------------------------
+
+# 36. IMPLEMENTED: support work, salaried staff and the monthly payment sheet
+
+Built on top of the existing architecture. Nothing was rebuilt, no table was
+dropped, and no existing column changed meaning.
+
+## 36.1 What exists now
+
+**Tailor support work** - `support_assignments` and `support_inspections`
+(`drizzle/0005_support_work_and_payroll.sql`).
+
+- A tailor hands weaving, taping or other supporting work to a helper through
+  **Production > Support Work** (`/api/support-work`).
+- The parent `production_operations` row stays the tailor's. The support row
+  links to it for traceability and never replaces it, so support work does not
+  inflate the parent stage.
+- The helper submits completed pieces; the tailor who handed it out inspects
+  and approves. Each pass is a new `support_inspections` row, so rework and
+  rejection history is preserved rather than overwritten.
+- **A support worker can never approve their own work.** The check is on
+  identity, not on login role, so it also holds for a supervisor whose own
+  worker record did the work.
+- Payable earnings reuse `@/lib/job-pay`: approved pieces x the rate agreed for
+  that work, snapshotted on the inspection. Submitted, reworked or rejected work
+  is never payable.
+
+**Salaried / non-production staff** - no new table.
+
+- `workers.department` and `workers.job_title` were added, and the role
+  vocabulary gained the staff positions Security, Sales, IT, Administration,
+  Management, Director and Office Staff, plus `Support Worker`.
+- `workers.specialty` is unchanged and may hold a staff position, so a security
+  guard is no longer forced to be a "Tailor". A person who is both a Tailor and
+  in Sales is one record holding both roles - never two people.
+- Their category (Production Worker / Support Worker / Salaried staff) is
+  **derived** from their roles, never stored, so it cannot drift.
+
+**Payroll** - `src/lib/payroll.ts`, `/api/payroll`.
+
+- Each row now separates: salary, production piecework, support piecework,
+  overtime, other approved payments, total due, paid, balance, and a payment
+  status (`UNPAID` / `PARTIAL` / `PAID` / `NOTHING_DUE`).
+- "Other approved payments" reuse `worker_overtime` with
+  `category = 'OTHER'` rather than adding a parallel table.
+- `worker_payments` gained `support_amount`, `other_amount`, `reference` and a
+  unique `idempotency_key`. The unique index is what makes a double payment
+  impossible; rows with no key stay `NULL` so legitimate part payments are
+  unaffected. Payments are still only ever inserted - never updated or deleted.
+- The headline `totals` object keeps its original `{due, paid, balance}` shape.
+  The new detail is returned alongside it as `breakdown`.
+
+**Monthly bank payment sheet** - `/payment-sheet/[month]` + `GET
+/api/payment-sheet`.
+
+- Owner-only. Project Managers and Workers are refused by the API, and the page
+  is useless without it.
+- Letterheaded printable layout reusing the existing `Letterhead` and
+  `DocumentActions` components: staff name, roles, position, pay type, salary,
+  piecework, support piecework, overtime, other, total due, paid, balance,
+  status, bank reference, column totals, and a prepared/approved signature area.
+
+## 36.2 Security
+
+- `GET /api/payroll`, `POST /api/payroll` and `GET /api/payment-sheet` are
+  `OWNER`-only, enforced server-side.
+- A Worker sees only their own support work and their own earnings; the support
+  endpoints filter by the linked worker profile.
+- Separation of duty is enforced on the server for support inspections, exactly
+  as it already was for stage inspections.
+
+## 36.3 Regression coverage
+
+`tests/support-payroll.test.ts` (18 tests) covers approved-only support pay, the
+self-approval ban, assignment and history preservation, salaried staff, the
+payroll breakdown and status, Owner-only access, and duplicate-payment
+prevention. Every control is **mutation-tested**: removing each guard was shown
+to fail exactly the intended test and nothing else. See `tests/README.md`.
+
+Total suite: **85 tests, all passing.**
+
+## 36.4 Deployment
+
+Run `deploy/upgrade-support-payroll.sql` in the client project's SQL Editor,
+check its verification query, and only then deploy the code. SQL first, code
+second. It is additive and repeatable, and is schema-identical to
+`drizzle/0005_support_work_and_payroll.sql`. See `deploy/UPDATE-INSTRUCTIONS.md`.
+
+## 36.5 Known limitations
+
+- Support work is deliberately **not** allocated to order profitability. Section
+  12.5 asks for that distinction; the amounts are recorded and reported in
+  payroll, but the profitability report was left untouched.
+- ~~WhatsApp deep-link sharing is still not implemented.~~ **Superseded by
+  section 37** --- the sheet now has a WhatsApp action, but as the
+  Owner-only payroll document it never embeds a phone number.
+- `deploy/schema-only.sql` and `deploy/full-setup.sql` were **not** updated for
+  these tables. They remain for brand-new empty databases only, and
+  `full-setup.sql` still contains a destructive demo-data reset.
+
+------------------------------------------------------------------------
+
+# 37. IMPLEMENTED: WhatsApp sharing on customer-facing documents
+
+Built on top of the existing document components. No table changed, no
+migration was created, no API route was added and no existing action was
+removed.
+
+## 37.1 What exists now
+
+The receipt, delivery and monthly-payment-sheet pages all already rendered
+one shared action bar, `src/components/documents/DocumentActions.tsx`.
+Sharing was added **there, once**, so all three documents inherited it ---
+nothing was duplicated and no document got its own bespoke share UI.
+
+A new pure helper module, `src/lib/whatsapp.ts`, does the only new
+computation:
+
+- `whatsappNumber(raw)` normalises a Nigerian number to `234XXXXXXXXXX`
+  and **returns `null` for anything it will not resolve confidently**
+  (blank, too short, or a foreign number it would have to guess at).
+- `whatsappMessage(parts)` joins the supplied document text and trims it
+  to 1200 characters.
+- `whatsappHref(message, number)` returns `https://wa.me/<number>?text=...`
+  when a number is known, and `https://wa.me/?text=...` when it is not.
+
+The action is a plain anchor (`<a href>`, `target="_blank"`,
+`rel="noreferrer noopener"`), not a script-driven handler. That is
+deliberate: on a phone the operating system hands the `wa.me` URL to the
+installed WhatsApp app, on a desktop browser it opens WhatsApp Web, and
+with JavaScript disabled the button still works.
+
+**Fallback when WhatsApp is unavailable.** A `wa.me` link with no phone
+number opens WhatsApp's own contact picker rather than failing, so an
+unusable or absent customer number degrades to "choose a contact" instead
+of opening a chat with the wrong person. The pre-existing `Share`
+(Web Share API / clipboard) and `Email` actions are untouched and remain
+the route for anyone without WhatsApp. The button reads `WhatsApp school`
+only when a number actually resolved, and plain `WhatsApp` otherwise.
+
+## 37.2 What each document shares
+
+| Document | Route | Number embedded |
+| --- | --- | --- |
+| Payment receipt | `/receipt/[id]` | the customer's own number |
+| Delivery document | `/delivery/[id]` | the customer's own number |
+| Monthly payment sheet | `/payment-sheet/[month]` | **never** --- marked `sensitive` |
+
+`customer.phone` was already returned by `GET /api/receipts` and
+`GET /api/deliveries`, and already declared by both page types, so no API
+change and no new data exposure were needed.
+
+## 37.3 Security
+
+- **No private data leaves the server.** The shared text is only what was
+  already printed on the document the Owner is looking at.
+- **No application URL is ever placed in a shared message.** Every
+  document page requires an Owner session, so a link to it would be
+  useless to a recipient and a needless leak of the internal host.
+- **The payment sheet never embeds a phone number.** It is marked
+  `sensitive`, so it always degrades to the contact picker and renders a
+  warning that it contains confidential salary information and that no
+  recipient was chosen. Its route stays `guard(req, OWNER)`.
+- **Authorisation is unchanged.** `GET /api/receipts`, `GET /api/deliveries`
+  and `GET /api/payment-sheet` are still Owner-only server-side. Nothing
+  here relies on the frontend hiding or disabling a button --- the tests
+  assert the API returns 403 regardless of what the page renders.
+- `rel="noreferrer noopener"` stops the internal host being sent to
+  WhatsApp as a referrer and blocks the new tab reaching back into the
+  opener.
+
+## 37.4 Regression coverage
+
+`tests/whatsapp-sharing.test.ts`, 15 tests. It renders the **real**
+`DocumentActions` component with `renderToStaticMarkup` and asserts on the
+actual markup, and it calls the real receipt/delivery/payment-sheet routes
+for the authorisation half. Each control was mutation-tested:
+
+| Mutation | Tests that failed | Everything else |
+| --- | --- | --- |
+| Let the payment sheet embed a customer phone number | `whatsapp-sharing` 11 only | all 99 others passed |
+| Make `whatsappNumber` guess on unresolvable numbers | `whatsapp-sharing` 2 and 10 only | all 98 others passed |
+| Drop `noreferrer` from the anchor | `whatsapp-sharing` 8 only | all 99 others passed |
+| Widen `GET /api/receipts` from `OWNER` to `STAFF` | `whatsapp-sharing` 14 only | all 99 others passed |
+
+## 37.5 Known limitations
+
+- **Sharing has not been exercised on a real handset.** The generated
+  `wa.me` URLs are asserted in tests, but no device or WhatsApp account
+  was available in this environment to confirm the hand-off. The URL
+  format follows WhatsApp's published `wa.me` scheme.
+- **The number is used as stored.** If a customer's `phone` holds a
+  Nigerian number in a form the helper cannot resolve, the action falls
+  back to the contact picker rather than guessing. Fixing the stored
+  number is a data-entry task, not a code change.
+- **Only the three existing printables have the action.** Section 33
+  mentions "other customer-facing printable documents where sensible";
+  there are no others --- a `find` over `src/app` for pages outside
+  `(app)` returns exactly these three.
+- **Message content is the plain document text**, not a PDF or image.
+  WhatsApp deep links cannot attach a file, so the recipient gets the
+  details as text and the Owner can still use Print/Email for the PDF.
+
+------------------------------------------------------------------------
+
+# 38. IMPLEMENTED: UI, PWA and mobile polish (Task 5)
+
+No table changed, no migration was created, no API route was added, and no
+authorization rule was touched. Four real gaps were found and fixed; most
+of what section 33 asks for was already in place and was verified rather
+than rebuilt.
+
+## 38.1 Verified as already implemented (do not redo)
+
+Checked against the code, not assumed:
+
+- **PWA core** - `src/app/manifest.ts` (standalone, `start_url: /login`,
+  scope `/`, brand colours), `public/sw.js`, `public/offline.html`, and the
+  service-worker registration in `src/app/layout.tsx`.
+- **Offline safety** - `sw.js` caches only `/_next/static/` and
+  `offline.html`. It never caches an API response, a document or a
+  dashboard, which is what section 33's "do not cache private
+  orders/financial pages on shared phones" requires.
+- **Mobile sidebar** - the drawer already scrolls independently
+  (`min-h-0 flex-1 overflow-y-auto overscroll-contain`), closes on Escape,
+  and locks body scroll while open.
+- **Modals** - the shared `Modal` is already a bottom sheet on phones
+  (`items-end sm:items-center`, `max-h-[96dvh]`, `overscroll-contain`), and
+  already handled the bottom safe area.
+- **Tap targets and forms** - the shared `inputCls` and `Btn` are both
+  `min-h-11` (44px), and `inputCls` is `text-base` on phones so iOS does
+  not zoom on focus. 229 call sites use it.
+- **Grouped pages** - `SchoolOrderGroups` exists and is used by both
+  Worker Assignments and the Stage Ledger, so neither is a wide table.
+- **Charts** - all charts are CSS percentage-width bars, so they are fluid
+  at any width; no chart library is installed.
+- **Print** - `globals.css` already has `@page { size: A4 portrait }`,
+  `print-color-adjust: exact`, `break-inside: avoid` on rows and
+  `table-header-group` so long tables repeat their header.
+- **Navigation** - the sidebar groups match section 33 exactly for Owner,
+  Project Manager and Worker.
+
+## 38.2 What changed
+
+Five changes, all additive:
+
+1. **Safe-area insets.** `layout.tsx` sets `viewportFit: "cover"` and
+   `appleWebApp.statusBarStyle: "black-translucent"`, which means content
+   extends under the status bar and the home indicator, but only the Modal
+   accounted for it. The app shell, the mobile top bar, the drawer header
+   and the sidebar footer now reserve the correct inset. Each uses
+   `max(<old padding>, env(safe-area-inset-*))`, so on a desktop browser -
+   where the insets are 0 - the padding is exactly what it was before.
+2. **Mobile menu toggle tap target.** It was `p-1` around a 24px icon,
+   about 32px, while the drawer's close button right beside it was already
+   `h-11 w-11`. The toggle now matches it, and gained `aria-expanded`.
+3. **Login form on iOS.** The login page defined its own input class with
+   `text-sm`, which makes iOS Safari zoom the page on focus. It now
+   follows the shared convention: `text-base sm:text-sm` plus `min-h-11`.
+   This was the only page in the app not using that convention.
+4. **Install affordance.** Section 33 lists installable app behaviour and
+   Android/iOS "Add to Home Screen" as requirements, but nothing handled
+   `beforeinstallprompt`. New `src/components/InstallPrompt.tsx` shows the
+   browser's own prompt from the sidebar, and renders nothing at all until
+   the browser fires that event - so on iOS Safari, or any browser that
+   does not offer it, there is no fake button that cannot install anything.
+5. **Official logo fallback.** `GET /api/branding/logo` now falls back to
+   the committed `public/matesther-logo.png` whenever no Owner upload
+   exists (section 38.3), so the real mark is in use everywhere without
+   touching the database.
+
+## 38.3 The official logo
+
+Found and wired in. The official mark is `public/matesther-logo.png` -
+a 1254 x 1254 PNG, committed to `main` at `fd1cd40`. It exists there but not
+in this working branch (the branch is cut from an earlier `main` commit), so
+it was brought across with the single additive command
+`git checkout origin/main -- public/matesther-logo.png`.
+
+One additive change connects it to the machinery every slot already used:
+`GET /api/branding/logo` returns the bundled file when the Owner has not
+uploaded their own logo, and the upload still takes precedence. No component
+changed, no database write, and the file is served byte-for-byte.
+
+## 38.4 Security
+
+No authorization, session or origin check was modified. The branding
+endpoint is the only API the new tests touch, and its existing rules were
+verified rather than changed: the logo upload stays Owner-only, the GET
+stays public but only ever returns branding, and `no-store` plus
+`X-Content-Type-Options: nosniff` are still set. `InstallPrompt` defers to
+the browser's own install consent and cannot install anything silently.
+
+## 38.5 Regression coverage
+
+`tests/pwa-branding.test.ts`, 15 tests, taking the suite to 115. The
+branding tests drive the real route with the real `sharp` and the real
+Drizzle layer. The suite is 100 tests of Tasks 1-4 plus these 15, and all
+100 pre-existing tests still pass unchanged.
+
+Two notes on the new tests:
+
+- **The byte-exactness test initially passed for the wrong reason.** A
+  sharp-generated PNG re-encodes to byte-identical output, so a mutation
+  that re-encoded the Owner's logo on the way out was invisible. The
+  fixture now carries a 300 dpi density so re-encoding changes the bytes,
+  and the test asserts that fact about itself first, so it cannot silently
+  become vacuous again. (Level-0 compression also works but makes an
+  873x641 image ~2.24 MB, over the route's 2 MB limit.)
+- Four of the fifteen tests are **source-contract** checks: they read the
+  shipped file and assert a CSS class is still present. `env(safe-area-
+  inset-bottom)` and a 44px tap target cannot be observed without a real
+  browser, which this suite deliberately does not need. They are labelled
+  as source contracts in the file header rather than passed off as
+  behavioural tests.
+
+## 38.6 Deployment
+
+No migration. No SQL. No schema change - `drizzle-kit generate` reports no
+drift. Deploying Task 5 is a code deploy only.
+
+## 38.7 Known limitations
+
+- **Not verified on a real handset.** The safe-area and tap-target fixes
+  follow the documented CSS and are asserted in the source, but no device
+  was available. They need a quick look on an actual iPhone and Android
+  phone, installed as a PWA.
+- **The install button is Chromium-only in practice.** `beforeinstallprompt`
+  is not implemented by iOS Safari, so iPhone users must use the browser's
+  Share -> Add to Home Screen. That is a platform limitation, not a bug;
+  the component hides itself rather than showing something that cannot work.
+- **The fallback logo resolves from `process.cwd()/public`.** That is the
+  project root under `next dev`/`next start` and in this test suite. If a
+  future host ran the route from a different working directory, the fallback
+  would 404 and slots would show the gold "M" until the Owner uploads, so the
+  file must ship with the app.
+- Section 33's item 7 - deriving a size's `completed` count from approved
+  production, and the batch payroll query - is **not** part of Task 5 and
+  remains outstanding.

@@ -119,6 +119,108 @@ export const WORKER_SPECIALTIES = [
   "Packer",
 ];
 
+/**
+ * Every role a person may hold. The seven production roles above, plus the two
+ * non-stage roles Matesther uses. One person may hold several at once.
+ *
+ * "Inspection Officer" and "Project Supervisor" are labels only. They grant no
+ * API permission: inspecting is still gated server-side to OWNER and
+ * PRODUCTION_MANAGER, and never on work the person submitted themselves.
+ */
+/** The seven roles that take part in the 8-stage production workflow. */
+export const PRODUCTION_ROLES = [...WORKER_SPECIALTIES] as const;
+
+/** Supporting garment work a tailor hands to a helper. */
+export const SUPPORT_OPERATIONS = ["Weaving", "Taping", "Support Work", "Other Support"] as const;
+
+/** The role held by someone who performs tailor support work. */
+export const SUPPORT_ROLE = "Support Worker";
+
+/**
+ * Non-production staff positions.
+ *
+ * These are roles, not a second person system, so a security guard who also
+ * sews is one record holding ["Security", "Tailor"] - never two people.
+ */
+export const STAFF_POSITIONS = [
+  "Security",
+  "Sales",
+  "IT",
+  "Administration",
+  "Management",
+  "Director",
+  "Office Staff",
+] as const;
+
+export const WORKER_ROLES = [
+  ...PRODUCTION_ROLES,
+  SUPPORT_ROLE,
+  "Inspection Officer",
+  "Project Supervisor",
+  ...STAFF_POSITIONS,
+] as const;
+
+export type WorkerRole = (typeof WORKER_ROLES)[number];
+
+/** The role a person must hold to be assigned each production stage. */
+export const STAGE_ROLES: Record<string, string> = {
+  CUTTING: "Cutter",
+  SEWING: "Tailor",
+  MONOGRAMMING: "Monogrammer",
+  BUTTONHOLE: "Buttonhole",
+  BUTTON_TACKING: "Button Tacking",
+  IRONING: "Ironer",
+  PACKING: "Packer",
+};
+
+/** True when a role is one of the production-stage roles. */
+export function isProductionRole(role: string | null | undefined): boolean {
+  return !!role && PRODUCTION_ROLES.some((known) => sameRole(known, role));
+}
+
+/**
+ * Broad staff grouping shown in the Owner's staff list. A person may fall into
+ * more than one, which is exactly why these are derived and not stored.
+ */
+export function staffCategories(roles: string[]): string[] {
+  const categories: string[] = [];
+  if (roles.some((role) => isProductionRole(role))) categories.push("Production Worker");
+  if (roles.some((role) => sameRole(role, SUPPORT_ROLE))) categories.push("Support Worker");
+  if (roles.some((role) => STAFF_POSITIONS.some((position) => sameRole(position, role))))
+    categories.push("Salaried / Non-Production Staff");
+  return categories;
+}
+
+/** Case/whitespace-insensitive role comparison. */
+export function sameRole(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+/** True when `roles` contains `role`, ignoring case and surrounding spaces. */
+export function hasRole(roles: (string | null | undefined)[], role: string): boolean {
+  return roles.some((value) => sameRole(value, role));
+}
+
+/**
+ * Client-side mirror of the server's effective-roles rule: the roles returned
+ * by /api/workers, with the legacy specialty always counted.
+ */
+export function personRoles(person: { specialty?: string | null; roles?: string[] | null }): string[] {
+  const listed = Array.isArray(person.roles) ? person.roles.filter((role): role is string => !!role) : [];
+  const specialty = person.specialty;
+  if (specialty && !hasRole(listed, specialty)) listed.push(specialty);
+  return listed;
+}
+
+/** Does this person hold `role`? Used by every worker dropdown filter. */
+export function personHoldsRole(
+  person: { specialty?: string | null; roles?: string[] | null },
+  role: string
+): boolean {
+  return hasRole(personRoles(person), role);
+}
+
 export const CUSTOMER_TYPES = ["SCHOOL", "COMPANY", "ORGANIZATION", "INDIVIDUAL"];
 
 /** Operation statuses */

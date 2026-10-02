@@ -1,7 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
-import { ChevronLeft, ChevronRight, HandCoins, History, Plus } from "lucide-react";
+import { ChevronLeft, ChevronRight, HandCoins, History, Plus, Printer } from "lucide-react";
 import {
   Card,
   CardHeader,
@@ -46,9 +47,9 @@ export default function PayrollPage() {
   const [err, setErr] = useState("");
 
   const [payModal, setPayModal] = useState<any>(null);
-  const [payForm, setPayForm] = useState({ workerId: "", pieceworkAmount: "", salaryAmount: "", overtimeAmount: "", amount: "", method: "Bank Transfer", paymentDate: new Date().toISOString().slice(0, 10), notes: "" });
+  const [payForm, setPayForm] = useState({ workerId: "", pieceworkAmount: "", supportAmount: "", salaryAmount: "", overtimeAmount: "", otherAmount: "", amount: "", method: "Bank Transfer", paymentDate: new Date().toISOString().slice(0, 10), reference: "", notes: "" });
   const [otModal, setOtModal] = useState(false);
-  const [otForm, setOtForm] = useState({ workerId: "", workedOn: new Date().toISOString().slice(0, 10), hours: "", amount: "", notes: "" });
+  const [otForm, setOtForm] = useState({ workerId: "", workedOn: new Date().toISOString().slice(0, 10), hours: "", amount: "", category: "OVERTIME", notes: "" });
   const [historyFor, setHistoryFor] = useState<any>(null);
   const [formErr, setFormErr] = useState("");
   const [saving, setSaving] = useState(false);
@@ -73,11 +74,14 @@ export default function PayrollPage() {
     setPayForm({
       workerId: id,
       pieceworkAmount: row ? String(row.piecework) : "",
+      supportAmount: row ? String(row.supportPiecework ?? 0) : "",
       salaryAmount: row ? String(row.salary) : "",
       overtimeAmount: row ? String(row.overtime) : "",
+      otherAmount: row ? String(row.other ?? 0) : "",
       amount: row ? String(row.due) : "",
       method: "Bank Transfer",
       paymentDate: new Date().toISOString().slice(0, 10),
+      reference: "",
       notes: "",
     });
   }
@@ -87,7 +91,18 @@ export default function PayrollPage() {
     setSaving(true);
     setFormErr("");
     try {
-      const body = kind === "payment" ? { kind, ...payForm, workerId: Number(payForm.workerId), periodMonth: month, paidBy: user?.name } : { kind, ...otForm, workerId: Number(otForm.workerId) };
+      const body = kind === "payment"
+        ? {
+            ...payForm,
+            kind,
+            workerId: Number(payForm.workerId),
+            periodMonth: month,
+            paidBy: user?.name,
+            // Same worker, month, date, amount, method and reference can only be
+            // recorded once, so a double click or a retried request cannot pay twice.
+            idempotencyKey: `payroll:${month}:${payForm.workerId}:${payForm.paymentDate}:${Number(payForm.amount) || 0}:${payForm.method}:${payForm.reference}`.slice(0, 200),
+          }
+        : { ...otForm, kind: otForm.category === "OTHER" ? "other" : kind, workerId: Number(otForm.workerId) };
       const res = await fetch("/api/payroll", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -112,7 +127,7 @@ export default function PayrollPage() {
     setHistoryFor({ ...w, ...res, loading: false });
   }
 
-  const payTotal = (Number(payForm.pieceworkAmount) || 0) + (Number(payForm.salaryAmount) || 0) + (Number(payForm.overtimeAmount) || 0);
+  const payTotal = (Number(payForm.pieceworkAmount) || 0) + (Number(payForm.supportAmount) || 0) + (Number(payForm.salaryAmount) || 0) + (Number(payForm.overtimeAmount) || 0) + (Number(payForm.otherAmount) || 0);
 
   if (err) return <p className="text-sm text-red-700">Failed to load: {err}</p>;
 
@@ -122,9 +137,14 @@ export default function PayrollPage() {
         title="Worker Payments"
         subtitle="Monthly payroll - piecework on approved work, monthly salaries and overtime. This is part of the month's expenses."
         action={
-          <Btn onClick={() => { setFormErr(""); setOtForm({ workerId: "", workedOn: new Date().toISOString().slice(0, 10), hours: "", amount: "", notes: "" }); setOtModal(true); }}>
-            <Plus className="w-4 h-4" /> Record Overtime
-          </Btn>
+          <>
+            <Link href={`/payment-sheet/${month}`} target="_blank" rel="noreferrer">
+              <Btn variant="secondary"><Printer className="w-4 h-4" /> Bank Payment Sheet</Btn>
+            </Link>
+            <Btn onClick={() => { setFormErr(""); setOtForm({ workerId: "", workedOn: new Date().toISOString().slice(0, 10), hours: "", amount: "", category: "OVERTIME", notes: "" }); setOtModal(true); }}>
+              <Plus className="w-4 h-4" /> Overtime / Other
+            </Btn>
+          </>
         }
       />
 
@@ -165,18 +185,21 @@ export default function PayrollPage() {
           <EmptyState title={`No earnings recorded for ${monthLabel(month)}`} hint="Piecework appears here as soon as work is inspected; salaries appear for monthly staff." />
         ) : (
           <div className="overflow-x-auto slim-scroll">
-            <table className="w-full text-sm min-w-[980px]">
+            <table className="w-full text-sm min-w-[1180px]">
               <thead>
                 <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">
                   <th className="px-5 py-3">Worker</th>
                   <th className="px-3 py-3">Pay Type</th>
                   <th className="px-3 py-3 text-right">Pieces Approved</th>
                   <th className="px-3 py-3 text-right">Piecework</th>
+                  <th className="px-3 py-3 text-right">Support</th>
                   <th className="px-3 py-3 text-right">Salary</th>
                   <th className="px-3 py-3 text-right">Overtime</th>
+                  <th className="px-3 py-3 text-right">Other</th>
                   <th className="px-3 py-3 text-right">Total Due</th>
                   <th className="px-3 py-3 text-right">Paid</th>
                   <th className="px-3 py-3 text-right">Balance</th>
+                  <th className="px-3 py-3">Status</th>
                   <th className="px-3 py-3 text-right">Actions</th>
                 </tr>
               </thead>
@@ -192,12 +215,20 @@ export default function PayrollPage() {
                       <td className="px-3 py-3 text-xs">{w.paymentType.replace("_", " ")}</td>
                       <td className="px-3 py-3 text-right">{w.pieces.toLocaleString()}</td>
                       <td className="px-3 py-3 text-right">{w.piecework ? naira(w.piecework) : "-"}</td>
+                      <td className="px-3 py-3 text-right">{w.supportPiecework ? naira(w.supportPiecework) : "-"}</td>
                       <td className="px-3 py-3 text-right">{w.salary ? naira(w.salary) : "-"}</td>
                       <td className="px-3 py-3 text-right">{w.overtime ? naira(w.overtime) : "-"}</td>
+                      <td className="px-3 py-3 text-right">{w.other ? naira(w.other) : "-"}</td>
                       <td className="px-3 py-3 text-right font-bold">{naira(w.due)}</td>
                       <td className="px-3 py-3 text-right text-matesther-700 font-semibold">{w.paid ? naira(w.paid) : "-"}</td>
                       <td className="px-3 py-3 text-right font-bold">
                         {w.balance > 0 ? <span className="text-red-700">{naira(w.balance)}</span> : w.paid > 0 ? <span className="text-emerald-700">Settled</span> : "-"}
+                      </td>
+                      <td className="px-3 py-3 text-xs">
+                        {w.paymentStatus === "PAID" ? <span className="font-semibold text-emerald-700">Paid in full</span>
+                          : w.paymentStatus === "PARTIAL" ? <span className="font-semibold text-amber-700">Part paid</span>
+                          : w.paymentStatus === "UNPAID" ? <span className="font-semibold text-red-700">Not yet paid</span>
+                          : <span className="text-slate-400">Nothing due</span>}
                       </td>
                       <td className="px-3 py-3 text-right whitespace-nowrap">
                         {w.balance > 0 && (
@@ -218,10 +249,11 @@ export default function PayrollPage() {
               <tfoot>
                 {d && (
                   <tr className="border-t-2 border-slate-200 bg-slate-50">
-                    <td colSpan={6} className="px-5 py-3 font-bold">Total - {monthLabel(month)}</td>
+                    <td colSpan={8} className="px-5 py-3 font-bold">Total - {monthLabel(month)}</td>
                     <td className="px-3 py-3 text-right font-extrabold">{naira(d.totals.due)}</td>
                     <td className="px-3 py-3 text-right font-bold text-matesther-700">{naira(d.totals.paid)}</td>
                     <td className="px-3 py-3 text-right font-extrabold text-red-700">{naira(d.totals.balance)}</td>
+                    <td />
                     <td />
                   </tr>
                 )}
@@ -245,7 +277,8 @@ export default function PayrollPage() {
                     {p.notes ? ` • ${p.notes}` : ""}
                   </p>
                   <p className="text-[11px] text-slate-400">
-                    Piecework {naira(p.pieceworkAmount)} + Salary {naira(p.salaryAmount)} + Overtime {naira(p.overtimeAmount)}
+                    Piecework {naira(p.pieceworkAmount)} + Support {naira(p.supportAmount ?? 0)} + Salary {naira(p.salaryAmount)} + Overtime {naira(p.overtimeAmount)} + Other {naira(p.otherAmount ?? 0)}
+                    {p.reference ? ` • Ref ${p.reference}` : ""}
                   </p>
                 </div>
                 <Badge status="COMPLETED" />
@@ -257,13 +290,13 @@ export default function PayrollPage() {
 
         {/* Overtime this month */}
         <Card>
-          <CardHeader title={`Overtime - ${monthLabel(month)}`} />
+          <CardHeader title={`Overtime & Other Payments - ${monthLabel(month)}`} />
           <div className="divide-y divide-slate-100">
             {d?.overtime.map((o: any) => (
               <div key={o.id} className="px-5 py-3 text-sm flex justify-between items-center">
                 <div>
                   <p className="font-semibold">{o.workerName} - {naira(o.amount)}</p>
-                  <p className="text-xs text-slate-500">{fmtDate(o.workedOn)} • {o.hours ? `${o.hours} hrs` : ""}{o.notes ? ` • ${o.notes}` : ""}</p>
+                  <p className="text-xs text-slate-500">{o.category === "OTHER" ? "Other payment" : "Overtime"} • {fmtDate(o.workedOn)} • {o.hours ? `${o.hours} hrs` : ""}{o.notes ? ` • ${o.notes}` : ""}</p>
                 </div>
                 <Badge status="IN_PROGRESS" />
               </div>
@@ -280,9 +313,11 @@ export default function PayrollPage() {
             Settling {monthLabel(month)} for <span className="font-semibold">{payModal?.name}</span>.
             Breakdown is pre-filled from their approved work, salary and overtime - adjust if part of it is paid.
           </p>
-          <Field label="Piecework"><input type="number" min="0" value={payForm.pieceworkAmount} onChange={(e) => setPayForm({ ...payForm, pieceworkAmount: e.target.value })} className={inputCls} /></Field>
+          <Field label="Production piecework"><input type="number" min="0" value={payForm.pieceworkAmount} onChange={(e) => setPayForm({ ...payForm, pieceworkAmount: e.target.value })} className={inputCls} /></Field>
+          <Field label="Support work piecework"><input type="number" min="0" value={payForm.supportAmount} onChange={(e) => setPayForm({ ...payForm, supportAmount: e.target.value })} className={inputCls} /></Field>
           <Field label="Salary"><input type="number" min="0" value={payForm.salaryAmount} onChange={(e) => setPayForm({ ...payForm, salaryAmount: e.target.value })} className={inputCls} /></Field>
           <Field label="Overtime"><input type="number" min="0" value={payForm.overtimeAmount} onChange={(e) => setPayForm({ ...payForm, overtimeAmount: e.target.value })} className={inputCls} /></Field>
+          <Field label="Other payments"><input type="number" min="0" value={payForm.otherAmount} onChange={(e) => setPayForm({ ...payForm, otherAmount: e.target.value })} className={inputCls} /></Field>
           <Field label="Total breakdown"><input value={naira(payTotal)} disabled className={`${inputCls} bg-slate-100`} /></Field>
           <Field label="Amount to pay now (₦) *"><input type="number" min="1" required value={payForm.amount} onChange={(e) => setPayForm({ ...payForm, amount: e.target.value })} className={inputCls} /></Field>
           <Field label="Payment date"><input type="date" value={payForm.paymentDate} onChange={(e) => setPayForm({ ...payForm, paymentDate: e.target.value })} className={inputCls} /></Field>
@@ -291,6 +326,7 @@ export default function PayrollPage() {
               {PAY_METHODS.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </Field>
+          <Field label="Bank / transfer reference"><input value={payForm.reference} onChange={(e) => setPayForm({ ...payForm, reference: e.target.value })} className={inputCls} placeholder="Shown on the payment sheet" /></Field>
           <Field label="Notes"><input value={payForm.notes} onChange={(e) => setPayForm({ ...payForm, notes: e.target.value })} className={inputCls} placeholder="e.g. Full September settlement" /></Field>
           {formErr && <p className="sm:col-span-2 text-sm text-red-600">{formErr}</p>}
           <div className="sm:col-span-2 flex justify-end gap-2">
@@ -301,8 +337,14 @@ export default function PayrollPage() {
       </Modal>
 
       {/* Overtime modal */}
-      <Modal open={otModal} onClose={() => setOtModal(false)} title="Record Overtime">
+      <Modal open={otModal} onClose={() => setOtModal(false)} title="Record Overtime or Other Payment">
         <form onSubmit={(e) => submit("overtime", e)} className="grid sm:grid-cols-2 gap-3">
+          <Field label="Type" className="sm:col-span-2">
+            <select value={otForm.category} onChange={(e) => setOtForm({ ...otForm, category: e.target.value })} className={inputCls}>
+              <option value="OVERTIME">Overtime</option>
+              <option value="OTHER">Other approved payment (allowance, bonus)</option>
+            </select>
+          </Field>
           <Field label="Worker *">
             <select required value={otForm.workerId} onChange={(e) => setOtForm({ ...otForm, workerId: e.target.value })} className={inputCls}>
               <option value="">Select…</option>
@@ -310,13 +352,15 @@ export default function PayrollPage() {
             </select>
           </Field>
           <Field label="Worked on"><input type="date" value={otForm.workedOn} onChange={(e) => setOtForm({ ...otForm, workedOn: e.target.value })} className={inputCls} /></Field>
-          <Field label="Hours (for record)"><input type="number" min="0" value={otForm.hours} onChange={(e) => setOtForm({ ...otForm, hours: e.target.value })} className={inputCls} /></Field>
+          {otForm.category === "OVERTIME" && (
+            <Field label="Hours (for record)"><input type="number" min="0" value={otForm.hours} onChange={(e) => setOtForm({ ...otForm, hours: e.target.value })} className={inputCls} /></Field>
+          )}
           <Field label="Amount paid (₦) *"><input type="number" min="1" required value={otForm.amount} onChange={(e) => setOtForm({ ...otForm, amount: e.target.value })} className={inputCls} /></Field>
           <Field label="Notes" className="sm:col-span-2"><input value={otForm.notes} onChange={(e) => setOtForm({ ...otForm, notes: e.target.value })} className={inputCls} placeholder="e.g. Rush job for school delivery" /></Field>
           {formErr && <p className="sm:col-span-2 text-sm text-red-600">{formErr}</p>}
           <div className="sm:col-span-2 flex justify-end gap-2">
             <Btn variant="secondary" onClick={() => setOtModal(false)}>Cancel</Btn>
-            <Btn type="submit" disabled={saving}>{saving ? "Saving…" : "Record Overtime"}</Btn>
+            <Btn type="submit" disabled={saving}>{saving ? "Saving…" : otForm.category === "OTHER" ? "Record Payment" : "Record Overtime"}</Btn>
           </div>
         </form>
       </Modal>
@@ -328,17 +372,19 @@ export default function PayrollPage() {
         ) : historyFor?.history ? (
           <div>
             <p className="text-xs text-slate-500 mb-3">
-              {historyFor.specialty} • {historyFor.paymentType === "PER_PIECE" ? "Per-piece rates agreed by job" : `${historyFor.paymentType.replace("_", " ")} ${naira(historyFor.rate)} per month`}
+              {(historyFor.roles ?? [historyFor.specialty]).join(", ")} • {historyFor.paymentType === "PER_PIECE" ? "Per-piece rates agreed by job" : `${historyFor.paymentType.replace("_", " ")} ${naira(historyFor.rate)} per month`}
             </p>
             <div className="overflow-x-auto slim-scroll rounded-lg border border-slate-200">
-              <table className="w-full text-sm min-w-[560px]">
+              <table className="w-full text-sm min-w-[700px]">
                 <thead>
                   <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100 bg-slate-50">
                     <th className="px-4 py-2.5">Month</th>
                     <th className="px-3 py-2.5 text-right">Pieces</th>
                     <th className="px-3 py-2.5 text-right">Piecework</th>
+                    <th className="px-3 py-2.5 text-right">Support</th>
                     <th className="px-3 py-2.5 text-right">Salary</th>
                     <th className="px-3 py-2.5 text-right">Overtime</th>
+                    <th className="px-3 py-2.5 text-right">Other</th>
                     <th className="px-3 py-2.5 text-right">Due</th>
                     <th className="px-3 py-2.5 text-right">Paid</th>
                     <th className="px-3 py-2.5 text-right">Balance</th>
@@ -350,8 +396,10 @@ export default function PayrollPage() {
                       <td className="px-4 py-2 font-medium">{monthLabel(h.month)}</td>
                       <td className="px-3 py-2 text-right">{h.pieces.toLocaleString()}</td>
                       <td className="px-3 py-2 text-right">{h.piecework ? naira(h.piecework) : "-"}</td>
+                      <td className="px-3 py-2 text-right">{h.supportPiecework ? naira(h.supportPiecework) : "-"}</td>
                       <td className="px-3 py-2 text-right">{h.salary ? naira(h.salary) : "-"}</td>
                       <td className="px-3 py-2 text-right">{h.overtime ? naira(h.overtime) : "-"}</td>
+                      <td className="px-3 py-2 text-right">{h.other ? naira(h.other) : "-"}</td>
                       <td className="px-3 py-2 text-right font-bold">{naira(h.due)}</td>
                       <td className="px-3 py-2 text-right text-matesther-700 font-semibold">{h.paid ? naira(h.paid) : "-"}</td>
                       <td className="px-3 py-2 text-right font-semibold">{h.balance > 0 ? <span className="text-red-700">{naira(h.balance)}</span> : h.paid > 0 ? <span className="text-emerald-700">Settled</span> : "-"}</td>

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { NextResponse } from "next/server";
 import sharp from "sharp";
 import { eq } from "drizzle-orm";
@@ -18,6 +20,26 @@ function actualMime(buffer: Buffer): string | null {
   return null;
 }
 
+const BUNDLED_LOGO_PATH = join(process.cwd(), "public", "matesther-logo.png");
+let bundledLogoCache: Buffer | null | undefined;
+
+/**
+ * The official MATESTHER mark committed to `public/matesther-logo.png`. It is
+ * used only while the Owner has not uploaded their own logo through Settings,
+ * and is served exactly as committed - never redrawn or re-rendered. `process
+ * .cwd()` is the project root under `next dev`, `next start` and this test
+ * suite, so the same file is resolved everywhere.
+ */
+function bundledLogo(): Buffer | null {
+  if (bundledLogoCache !== undefined) return bundledLogoCache;
+  try {
+    bundledLogoCache = readFileSync(BUNDLED_LOGO_PATH);
+  } catch {
+    bundledLogoCache = null;
+  }
+  return bundledLogoCache;
+}
+
 /** Public branding only. Original bytes are served untouched unless requesting an OS icon. */
 export async function GET(req: Request) {
   try {
@@ -26,12 +48,19 @@ export async function GET(req: Request) {
       .from(organizations)
       .where(eq(organizations.id, 1))
       .limit(1);
-    if (!org?.logoData || !org.logoMime) return new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
-    const original = Buffer.from(org.logoData, "base64");
     const requested = new URL(req.url).searchParams.get("size");
     const size = requested ? Number(requested) : null;
     if (requested && (!Number.isInteger(size) || !ICON_SIZES.includes(size!)))
       return NextResponse.json({ error: "Unsupported icon size" }, { status: 400 });
+
+    // The Owner's own uploaded logo always wins. While none is set, fall back to
+    // the official mark committed to public/matesther-logo.png so every slot -
+    // sidebar, login, letterhead, favicon and the PWA icons - shows the real logo
+    // with no database write at all.
+    const hasUpload = Boolean(org?.logoData && org.logoMime);
+    const original = hasUpload ? Buffer.from(org!.logoData!, "base64") : bundledLogo();
+    if (!original) return new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
+    const mime = hasUpload ? org!.logoMime! : "image/png";
 
     // Favicon / installed-app icons need square dimensions; fit and pad the same
     // original file without cropping, replacing, or redrawing its artwork.
@@ -40,7 +69,7 @@ export async function GET(req: Request) {
       : original;
     return new Response(new Uint8Array(bytes), {
       headers: {
-        "Content-Type": size ? "image/png" : org.logoMime,
+        "Content-Type": size ? "image/png" : mime,
         "Cache-Control": "no-store, max-age=0",
         "X-Content-Type-Options": "nosniff",
       },

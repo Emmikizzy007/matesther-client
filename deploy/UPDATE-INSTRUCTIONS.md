@@ -24,4 +24,37 @@ Use **one existing email and password**. An inspector who also cuts uniforms nee
 
 This particular release adds no new database fields beyond those already described in `deploy/upgrade-current-client.sql`. If that file has already been applied to the **client** Supabase project, push the updated code to the client GitHub repository and wait for Netlify to publish. If it has **not** been applied, make a backup and run it in the correct client Supabase project **before** deploying this code. It is designed to be repeatable and preserves business records.
 
+## Multi-role workers: one person, several roles
+
+This release adds **one new table**, `public.worker_roles`, so a person who cuts and sews is recorded once with two roles instead of twice as two people.
+
+1. Make a database backup, or confirm your restore plan.
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-multi-role.sql` and Run. It is additive and repeatable: it creates the table and its two constraints, and nothing else. There is no `DROP`, no `TRUNCATE`, no `DELETE`, and no change to any existing column — including `workers.specialty`.
+3. Run the verification query at the bottom of that file. Expect `worker_roles_table = 1` and `worker_roles_constraints = 2`, and the worker, production, inspection and payment counts **unchanged** from before you ran it.
+4. Only then push the new code. **SQL first, code second.**
+
+Nothing has to be backfilled. The application counts `workers.specialty` as a role the person already holds, so every existing worker keeps working immediately even while `public.worker_roles` is still empty.
+
+After deploying, open **Workers > Edit** on anyone who does more than one job and tick every role they do. Removing a role later never deletes the person or their production and pay history.
+
+The same change is recorded for the ORM as `drizzle/0004_worker_roles.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
+## Support work, salaried staff and the monthly bank payment sheet
+
+This release adds **two new tables** and **seven new columns**, all additive.
+
+1. Make a database backup, or confirm your restore plan.
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-support-payroll.sql` and Run. It is additive and repeatable. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, and no change to any existing column's type or meaning.
+3. Run the verification query at the bottom of that file. Expect `support_tables = 2`, `new_columns = 7`, `duplicate_payment_guard = 1`, and the worker, production, inspection, payment and overtime counts **unchanged**.
+4. Only then push the new code. **SQL first, code second.**
+
+After deploying:
+
+- **Workers > Edit** now has Job title and Department, and the role picker includes non-production positions (Security, Sales, IT, Administration, Management, Director, Office Staff) and **Support Worker**. Record a security guard or sales girl once, with their real position - do not give them a Tailor specialty and do not create a second record.
+- **Production > Support Work** is where a tailor hands weaving, taping or other supporting work to a helper. The helper submits completed pieces; the tailor who handed it out inspects and approves. **A helper can never approve their own work** - if that person is also a supervisor, the Owner or another supervisor must inspect it. Only approved pieces are paid.
+- **Worker Payments** now shows production piecework, support piecework, salary, overtime and other payments separately, with a payment status. Use **Overtime / Other** to record an approved allowance or bonus.
+- **Worker Payments > Bank Payment Sheet** opens the Owner-only printable monthly sheet for the bank. Project Managers and Workers cannot open it, and the API behind it refuses them.
+
+The same change is recorded for the ORM as `drizzle/0005_support_work_and_payroll.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
 **Never run `deploy/full-setup.sql` or `deploy/schema-only.sql` on an existing client project.** Those files are for brand-new empty databases; `full-setup.sql` contains a destructive demo-data reset.
