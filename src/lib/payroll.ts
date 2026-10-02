@@ -5,9 +5,13 @@ import {
   stageInspections,
   workerPayments,
   workerOvertime,
+  supportAssignments,
+  supportInspections,
 } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { inspectionEarnings } from "@/lib/job-pay";
+import { staffCategories } from "@/lib/format";
+import { rolesForWorker } from "@/lib/worker-roles";
 
 /* ---------------- month helpers ---------------- */
 
@@ -38,21 +42,41 @@ export function monthLabel(key: string): string {
 
 /* ---------------- per-worker accrual ---------------- */
 
+/** Payment status shown on the payroll sheet and the monthly payment sheet. */
+export function paymentStatus(due: number, paid: number): string {
+  if (due === 0) return paid > 0 ? "PAID" : "NOTHING_DUE";
+  if (paid <= 0) return "UNPAID";
+  return due - paid <= 0 ? "PAID" : "PARTIAL";
+}
+
 export interface WorkerAccrual {
   month: string;
   workerId: number;
   name: string;
   specialty: string;
+  /** Every role the person holds, production and non-production alike. */
+  roles: string[];
+  /** Broad grouping: Production Worker / Support Worker / Salaried staff. */
+  categories: string[];
+  department: string | null;
+  jobTitle: string | null;
   paymentType: string;
   rate: number;
   status: string;
   pieces: number;
+  /** Production stage piecework, on approved pieces only. */
   piecework: number;
+  /** Tailor support piecework, on approved support work only. */
+  supportPieces: number;
+  supportPiecework: number;
   salary: number;
   overtime: number;
+  /** Other approved earnings recorded for the month (allowance, bonus). */
+  other: number;
   due: number;
   paid: number;
   balance: number;
+  paymentStatus: string;
 }
 
 /**
@@ -66,11 +90,14 @@ export async function accrualForWorker(workerId: number, month: string): Promise
   const [w] = await db.select().from(workers).where(eq(workers.id, workerId));
   if (!w) return null;
 
-  const [ops, insps, pays, ots] = await Promise.all([
+  const [ops, insps, pays, ots, support, supportChecks, roles] = await Promise.all([
     db.select().from(productionOperations).where(eq(productionOperations.workerId, workerId)),
     db.select().from(stageInspections),
     db.select().from(workerPayments).where(eq(workerPayments.workerId, workerId)),
     db.select().from(workerOvertime).where(eq(workerOvertime.workerId, workerId)),
+    db.select().from(supportAssignments).where(eq(supportAssignments.workerId, workerId)),
+    db.select().from(supportInspections),
+    rolesForWorker(workerId),
   ]);
   const operationsById = new Map(ops.map((operation) => [operation.id, operation]));
   let pieces = 0;
@@ -81,13 +108,27 @@ export async function accrualForWorker(workerId: number, month: string): Promise
     pieces += inspection.quantityApproved;
     piecework += inspectionEarnings(inspection, operation, w);
   }
+  // Support work pays on approved pieces too, at the rate agreed for that work.
+  const supportById = new Map(support.map((row) => [row.id, row]));
+  let supportPieces = 0;
+  let supportPiecework = 0;
+  for (const check of supportChecks) {
+    const assignment = supportById.get(check.supportAssignmentId);
+    if (!assignment || monthKey(check.inspectedAt) !== month) continue;
+    supportPieces += check.quantityApproved;
+    supportPiecework += inspectionEarnings(check, assignment, w);
+  }
   const rate = w.paymentRate ?? 0; // monthly/daily salary or historical fallback only
   const activeDuringMonth = w.status === "ACTIVE" || (!!w.archivedAt && month <= monthKey(w.archivedAt));
   const salary = w.paymentType === "MONTHLY" && activeDuringMonth && (!w.createdAt || month >= monthKey(w.createdAt)) ? rate : 0;
-  const overtime = ots
-    .filter((o) => monthKey(o.workedOn) === month)
+  const monthExtras = ots.filter((o) => monthKey(o.workedOn) === month);
+  const overtime = monthExtras
+    .filter((o) => (o.category ?? "OVERTIME") === "OVERTIME")
     .reduce((s, o) => s + (o.amount ?? 0), 0);
-  const due = piecework + salary + overtime;
+  const other = monthExtras
+    .filter((o) => o.category === "OTHER")
+    .reduce((s, o) => s + (o.amount ?? 0), 0);
+  const due = piecework + supportPiecework + salary + overtime + other;
   const paid = pays
     .filter((p) => p.periodMonth === month)
     .reduce((s, p) => s + (p.amount ?? 0), 0);
@@ -97,16 +138,24 @@ export async function accrualForWorker(workerId: number, month: string): Promise
     workerId,
     name: w.name,
     specialty: w.specialty,
+    roles,
+    categories: staffCategories(roles),
+    department: w.department ?? null,
+    jobTitle: w.jobTitle ?? null,
     paymentType: w.paymentType,
     rate,
     status: w.status,
     pieces,
     piecework,
+    supportPieces,
+    supportPiecework,
     salary,
     overtime,
+    other,
     due,
     paid,
     balance: due - paid,
+    paymentStatus: paymentStatus(due, paid),
   };
 }
 
@@ -124,7 +173,19 @@ export async function workerAccruals(month: string) {
     }),
     { due: 0, paid: 0, balance: 0 }
   );
-  return { workers: rows, totals };
+  // Kept separate from `totals` on purpose: totals is the headline the existing
+  // payroll UI and tests rely on, breakdown is the additive detail.
+  const breakdown = rows.reduce(
+    (t, r) => ({
+      piecework: t.piecework + r.piecework,
+      supportPiecework: t.supportPiecework + r.supportPiecework,
+      salary: t.salary + r.salary,
+      overtime: t.overtime + r.overtime,
+      other: t.other + r.other,
+    }),
+    { piecework: 0, supportPiecework: 0, salary: 0, overtime: 0, other: 0 }
+  );
+  return { workers: rows, totals, breakdown };
 }
 
 /** 12-month history for one worker + their payment records */

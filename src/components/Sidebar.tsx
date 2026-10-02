@@ -29,6 +29,7 @@ import {
   LogOut,
   Menu,
   X,
+  HandHelping,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useAuth, roleLabel, Role } from "@/lib/auth";
@@ -55,6 +56,7 @@ const OWNER_NAV: NavGroup[] = [
     items: [
       { href: "/production", label: "Active Production", icon: Factory },
       { href: "/production/assign", label: "Assign Production", icon: UserCheck },
+      { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
       { href: "/production/history", label: "Production History", icon: History },
       { href: "/workers", label: "Workers", icon: ContactRound },
@@ -100,6 +102,7 @@ const PM_NAV: NavGroup[] = [
     items: [
       { href: "/production/assign", label: "Assign Production", icon: UserCheck },
       { href: "/production", label: "Active Production", icon: Factory },
+      { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
       { href: "/production/history", label: "Production History", icon: History },
     ],
@@ -128,6 +131,7 @@ const WORKER_NAV: NavGroup[] = [
     items: [
       { href: "/dashboard", label: "Dashboard", icon: Briefcase },
       { href: "/worker/jobs", label: "My Jobs", icon: Factory },
+      { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/worker/journal", label: "My Journal", icon: BookOpen },
       { href: "/worker/earnings", label: "My Earnings", icon: Coins },
       { href: "/worker/profile", label: "Profile", icon: User },

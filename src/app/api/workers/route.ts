@@ -4,6 +4,13 @@ import { db } from "@/db";
 import { workers, users, productionOperations, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime } from "@/db/schema";
 import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
 import { inspectionEarnings } from "@/lib/job-pay";
+import {
+  normaliseRoles,
+  replaceWorkerRoles,
+  rolesByWorker,
+  rolesForWorker,
+  unknownRoles,
+} from "@/lib/worker-roles";
 
 export async function GET(req: Request) {
   const denied = await guard(req, STAFF);
@@ -11,13 +18,14 @@ export async function GET(req: Request) {
   try {
     const isManager = (await getSessionUser(req))?.role === "PRODUCTION_MANAGER";
     const query = new URL(req.url).searchParams;
-    const [people, operations, inspections, payRows, overtimeRows] = await Promise.all([
+    const [people, operations, inspections, payRows, overtimeRows, roleMap] = await Promise.all([
       db.select().from(workers), db.select().from(productionOperations), db.select().from(stageInspections),
-      db.select().from(workerPayments), db.select().from(workerOvertime),
+      db.select().from(workerPayments), db.select().from(workerOvertime), rolesByWorker(),
     ]);
     const personView = (person: typeof workers.$inferSelect) => isManager
       ? { id: person.id, name: person.name, phone: person.phone, specialty: person.specialty, status: person.status,
-          paymentType: person.paymentType, isInspector: person.isInspector, createdAt: person.createdAt }
+          paymentType: person.paymentType, isInspector: person.isInspector, createdAt: person.createdAt,
+          department: person.department, jobTitle: person.jobTitle }
       : person;
     const expanded = people.map((person) => {
       const mine = operations.filter((op) => op.workerId === person.id);
@@ -31,6 +39,9 @@ export async function GET(req: Request) {
         : person.paymentType === "MONTHLY" ? person.paymentRate : 0;
       return {
         ...personView(person),
+        // Additive: every person still carries `specialty`; `roles` is the
+        // full set, so a Cutter who also sews appears in both filters.
+        roles: roleMap.get(person.id) ?? [person.specialty],
         currentTasks: mine.filter((op) => ["IN_PROGRESS", "SUBMITTED"].includes(op.status)).length,
         assigned: mine.reduce((sum, op) => sum + op.quantityReceived, 0),
         completed: mine.reduce((sum, op) => sum + op.quantityCompleted, 0),
@@ -81,12 +92,24 @@ export async function POST(req: Request) {
     const rate = Number(body.paymentRate) || 0;
     if (!Number.isSafeInteger(rate) || rate < 0 || (paymentType === "MONTHLY" && rate < 1))
       return NextResponse.json({ error: "Enter a valid monthly salary, or set the per-piece amount when assigning the job." }, { status: 400 });
-    const [created] = await db.insert(workers).values({
-      organizationId: 1, name, phone: String(body.phone ?? "").trim() || null,
-      specialty: String(body.specialty ?? "Tailor").trim() || "Tailor",
-      paymentType, paymentRate: rate, status: "ACTIVE", isInspector: !!body.isInspector,
-    }).returning();
-    return NextResponse.json(created, { status: 201 });
+    const roles = normaliseRoles(body.roles, String(body.specialty ?? "Tailor").trim() || "Tailor");
+    const invalid = unknownRoles(roles);
+    if (invalid.length)
+      return NextResponse.json({ error: `${invalid.join(", ")} is not one of Matesther's roles.` }, { status: 400 });
+    const specialty = String(body.specialty ?? "").trim() || roles[0] || "Tailor";
+    const created = await db.transaction(async (tx) => {
+      const [row] = await tx.insert(workers).values({
+        organizationId: 1, name, phone: String(body.phone ?? "").trim() || null,
+        specialty,
+        department: String(body.department ?? "").trim() || null,
+        jobTitle: String(body.jobTitle ?? "").trim() || null,
+        paymentType, paymentRate: rate, status: "ACTIVE", isInspector: !!body.isInspector,
+      }).returning();
+      // Roles live in worker_roles; the person row is created exactly once.
+      await replaceWorkerRoles(tx, row.id, roles);
+      return row;
+    });
+    return NextResponse.json({ ...created, roles }, { status: 201 });
   } catch (error) {
     console.error("Worker creation failed", error);
     return NextResponse.json({ error: "Unable to add this worker." }, { status: 500 });
@@ -107,16 +130,26 @@ export async function PUT(req: Request) {
     if (!Number.isSafeInteger(rate) || rate < 0 || (paymentType === "MONTHLY" && rate < 1))
       return NextResponse.json({ error: "Enter a valid salary. Per-piece pay is set on each production job." }, { status: 400 });
     const status = body.status === "INACTIVE" ? "INACTIVE" : "ACTIVE";
+    const roles = body.roles === undefined ? null : normaliseRoles(body.roles, existing.specialty);
+    const invalid = roles ? unknownRoles(roles) : [];
+    if (invalid.length)
+      return NextResponse.json({ error: `${invalid.join(", ")} is not one of Matesther's roles.` }, { status: 400 });
+    const specialty = String(body.specialty ?? "").trim() || (roles ? roles[0] : existing.specialty);
     const [updated] = await db.update(workers).set({
       name: String(body.name ?? "").trim() || existing.name,
       phone: String(body.phone ?? "").trim() || null,
-      specialty: String(body.specialty ?? existing.specialty),
+      specialty,
+      department: String(body.department ?? "").trim() || null,
+      jobTitle: String(body.jobTitle ?? "").trim() || null,
       paymentType, paymentRate: rate,
       isInspector: !!body.isInspector,
       status,
       archivedAt: status === "INACTIVE" ? existing.archivedAt ?? new Date() : null,
     }).where(eq(workers.id, id)).returning();
-    return NextResponse.json(updated);
+    // Editing the role set touches worker_roles only. Dropping a role never
+    // removes the person or their production and pay history.
+    if (roles) await replaceWorkerRoles(db, id, roles);
+    return NextResponse.json({ ...updated, roles: roles ?? (await rolesForWorker(id)) });
   } catch (error) {
     console.error("Worker update failed", error);
     return NextResponse.json({ error: "Unable to update this worker." }, { status: 500 });

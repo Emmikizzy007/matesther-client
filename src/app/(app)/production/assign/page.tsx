@@ -4,12 +4,12 @@ import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { ArrowRight, CheckCircle2, Plus, Scissors } from "lucide-react";
 import { Card, Field, Loading, PageHeader, inputCls, Btn } from "@/components/ui";
-import { fmtDate } from "@/lib/format";
+import { fmtDate, personHoldsRole } from "@/lib/format";
 
 type ProductionItem = { id: number; name: string; quantity: number; sizes: { size: string; quantity: number }[];
   assigned: { size: string | null; color: string | null; quantity: number }[] };
 type ProductionOrder = { id: number; customer: string; orderNumber: string; dueDate: string | null; status: string; items: ProductionItem[] };
-type Worker = { id: number; name: string; specialty: string; paymentType: string; status: string };
+type Worker = { id: number; name: string; specialty: string; roles?: string[]; paymentType: string; status: string };
 type Form = { orderId: string; itemId: string; size: string; color: string; quantity: string; cutterId: string;
   cuttingRate: string; tailorId: string; sewingRate: string; expectedCompletionDate: string };
 const newForm = (): Form => ({ orderId: "", itemId: "", size: "", color: "", quantity: "", cutterId: "", cuttingRate: "", tailorId: "", sewingRate: "", expectedCompletionDate: "" });
@@ -124,12 +124,12 @@ export default function AssignProductionPage() {
             <div className="self-end rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">{item ? <><strong>{available}</strong> garment{available === 1 ? "" : "s"} left to allocate{size ? ` for size ${size.size}` : ""}.</> : "Select a garment to see the available quantity."}{order?.dueDate && <span className="block mt-1">School deadline: {fmtDate(order.dueDate)}</span>}</div>
           </div>
           <div className="rounded-xl border border-slate-200 p-4"><p className="mb-3 text-sm font-bold text-slate-800">Cutting assignment</p>
-            {canAssignCutting ? <div className="grid gap-3 sm:grid-cols-2"><Field label="Cutter"><select className={inputCls} value={form.cutterId} onChange={(event) => setForm({ ...form, cutterId: event.target.value, cuttingRate: "" })}><option value="">Assign later</option>{workers.filter((person) => person.status === "ACTIVE" && person.specialty === "Cutter").map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>
+            {canAssignCutting ? <div className="grid gap-3 sm:grid-cols-2"><Field label="Cutter"><select className={inputCls} value={form.cutterId} onChange={(event) => setForm({ ...form, cutterId: event.target.value, cuttingRate: "" })}><option value="">Assign later</option>{workers.filter((person) => person.status === "ACTIVE" && personHoldsRole(person, "Cutter")).map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>
               {cutter?.paymentType === "PER_PIECE" && <Field label="Agreed pay per approved piece (₦) *"><input className={inputCls} type="number" min="1" step="1" required value={form.cuttingRate} onChange={(event) => setForm({ ...form, cuttingRate: event.target.value })} /></Field>}
             </div> : <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-relaxed text-amber-900">As a cutter-supervisor, you can prepare this batch and assign its Tailor. The Owner or a non-cutting supervisor must choose the Cutter and their agreed rate before Cutting begins.</p>}
           </div>
           <div className="rounded-xl border border-slate-200 p-4"><p className="mb-3 text-sm font-bold text-slate-800">Sewing assignment</p>
-            <div className="grid gap-3 sm:grid-cols-2"><Field label="Tailor"><select className={inputCls} value={form.tailorId} onChange={(event) => setForm({ ...form, tailorId: event.target.value, sewingRate: "" })}><option value="">Assign after cutting</option>{workers.filter((person) => person.status === "ACTIVE" && person.specialty === "Tailor").map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>
+            <div className="grid gap-3 sm:grid-cols-2"><Field label="Tailor"><select className={inputCls} value={form.tailorId} onChange={(event) => setForm({ ...form, tailorId: event.target.value, sewingRate: "" })}><option value="">Assign after cutting</option>{workers.filter((person) => person.status === "ACTIVE" && personHoldsRole(person, "Tailor")).map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></Field>
               {tailor?.paymentType === "PER_PIECE" && <Field label="Agreed pay per approved piece (₦) *"><input className={inputCls} type="number" min="1" step="1" required value={form.sewingRate} onChange={(event) => setForm({ ...form, sewingRate: event.target.value })} /></Field>}
             </div>
             {tailor && item?.sizes.length ? <p className="mt-2 text-xs text-slate-500">Choose a size above. Create another batch for another size or colour.</p> : null}

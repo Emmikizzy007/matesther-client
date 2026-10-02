@@ -7,6 +7,7 @@ import {
   timestamp,
   date,
   varchar,
+  unique,
 } from "drizzle-orm/pg-core";
 
 // ---------- Organizations ----------
@@ -107,7 +108,13 @@ export const workers = pgTable("workers", {
   organizationId: integer("organization_id").references(() => organizations.id),
   name: text("name").notNull(),
   phone: text("phone"),
+  // A person is NOT forced into a production specialty: `specialty` may hold a
+  // staff position such as "Security" or "Sales" for non-production employees,
+  // and `roles` in worker_roles carries the full set either way.
   specialty: text("specialty").notNull().default("Tailor"),
+  // Staff-record detail for salaried / non-production employees.
+  department: text("department"),
+  jobTitle: text("job_title"),
   paymentType: text("payment_type").notNull().default("PER_PIECE"),
   paymentRate: integer("payment_rate").notNull().default(0),
   isInspector: boolean("is_inspector").notNull().default(false),
@@ -115,6 +122,27 @@ export const workers = pgTable("workers", {
   archivedAt: timestamp("archived_at"),
   createdAt: timestamp("created_at").defaultNow(),
 });
+
+// ---------- Worker roles (one person, many production roles) ----------
+// A single person may legitimately be a Cutter AND a Tailor AND an Inspection
+// Officer. That is one workers row with several role rows here - never a
+// duplicate person. workers.specialty is kept as the legacy single-role value
+// and still counts as an assigned role, so people recorded before this table
+// existed keep working with no data backfill.
+export const workerRoles = pgTable(
+  "worker_roles",
+  {
+    id: serial("id").primaryKey(),
+    workerId: integer("worker_id")
+      .references(() => workers.id, { onDelete: "cascade" })
+      .notNull(),
+    role: text("role").notNull(),
+    // The role shown first in lists and used as the default label.
+    isPrimary: boolean("is_primary").notNull().default(false),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => [unique("worker_roles_worker_id_role_unique").on(table.workerId, table.role)]
+);
 
 // ---------- Size breakdown per order item ----------
 export const orderItemSizes = pgTable("order_item_sizes", {
@@ -178,6 +206,64 @@ export const stageInspections = pgTable("stage_inspections", {
     .notNull(),
   inspectedBy: text("inspected_by").notNull(),
   // Snapshot agreed pay per approved piece at inspection time.
+  pieceRate: integer("piece_rate"),
+  quantityApproved: integer("quantity_approved").notNull().default(0),
+  quantityRework: integer("quantity_rework").notNull().default(0),
+  quantityRejected: integer("quantity_rejected").notNull().default(0),
+  notes: text("notes"),
+  inspectedAt: timestamp("inspected_at").defaultNow(),
+});
+
+// ---------- Tailor support work (weaving, taping, other supporting work) ----
+// A tailor hands part of their garment work to a support worker. The parent
+// production_operations row stays the tailor's responsibility; this table links
+// to it for traceability and never replaces it.
+export const supportAssignments = pgTable("support_assignments", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  // The tailor who handed the work out. They are the one who may approve it.
+  assignedByWorkerId: integer("assigned_by_worker_id")
+    .references(() => workers.id, { onDelete: "cascade" })
+    .notNull(),
+  // The support worker performing it.
+  workerId: integer("worker_id")
+    .references(() => workers.id, { onDelete: "cascade" })
+    .notNull(),
+  // Optional link back to the parent tailor's stage job.
+  productionOperationId: integer("production_operation_id").references(
+    () => productionOperations.id,
+    { onDelete: "set null" }
+  ),
+  orderId: integer("order_id").references(() => orders.id, { onDelete: "set null" }),
+  // The supporting operation itself, e.g. "Weaving" or "Taping".
+  operation: text("operation").notNull(),
+  pieceRate: integer("piece_rate").notNull().default(0),
+  quantityAssigned: integer("quantity_assigned").notNull().default(0),
+  quantitySubmitted: integer("quantity_submitted").notNull().default(0),
+  quantityApproved: integer("quantity_approved").notNull().default(0),
+  quantityRework: integer("quantity_rework").notNull().default(0),
+  quantityRejected: integer("quantity_rejected").notNull().default(0),
+  status: text("status").notNull().default("ASSIGNED"),
+  assignedAt: timestamp("assigned_at").defaultNow(),
+  submittedAt: timestamp("submitted_at"),
+  inspectedAt: timestamp("inspected_at"),
+  approvedByWorkerId: integer("approved_by_worker_id").references(() => workers.id, {
+    onDelete: "set null",
+  }),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+// ---------- Support-work inspections (append-only audit trail) ----------
+// Mirrors stage_inspections: every pass is a new row, so rework and rejection
+// history is preserved rather than overwritten.
+export const supportInspections = pgTable("support_inspections", {
+  id: serial("id").primaryKey(),
+  supportAssignmentId: integer("support_assignment_id")
+    .references(() => supportAssignments.id, { onDelete: "cascade" })
+    .notNull(),
+  inspectedBy: text("inspected_by").notNull(),
+  // Snapshot of the agreed rate, so pay history survives a later rate change.
   pieceRate: integer("piece_rate"),
   quantityApproved: integer("quantity_approved").notNull().default(0),
   quantityRework: integer("quantity_rework").notNull().default(0),
@@ -294,22 +380,36 @@ export const packingRecords = pgTable("packing_records", {
 });
 
 // ---------- Worker payments (payroll records) ----------
-export const workerPayments = pgTable("worker_payments", {
-  id: serial("id").primaryKey(),
-  workerId: integer("worker_id")
-    .references(() => workers.id, { onDelete: "cascade" })
-    .notNull(),
-  paymentDate: date("payment_date").notNull(),
-  periodMonth: text("period_month").notNull(),
-  pieceworkAmount: integer("piecework_amount").notNull().default(0),
-  salaryAmount: integer("salary_amount").notNull().default(0),
-  overtimeAmount: integer("overtime_amount").notNull().default(0),
-  amount: integer("amount").notNull().default(0),
-  method: text("method"),
-  paidBy: text("paid_by"),
-  notes: text("notes"),
-  createdAt: timestamp("created_at").defaultNow(),
-});
+export const workerPayments = pgTable(
+  "worker_payments",
+  {
+    id: serial("id").primaryKey(),
+    workerId: integer("worker_id")
+      .references(() => workers.id, { onDelete: "cascade" })
+      .notNull(),
+    paymentDate: date("payment_date").notNull(),
+    periodMonth: text("period_month").notNull(),
+    pieceworkAmount: integer("piecework_amount").notNull().default(0),
+    // Piecework earned on tailor support work, kept separate from stage work.
+    supportAmount: integer("support_amount").notNull().default(0),
+    salaryAmount: integer("salary_amount").notNull().default(0),
+    overtimeAmount: integer("overtime_amount").notNull().default(0),
+    // Any other approved payment (allowance, advance settlement, bonus).
+    otherAmount: integer("other_amount").notNull().default(0),
+    amount: integer("amount").notNull().default(0),
+    method: text("method"),
+    paidBy: text("paid_by"),
+    // Bank or transfer reference, shown on the monthly payment sheet.
+    reference: text("reference"),
+    // Optional caller-supplied key. A unique index on it makes the same payment
+    // impossible to record twice, while still allowing legitimate part payments
+    // (a different key). Rows with no key stay NULL and never collide.
+    idempotencyKey: text("idempotency_key"),
+    notes: text("notes"),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => [unique("worker_payments_idempotency_key_unique").on(table.idempotencyKey)]
+);
 
 // ---------- Worker overtime ----------
 export const workerOvertime = pgTable("worker_overtime", {
@@ -320,6 +420,9 @@ export const workerOvertime = pgTable("worker_overtime", {
   workedOn: date("worked_on").notNull(),
   hours: integer("hours").notNull().default(0),
   amount: integer("amount").notNull().default(0),
+  // "OVERTIME" or "OTHER" - lets the Owner record an approved allowance or
+  // bonus on the same path without a second table. Existing rows are overtime.
+  category: text("category").notNull().default("OVERTIME"),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
 });

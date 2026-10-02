@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Search, ClipboardCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
-import { fmtDate, stageLabel, STAGES } from "@/lib/format";
+import { fmtDate, stageLabel, STAGES, personHoldsRole } from "@/lib/format";
 
 const STAGE_SPECIALTIES: Record<string, string> = { CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole", BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer", DELIVERY: "Packer" };
 const COLS = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD"];
@@ -196,7 +196,7 @@ export default function ProductionPage() {
             <Field label="Worker">
               <select value={selected.workerId || ""} onChange={(e) => setSelected({ ...selected, workerId: e.target.value ? Number(e.target.value) : null, pieceRate: null })} className={inputCls}>
                 <option value="">Unassigned</option>
-                {workers.filter((w) => w.status === "ACTIVE" && (!STAGE_SPECIALTIES[selected.stage] || w.specialty === STAGE_SPECIALTIES[selected.stage])).map((w) => <option key={w.id} value={w.id}>{w.name} - {w.specialty}</option>)}
+                {workers.filter((w) => w.status === "ACTIVE" && (!STAGE_SPECIALTIES[selected.stage] || personHoldsRole(w, STAGE_SPECIALTIES[selected.stage]))).map((w) => <option key={w.id} value={w.id}>{w.name} - {STAGE_SPECIALTIES[selected.stage] ?? w.specialty}</option>)}
               </select>
             </Field>
             {workers.find((w) => w.id === Number(selected.workerId))?.paymentType === "PER_PIECE" && <Field label="Agreed pay per approved garment (₦) *">

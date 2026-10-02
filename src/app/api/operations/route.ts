@@ -4,12 +4,10 @@ import { db } from "@/db";
 import { productionOperations, productionBatches, orders, customers, workers, orderItems, products } from "@/db/schema";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE } from "@/lib/authz";
+import { STAGE_ROLES } from "@/lib/format";
+import { workerHoldsRole } from "@/lib/worker-roles";
 
 const STATUSES = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD", "CANCELLED"];
-const STAGE_SPECIALTIES: Record<string, string> = {
-  CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole",
-  BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer",
-};
 
 export async function GET(req: Request) {
   const denied = await guard(req, ANYONE);
@@ -100,10 +98,11 @@ export async function PUT(req: Request) {
     const [person] = workerId ? await db.select().from(workers).where(eq(workers.id, workerId)).limit(1) : [];
     if (workerId && (!person || person.status !== "ACTIVE" || person.organizationId !== session.organizationId))
       return NextResponse.json({ error: "Choose an active Matesther worker." }, { status: 400 });
-    if (access?.cutterSupervisor && person?.specialty.toLowerCase() === "cutter" && workerId !== current.workerId)
+    // "Is a cutter" now means holding the Cutter role among possibly several.
+    if (access?.cutterSupervisor && workerId !== current.workerId && (await workerHoldsRole(person, "Cutter")))
       return NextResponse.json({ error: "Cutter assignments must be made by the Owner or a non-cutting supervisor." }, { status: 403 });
-    if (person && STAGE_SPECIALTIES[current.stage] && person.specialty.toLowerCase() !== STAGE_SPECIALTIES[current.stage].toLowerCase())
-      return NextResponse.json({ error: `${current.stage.replaceAll("_", " ")} needs a ${STAGE_SPECIALTIES[current.stage]}.` }, { status: 400 });
+    if (person && STAGE_ROLES[current.stage] && !(await workerHoldsRole(person, STAGE_ROLES[current.stage])))
+      return NextResponse.json({ error: `${current.stage.replaceAll("_", " ")} needs a ${STAGE_ROLES[current.stage]}.` }, { status: 400 });
     if (changedWorker && (current.quantityCompleted > 0 || current.quantityInspected > 0 || current.quantityApproved > 0))
       return NextResponse.json({ error: "This job already has production history. Keep the assigned worker; use a new batch to split the work." }, { status: 400 });
 

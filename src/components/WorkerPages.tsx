@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card, CardHeader, PageHeader, StatCard, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
-import { naira, fmtDate, fmtDateTime, stageLabel } from "@/lib/format";
+import { naira, fmtDate, fmtDateTime, stageLabel, personRoles } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 import { WorkerLinkNotice } from "@/components/WorkerLinkNotice";
 import { Coins, Banknote, Briefcase, Clock } from "lucide-react";
@@ -110,7 +110,7 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
         <PageHeader title="Profile" subtitle="Your Matesther production profile" />
         <Card className="max-w-lg p-5 space-y-3 text-sm">
           <div><p className="text-xs font-semibold uppercase text-slate-400">Name</p><p className="font-bold text-lg">{p.name}</p></div>
-          <div><p className="text-xs font-semibold uppercase text-slate-400">Specialty</p><p className="font-semibold">{p.specialty}</p></div>
+          <div><p className="text-xs font-semibold uppercase text-slate-400">Roles</p><p className="font-semibold">{personRoles(p).join(" • ") || p.specialty}</p></div>
           <div><p className="text-xs font-semibold uppercase text-slate-400">Phone</p><p>{p.phone || "-"}</p></div>
           <div><p className="text-xs font-semibold uppercase text-slate-400">Payment</p><p className="font-semibold">{p.paymentType.replace("_", " ")} - {rate}</p></div>
           <div><p className="text-xs font-semibold uppercase text-slate-400">Signed in as</p><p>{user?.name} ({user?.email})</p></div>
@@ -130,9 +130,9 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
           <StatCard label="Total" value={naira(d.earnings.total)} icon={<Banknote className="w-5 h-5" />} tone="green" />
         </div>
          <Card>
-           <CardHeader title="Approved work and earnings" subtitle="Each inspection uses the agreed rate on that production job" />
+           <CardHeader title="Approved work and earnings" subtitle="Production stages and tailor support work, each at the rate agreed for that job" />
            <div className="divide-y divide-slate-100 sm:hidden">
-             {d.earnings.events.map((entry: any) => <div key={entry.id} className="p-4">
+             {d.earnings.events.map((entry: any) => <div key={`${entry.source}-${entry.id}`} className="p-4">
                <div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-900">{stageLabel(entry.stage)}</p><p className="text-xs text-slate-500">{entry.customer} • {entry.orderNumber} • {entry.batchNumber}</p></div><strong className="whitespace-nowrap text-matesther-700">{naira(entry.amount)}</strong></div>
                <div className="mt-2 flex flex-wrap gap-x-3 text-xs text-slate-600"><span>{fmtDateTime(entry.inspectedAt)}</span><span>{entry.quantityApproved} approved × {naira(entry.pieceRate)}</span></div>
              </div>)}
@@ -152,7 +152,7 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {d.earnings.events.map((e: any) => (
-                  <tr key={e.id} className="hover:bg-slate-50">
+                  <tr key={`${e.source}-${e.id}`} className="hover:bg-slate-50">
                     <td className="px-5 py-2.5 text-xs">{fmtDateTime(e.inspectedAt)}</td>
                     <td className="px-3 py-2.5 font-semibold">{stageLabel(e.stage)} <span className="text-xs font-normal text-slate-400">({e.batchNumber})</span></td>
                     <td className="px-3 py-2.5">{e.orderNumber} <span className="text-xs text-slate-500">• {e.customer}</span></td>

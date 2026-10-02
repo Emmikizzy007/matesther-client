@@ -402,6 +402,10 @@ Material costs should contribute to order profitability.
 
 # 12. STAFF, SALARIED EMPLOYEES, AND TAILOR SUPPORT WORKERS
 
+> **STATUS: IMPLEMENTED.** See section 36 for what was built, where it lives,
+> and which regression tests guard it. The requirements below are kept unchanged
+> as the specification.
+
 Matesther has people who receive payment from the company but do not all
 perform the normal 8-stage garment-production workflow. The ERP must not
 assume that every person who receives money is a production worker.
@@ -626,6 +630,9 @@ information.
 ------------------------------------------------------------------------
 
 # 33. LAST UNFINISHED REQUEST --- MONTHLY PAYMENT SHEET
+
+> **STATUS: IMPLEMENTED** as the Owner-only `/payment-sheet/[month]` page backed
+> by `GET /api/payment-sheet`. See section 36.
 
 The final user instruction before the Arena session stopped requested:
 
@@ -1448,3 +1455,102 @@ The human/developer should:
 
 **Do not start from an empty repository. Do not ask the agent to rebuild
 MATESTHER.**
+
+------------------------------------------------------------------------
+
+# 36. IMPLEMENTED: support work, salaried staff and the monthly payment sheet
+
+Built on top of the existing architecture. Nothing was rebuilt, no table was
+dropped, and no existing column changed meaning.
+
+## 36.1 What exists now
+
+**Tailor support work** - `support_assignments` and `support_inspections`
+(`drizzle/0005_support_work_and_payroll.sql`).
+
+- A tailor hands weaving, taping or other supporting work to a helper through
+  **Production > Support Work** (`/api/support-work`).
+- The parent `production_operations` row stays the tailor's. The support row
+  links to it for traceability and never replaces it, so support work does not
+  inflate the parent stage.
+- The helper submits completed pieces; the tailor who handed it out inspects
+  and approves. Each pass is a new `support_inspections` row, so rework and
+  rejection history is preserved rather than overwritten.
+- **A support worker can never approve their own work.** The check is on
+  identity, not on login role, so it also holds for a supervisor whose own
+  worker record did the work.
+- Payable earnings reuse `@/lib/job-pay`: approved pieces x the rate agreed for
+  that work, snapshotted on the inspection. Submitted, reworked or rejected work
+  is never payable.
+
+**Salaried / non-production staff** - no new table.
+
+- `workers.department` and `workers.job_title` were added, and the role
+  vocabulary gained the staff positions Security, Sales, IT, Administration,
+  Management, Director and Office Staff, plus `Support Worker`.
+- `workers.specialty` is unchanged and may hold a staff position, so a security
+  guard is no longer forced to be a "Tailor". A person who is both a Tailor and
+  in Sales is one record holding both roles - never two people.
+- Their category (Production Worker / Support Worker / Salaried staff) is
+  **derived** from their roles, never stored, so it cannot drift.
+
+**Payroll** - `src/lib/payroll.ts`, `/api/payroll`.
+
+- Each row now separates: salary, production piecework, support piecework,
+  overtime, other approved payments, total due, paid, balance, and a payment
+  status (`UNPAID` / `PARTIAL` / `PAID` / `NOTHING_DUE`).
+- "Other approved payments" reuse `worker_overtime` with
+  `category = 'OTHER'` rather than adding a parallel table.
+- `worker_payments` gained `support_amount`, `other_amount`, `reference` and a
+  unique `idempotency_key`. The unique index is what makes a double payment
+  impossible; rows with no key stay `NULL` so legitimate part payments are
+  unaffected. Payments are still only ever inserted - never updated or deleted.
+- The headline `totals` object keeps its original `{due, paid, balance}` shape.
+  The new detail is returned alongside it as `breakdown`.
+
+**Monthly bank payment sheet** - `/payment-sheet/[month]` + `GET
+/api/payment-sheet`.
+
+- Owner-only. Project Managers and Workers are refused by the API, and the page
+  is useless without it.
+- Letterheaded printable layout reusing the existing `Letterhead` and
+  `DocumentActions` components: staff name, roles, position, pay type, salary,
+  piecework, support piecework, overtime, other, total due, paid, balance,
+  status, bank reference, column totals, and a prepared/approved signature area.
+
+## 36.2 Security
+
+- `GET /api/payroll`, `POST /api/payroll` and `GET /api/payment-sheet` are
+  `OWNER`-only, enforced server-side.
+- A Worker sees only their own support work and their own earnings; the support
+  endpoints filter by the linked worker profile.
+- Separation of duty is enforced on the server for support inspections, exactly
+  as it already was for stage inspections.
+
+## 36.3 Regression coverage
+
+`tests/support-payroll.test.ts` (18 tests) covers approved-only support pay, the
+self-approval ban, assignment and history preservation, salaried staff, the
+payroll breakdown and status, Owner-only access, and duplicate-payment
+prevention. Every control is **mutation-tested**: removing each guard was shown
+to fail exactly the intended test and nothing else. See `tests/README.md`.
+
+Total suite: **85 tests, all passing.**
+
+## 36.4 Deployment
+
+Run `deploy/upgrade-support-payroll.sql` in the client project's SQL Editor,
+check its verification query, and only then deploy the code. SQL first, code
+second. It is additive and repeatable, and is schema-identical to
+`drizzle/0005_support_work_and_payroll.sql`. See `deploy/UPDATE-INSTRUCTIONS.md`.
+
+## 36.5 Known limitations
+
+- Support work is deliberately **not** allocated to order profitability. Section
+  12.5 asks for that distinction; the amounts are recorded and reported in
+  payroll, but the profitability report was left untouched.
+- WhatsApp deep-link sharing is still not implemented. The sheet uses the
+  existing `DocumentActions` share/copy fallback only.
+- `deploy/schema-only.sql` and `deploy/full-setup.sql` were **not** updated for
+  these tables. They remain for brand-new empty databases only, and
+  `full-setup.sql` still contains a destructive demo-data reset.

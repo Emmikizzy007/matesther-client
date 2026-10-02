@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Plus, Pencil, Phone, Trash2, Archive, RotateCcw } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, EmptyState, Modal, Field, inputCls, Btn } from "@/components/ui";
-import { naira, fmtDate, stageLabel, WORKER_SPECIALTIES } from "@/lib/format";
+import { naira, fmtDate, stageLabel, WORKER_ROLES, staffCategories } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 
 export default function WorkersPage() {
@@ -16,7 +16,7 @@ export default function WorkersPage() {
   const [loadError, setLoadError] = useState("");
   const [modal, setModal] = useState(false);
   const [editing, setEditing] = useState<any>(null);
-  const [form, setForm] = useState({ name: "", phone: "", specialty: "Tailor", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false });
+  const [form, setForm] = useState({ name: "", phone: "", roles: ["Tailor"], department: "", jobTitle: "", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false });
   const [history, setHistory] = useState<any>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -59,13 +59,16 @@ export default function WorkersPage() {
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
+    if (!form.roles.length) { setErr("Choose at least one role for this person."); return; }
     setSaving(true);
     setErr("");
     try {
       const res = await fetch("/api/workers", {
         method: editing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...form, id: editing?.id, paymentRate: Number(form.paymentRate) || 0 }),
+        // `specialty` is still sent so anything reading it keeps working; the
+        // first chosen role is the primary one.
+        body: JSON.stringify({ ...form, specialty: form.roles[0], id: editing?.id, paymentRate: Number(form.paymentRate) || 0 }),
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || "Failed to save");
@@ -98,7 +101,7 @@ export default function WorkersPage() {
         subtitle="Cutters, tailors, buttonhole, button tacking, ironers and packers - who is doing what"
         action={<>
           <Btn variant="secondary" onClick={() => setShowArchived((current) => !current)}>{showArchived ? "Active only" : "Show archived"}</Btn>
-          {isOwner && <Btn onClick={() => { setEditing(null); setForm({ name: "", phone: "", specialty: "Tailor", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false }); setErr(""); setModal(true); }}>
+          {isOwner && <Btn onClick={() => { setEditing(null); setForm({ name: "", phone: "", roles: ["Tailor"], department: "", jobTitle: "", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false }); setErr(""); setModal(true); }}>
             <Plus className="w-4 h-4" /> Add Worker
           </Btn>}
         </>}
@@ -110,7 +113,7 @@ export default function WorkersPage() {
               <thead>
                 <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">
                   <th className="px-5 py-3">Worker</th>
-                  <th className="px-3 py-3">Specialty</th>
+                  <th className="px-3 py-3">Roles</th>
                   {isOwner && <th className="px-3 py-3">Pay</th>}
                   <th className="px-3 py-3 text-right">Current Tasks</th>
                   <th className="px-3 py-3 text-right">Assigned</th>
@@ -127,9 +130,17 @@ export default function WorkersPage() {
                     <td className="px-5 py-3">
                       <p className="font-semibold">{w.name}</p>
                       <p className="text-xs text-slate-500 flex items-center gap-1"><Phone className="w-3 h-3" />{w.phone || "-"}</p>
+                      {(w.jobTitle || w.department) && (
+                        <p className="text-[11px] text-slate-400">{[w.jobTitle, w.department].filter(Boolean).join(" - ")}</p>
+                      )}
                     </td>
                     <td className="px-3 py-3">
-                      {w.specialty}
+                      <span className="inline-flex flex-wrap gap-1">
+                        {(Array.isArray(w.roles) && w.roles.length ? w.roles : [w.specialty]).map((role: string) => (
+                          <span key={role} className="rounded-full border border-slate-200 bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">{role}</span>
+                        ))}
+                      </span>
+                      <span className="mt-1 block text-[10px] text-slate-400">{staffCategories(Array.isArray(w.roles) && w.roles.length ? w.roles : [w.specialty]).join(" + ")}</span>
                       {w.isInspector && (
                         <span className="ml-1.5 inline-block text-[10px] font-bold bg-violet-100 text-violet-800 border border-violet-200 rounded-full px-1.5 py-0.5 align-middle">
                           Also inspects
@@ -151,7 +162,7 @@ export default function WorkersPage() {
                       {isOwner && <>
                         <button title={`Edit ${w.name}`} aria-label={`Edit ${w.name}`} onClick={() => {
                           setEditing(w);
-                          setForm({ name: w.name, phone: w.phone || "", specialty: w.specialty, paymentType: w.paymentType, paymentRate: String(w.paymentRate), status: w.status, isInspector: !!w.isInspector });
+                          setForm({ name: w.name, phone: w.phone || "", roles: Array.isArray(w.roles) && w.roles.length ? w.roles : [w.specialty], department: w.department || "", jobTitle: w.jobTitle || "", paymentType: w.paymentType, paymentRate: String(w.paymentRate), status: w.status, isInspector: !!w.isInspector });
                           setErr(""); setModal(true);
                         }} className="p-1 text-slate-500 hover:text-matesther-700"><Pencil className="w-4 h-4" /></button>
                         {w.status === "ACTIVE" ? <button title={w.hasHistory ? `Archive ${w.name}` : `Delete ${w.name}`} aria-label={w.hasHistory ? `Archive ${w.name}` : `Delete ${w.name}`}
@@ -172,10 +183,30 @@ export default function WorkersPage() {
         <form onSubmit={save} className="grid sm:grid-cols-2 gap-3">
           <Field label="Full name *" className="sm:col-span-2"><input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className={inputCls} placeholder="e.g. Mrs. Aisha Bello" /></Field>
           <Field label="Phone"><input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} className={inputCls} placeholder="+234 ..." /></Field>
-          <Field label="Specialty">
-            <select value={form.specialty} onChange={(e) => setForm({ ...form, specialty: e.target.value })} className={inputCls}>
-              {WORKER_SPECIALTIES.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
+          <Field label="Roles * - pick every job this person does" className="sm:col-span-2">
+            <div className="flex flex-wrap gap-2 rounded-lg border border-slate-200 p-2.5">
+              {WORKER_ROLES.map((role) => {
+                const on = form.roles.includes(role);
+                return (
+                  <button
+                    key={role}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() => setForm({ ...form, roles: on ? form.roles.filter((chosen) => chosen !== role) : [...form.roles, role] })}
+                    className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${on ? "border-matesther-700 bg-matesther-700 text-white" : "border-slate-300 bg-white text-slate-600 hover:border-matesther-700"}`}
+                  >
+                    {role}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-1 text-xs text-slate-500">One person, many roles - add them once, then tick everything they do. Non-production staff such as Security, Sales or IT can be recorded here without a production specialty.</p>
+          </Field>
+          <Field label="Job title">
+            <input value={form.jobTitle} onChange={(e) => setForm({ ...form, jobTitle: e.target.value })} className={inputCls} placeholder="e.g. Security Guard, Sales Girl, Director" />
+          </Field>
+          <Field label="Department">
+            <input value={form.department} onChange={(e) => setForm({ ...form, department: e.target.value })} className={inputCls} placeholder="e.g. Security, Sales, IT, Management" />
           </Field>
           <Field label="Payment type">
             <select value={form.paymentType} onChange={(e) => setForm({ ...form, paymentType: e.target.value })} className={inputCls}>
