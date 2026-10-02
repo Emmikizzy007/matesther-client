@@ -69,7 +69,7 @@ export default function LoginPage() {
   }
 
   const firstSetup = status !== null && !status.hasUsers;
-  const inputClass = "w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none transition-colors focus:border-matesther-700 focus:ring-2 focus:ring-matesther-700/20";
+  const inputClass = "min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-base outline-none transition-colors focus:border-matesther-700 focus:ring-2 focus:ring-matesther-700/20 sm:text-sm";
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-matesther-950 px-4 py-8 sm:px-6">

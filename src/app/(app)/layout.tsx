@@ -29,7 +29,7 @@ export default function AppLayout({ children }: { children: ReactNode }) {
     <div className="min-h-screen">
       <Sidebar />
       <main className="lg:pl-64">
-        <div className="p-4 sm:p-6 max-w-[1400px] mx-auto">{children}</div>
+        <div className="px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6 sm:pt-6 sm:pb-6 max-w-[1400px] mx-auto">{children}</div>
       </main>
     </div>
   );

@@ -51,7 +51,7 @@ export default function DeliverySheetPage({ params }: { params: Promise<{ id: st
 
   return (
     <main className="document-page min-h-screen bg-[#f2f3ee] px-3 py-6 sm:px-6">
-      <DocumentActions title={`Matesther delivery sheet ${delivery.deliveryNumber}`} filename="delivery sheet" customerEmail={customer?.email} message={message} />
+      <DocumentActions title={`Matesther delivery sheet ${delivery.deliveryNumber}`} filename="delivery sheet" customerEmail={customer?.email} customerPhone={customer?.phone} message={message} />
       <Letterhead business={business} ourRef={delivery.deliveryNumber} yourRef={order.orderNumber} date={fmtDate(delivery.deliveryDate)} title="School Uniform Delivery Sheet" subtitle={`Order ${order.orderNumber} | ${customer?.name || "School"}`}>
         <div className="grid gap-5 sm:grid-cols-2">
           <div>

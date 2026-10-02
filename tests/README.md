@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 85 tests in about 30 seconds. No server, no `DATABASE_URL`, no network,
+Runs 115 tests in about 40 seconds. No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists
@@ -29,6 +29,8 @@ place and untouched.
 | `separation-of-duties.test.ts` | Cutter-supervisor restriction, self-inspection ban, inspector identity, approved-only stage flow, history preservation |
 | `payroll-rules.test.ts` | Payroll accrual (piecework / salary / overtime), plus the pure pay and progress helpers |
 | `multi-role.test.ts` | One person with several roles: no duplicate people, no duplicate roles, role removal keeps the person, legacy single-role workers unchanged, and the cutter-supervisor and self-inspection controls still holding when the role is one of several |
+| `pwa-branding.test.ts` | Installability contract, and the official-logo endpoint: Owner-only upload, the committed official mark served byte-for-byte when none is uploaded, SVG and undersized uploads refused, the stored logo returned **byte-for-byte**, square OS icons, the install button never faked, and the mobile safe-area / tap-target / iOS-zoom fixes |
+| `whatsapp-sharing.test.ts` | WhatsApp deep links: correct `wa.me` number normalisation, refusal to guess an unusable number, no application URL in a shared message, confidentiality handling on the Owner-only payment sheet, and the Owner-only guard still holding on the documents behind the share buttons |
 | `support-payroll.test.ts` | Tailor support work paid on approved pieces only, the ban on approving your own support work (including a supervisor who also does the work), assignment and inspection history preserved, salaried non-production staff, the payroll breakdown and payment status, Owner-only payroll and payment sheet, and duplicate-payment prevention |
 
 ## How it works
@@ -68,10 +70,22 @@ inspection route against the actual data layer.
   | --- | --- | --- |
   | Remove the self-inspection guard in `api/inspections` | `separation-of-duties` 7 **and** `multi-role` 10 | passed |
   | Widen `GET /api/payroll` from `OWNER` to `STAFF` | `authorization` 2 | passed |
-| Remove the support-work self-approval guard | `support-payroll` 3 only | all 84 others passed |
-| Pay support work on submitted instead of approved pieces | `support-payroll` 1, 5 and 11 only | all 67 pre-Task-3 tests passed |
-| Widen `GET /api/payment-sheet` from `OWNER` to `STAFF` | `support-payroll` 13 only | all 84 others passed |
-| Remove the duplicate-payment idempotency guard | `support-payroll` 15 only | all 84 others passed |
+  | Remove the support-work self-approval guard | `support-payroll` 3 only | all 84 others passed |
+  | Pay support work on submitted instead of approved pieces | `support-payroll` 1, 5 and 11 only | all 67 pre-Task-3 tests passed |
+  | Widen `GET /api/payment-sheet` from `OWNER` to `STAFF` | `support-payroll` 13 only | all 84 others passed |
+  | Remove the duplicate-payment idempotency guard | `support-payroll` 15 only | all 84 others passed |
+  | Let the payment sheet embed a customer phone number (`sensitive` no longer suppresses it) | `whatsapp-sharing` 11 only | all 99 others passed |
+  | Make `whatsappNumber` guess on numbers it cannot resolve | `whatsapp-sharing` 2 and 10 only | all 98 others passed |
+  | Drop `noreferrer` from the WhatsApp anchor | `whatsapp-sharing` 8 only | all 99 others passed |
+  | Widen `GET /api/receipts` from `OWNER` to `STAFF` | `whatsapp-sharing` 14 only | all 99 others passed |
+  | Widen `POST /api/branding/logo` from `OWNER` to `STAFF` | `pwa-branding` 5 only | all 114 others passed |
+  | Serve a generated blank instead of the bundled official mark | `pwa-branding` 3 only | all 114 others passed |
+  | Re-encode the logo bytes on the way out | `pwa-branding` 3 and 9 | all 113 others passed |
+  | Accept an SVG as the company logo | `pwa-branding` 6 only | all 114 others passed |
+  | Shrink the mobile menu toggle back to a ~32px tap target | `pwa-branding` 13 only | all 114 others passed |
+  | Put the login inputs back to `text-sm` (iOS focus-zoom) | `pwa-branding` 14 only | all 114 others passed |
+  | Render the install button even with no browser prompt | `pwa-branding` 11 only | all 114 others passed |
+  | Point a manifest icon at a baked-in file | `pwa-branding` 2 only | all 114 others passed |
   | Restore `cutterSupervisor` to the old `specialty === "cutter"` check | `multi-role` 7, 8 and 9 only | all 53 original tests passed |
   | Restore the stage gate to single-specialty equality | `multi-role` 5, 9 and 11 only | all 53 original tests passed |
 

@@ -93,6 +93,7 @@ export default function PaymentSheetPage({ params }: { params: Promise<{ month: 
         title={`Matesther staff payment sheet ${sheet.sheetNo}`}
         filename={`matesther-payment-sheet-${sheet.month}`}
         message={note}
+        sensitive
       />
       <Letterhead
         business={sheet.business}
