@@ -57,6 +57,27 @@ After deploying:
 
 The same change is recorded for the ORM as `drizzle/0005_support_work_and_payroll.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
 
+## Release: exact garment variants, production routes, methods and external work
+
+1. **Back up the client database first.**
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-variants-routes-external.sql` and Run. It is additive and repeatable. There is no `TRUNCATE`, no `DELETE`, no `RENAME`, no change to any existing column's type or meaning, and **it writes no data at all** - no default route row and no backfill. `route_position` stays `NULL` on historical operations and the application falls back to the eight-stage order for them, so no existing batch changes behaviour.
+3. **Read the NOTICE / WARNING output.** The one `DROP INDEX` in the file is called out in its header: it removes `order_item_sizes_item_size_unique`, whose rule (one row per item + size) is now *wrong* because it would reject "size M navy" and "size M black" as duplicates. It is replaced inside a pre-flighted block, so if any duplicate variants somehow exist the new index is skipped and the rows are reported instead of anything being deleted. Dropping an index destroys no data.
+4. Run verification queries **V1** to **V6** at the bottom of the file. V2 and V4 confirm historical operations defaulted to `INTERNAL` with no route position and that existing batches still have the stage counts they had before. V6 confirms nothing was written.
+5. Only then deploy the new application code. **SQL first, code second.** The new code writes to `production_routes`, `production_route_stages` and `external_work_orders` and reads `production_operations.route_position`, so deploying it before this file would fail.
+
+### What changes for the people using the system
+
+- **An order line now records exact garments**: size, colour and quantity. "10 navy blazers in size 8" and "6 black blazers in size 8" are two lines, and production is allocated against them. A line may have a colour and no size, which previously could not be recorded at all. The order page's *Sizes* tab is now *Variants*.
+- **Allocation is capped per exact garment**, server-side. Two batches can no longer each stay inside the item and size limits and still over-commit one specific size and colour.
+- **A garment follows a ROUTE**, which may be all eight stages, fewer, in a different order, starting later or ending earlier. Routes are defined under **Production → Production Routes**. A batch freezes the route it was created with, so editing or retiring a route changes only batches created afterwards. A garment is therefore never reported as stuck at a stage its own route does not have.
+- **Each stage has a production method**: in-house, machine, outsourced, ready-made purchase, or external processing.
+- **Assign Production is now generic**: it lists the stages of the chosen route and offers a worker for each one whose role that stage needs, instead of two fixed "Cutting" and "Sewing" boxes.
+- **New page: Production → External & Ready-made.** Work that leaves the factory is tracked as sent / returned / accepted / rejected-damaged / short - four separate facts, because 100 sent and 96 back and 94 good is a normal outcome. Only what Matesther **accepts** moves on to the next stage. A bought-in finished garment is recorded as a purchase with its own cost and is never counted as tailor labour or as outsourced production.
+- **A stage that has just been given approved work becomes In Progress automatically.** It no longer has to be opened and flipped by hand before the assigned worker can submit.
+- Machine stages are Matesther's own equipment: an operator is assigned and submits as usual. Only the cost is treated differently. If a machine is really a service bought in from someone else, set that stage's method to External processing.
+
+The same change is recorded for the ORM as `drizzle/0007_variants_routes_and_external_work.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
 ## Release: production movement ledger, indexes and quantity integrity
 
 1. **Back up the client database first.**

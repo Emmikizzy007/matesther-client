@@ -190,6 +190,90 @@ export const STAGE_ROLES: Record<string, string> = {
   DELIVERY: "Packer",
 };
 
+/* ---------------------------------------------------------------------------
+ * PRODUCTION METHODS - a second axis, orthogonal to stage.
+ *
+ * `stage` says WHICH operation this is (Cutting, Sewing, ...). `method` says HOW
+ * it is produced. They must never be conflated: the same MONOGRAMMING stage can be
+ * internal on one garment and outsourced on another, and a route picks the method
+ * per stage.
+ *
+ * These five values are the whole vocabulary. A new one is a data change plus a
+ * label here, not a new table and not a new production system.
+ * ------------------------------------------------------------------------- */
+export const PRODUCTION_METHODS = [
+  /** Matesther's own workers, on the factory floor. The existing behaviour. */
+  "INTERNAL",
+  /** Produced on a machine rather than by hand. Still Matesther's own output. */
+  "MACHINE",
+  /** Another company manufactures MATESTHER's garment to our specification. */
+  "OUTSOURCED",
+  /** A finished garment is BOUGHT IN. Not manufacturing - a purchase. */
+  "READY_MADE",
+  /** Matesther's garment goes out for one process and comes back. */
+  "VENDOR_PROCESSING",
+] as const;
+
+export type ProductionMethod = (typeof PRODUCTION_METHODS)[number];
+
+/**
+ * Methods whose work LEAVES THE FACTORY and must come back before anything can
+ * count as available downstream. Sent is never assumed to equal returned, and
+ * returned is never assumed to equal accepted.
+ *
+ * MACHINE IS DELIBERATELY NOT HERE. A machine stage is Matesther's own output on
+ * Matesther's own equipment: an operator is assigned to it and submits against it
+ * exactly as for INTERNAL work, and only the COST is treated differently (Task 4).
+ * Whether a given machine is an owned asset or a bought-in service is an open
+ * business decision; if it turns out to be bought in, that stage's method should
+ * be VENDOR_PROCESSING, which does use the dispatch-and-return flow. Keeping
+ * MACHINE out of this list is what stops that decision from having to be made
+ * before the quantities can be tracked at all.
+ */
+export const EXTERNAL_METHODS: ProductionMethod[] = ["OUTSOURCED", "VENDOR_PROCESSING"];
+
+/** Methods whose quantity arrives by purchase rather than by production. */
+export const PURCHASED_METHODS: ProductionMethod[] = ["READY_MADE"];
+
+export function isExternalMethod(method: string | null | undefined): boolean {
+  return !!method && (EXTERNAL_METHODS as string[]).includes(method);
+}
+
+export function isPurchasedMethod(method: string | null | undefined): boolean {
+  return !!method && (PURCHASED_METHODS as string[]).includes(method);
+}
+
+export function methodLabel(method: string | null | undefined): string {
+  const map: Record<string, string> = {
+    INTERNAL: "In-house",
+    MACHINE: "Machine",
+    OUTSOURCED: "Outsourced",
+    READY_MADE: "Ready-made purchase",
+    VENDOR_PROCESSING: "External processing",
+  };
+  return map[String(method ?? "")] ?? String(method ?? "In-house");
+}
+
+/**
+ * The `materials.category` value that marks a stock item as a finished garment
+ * bought in rather than a raw material. `materials.category` already exists, so a
+ * ready-made product needs no new table - and keeping it in `material_purchases`
+ * with its own cost is what stops a ready-made purchase from ever being
+ * classified as tailor labour.
+ */
+export const READY_MADE_CATEGORY = "Ready-made garment";
+
+/**
+ * One exact garment: "Navy • Size M", or whichever parts the variant has.
+ * Used everywhere a worker or supervisor must see the specific garment they are
+ * working on rather than the whole order.
+ */
+export function variantLabel(size?: string | null, color?: string | null): string {
+  const parts = [color, size].map((value) => String(value ?? "").trim()).filter(Boolean);
+  if (!parts.length) return "No size or colour recorded";
+  return parts.length === 2 ? `${parts[0]} • Size ${parts[1]}` : parts[0];
+}
+
 /** Position of a stage in the default route, or -1 when it is not one. */
 export function stageIndex(stage: string | null | undefined): number {
   return stage ? (STAGES as readonly string[]).indexOf(stage) : -1;

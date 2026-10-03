@@ -1,4 +1,4 @@
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   workers,
@@ -14,6 +14,7 @@ import {
 } from "@/db/schema";
 import { getLinkedWorkerId, type SessionUser } from "@/lib/authz";
 import { inspectionPieceRate } from "@/lib/job-pay";
+import { methodLabel, variantLabel } from "@/lib/format";
 
 /** Personal jobs and earnings, also available to a manager for their own factory work. No company-level figures. */
 export async function getWorkerDashboard(user: SessionUser) {
@@ -53,12 +54,34 @@ export async function getWorkerDashboard(user: SessionUser) {
     .leftJoin(products, eq(orderItems.productId, products.id))
     .where(eq(productionOperations.workerId, profile.id));
 
+  // How long each batch's own route is, so a card can say "stage 2 of 3" instead
+  // of implying the eight-stage pipeline. One grouped query for this worker's
+  // batches only.
+  const workerBatchIds = [...new Set(rows.map(({ batch }) => batch.id))];
+  const routeLengthRows = workerBatchIds.length
+    ? await db
+        .select({ batchId: productionOperations.productionBatchId, stages: sql<number>`count(*)` })
+        .from(productionOperations)
+        .where(inArray(productionOperations.productionBatchId, workerBatchIds))
+        .groupBy(productionOperations.productionBatchId)
+    : [];
+  const routeLengthByBatch = new Map(routeLengthRows.map((row) => [Number(row.batchId), Number(row.stages)]));
+
   const journal = rows.map(({ operation, batch, order, customer, garment }) => ({
     ...operation,
     batchNumber: batch.batchNumber,
     batchQuantity: batch.quantity,
     size: batch.size,
     color: batch.color,
+    // THE EXACT GARMENT. A worker is allocated a specific item, size and colour in
+    // a specific quantity - not "the order". These four fields are what makes that
+    // visible on their own screen, and `quantityReceived` is their allocation of it.
+    variant: variantLabel(batch.size, batch.color),
+    orderVariantId: batch.orderVariantId,
+    method: operation.method,
+    methodLabel: methodLabel(operation.method),
+    routePosition: operation.routePosition,
+    routeLength: routeLengthByBatch.get(batch.id) ?? 0,
     orderId: order.id,
     orderNumber: order.orderNumber,
     dueDate: order.dueDate,

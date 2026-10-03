@@ -50,6 +50,13 @@
       "when": 1791037524298,
       "tag": "0006_production_ledger_and_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791051756889,
+      "tag": "0007_variants_routes_and_external_work",
+      "breakpoints": true
     }
   ]
 }

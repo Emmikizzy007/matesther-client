@@ -4,9 +4,12 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Search, ClipboardCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
-import { fmtDate, stageLabel, STAGES, personHoldsRole } from "@/lib/format";
+import { fmtDate, methodLabel, stageLabel, STAGES, STAGE_ROLES, personHoldsRole } from "@/lib/format";
 
-const STAGE_SPECIALTIES: Record<string, string> = { CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole", BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer", DELIVERY: "Packer" };
+// Was a sixth hand-typed copy of the stage -> role map. Now the shared one from
+// lib/format, so the board's worker dropdowns and the server's assignment gate can
+// never disagree about which role a stage needs.
+const STAGE_SPECIALTIES = STAGE_ROLES;
 const COLS = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD"];
 /** One page of the production board. The server caps a request at 1000. */
 const PAGE_SIZE = 200;
@@ -197,7 +200,14 @@ export default function ProductionPage() {
                       </div>
                       <p className="text-sm font-semibold mt-1 text-matesther-800">{o.orderNumber}</p>
                       <p className="text-xs text-slate-500 truncate">{o.customer}</p>
-                      <p className="mt-1 text-[11px] font-semibold text-slate-700">{o.garment}{o.size ? ` • Size ${o.size}` : ""}{o.color ? ` • ${o.color}` : ""}</p>
+                      {/* The EXACT garment, and this stage's place in THIS batch's
+                          route - so a polo on a three-stage route is never read as
+                          "stuck" at a stage it does not have. */}
+                      <p className="mt-1 text-[11px] font-semibold text-slate-700">{o.garment} • {o.variant}</p>
+                      <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[10px]">
+                        {o.routePosition && o.routeLength ? <span className="rounded bg-slate-100 px-1.5 py-0.5 font-semibold text-slate-600">Stage {o.routePosition} of {o.routeLength}</span> : null}
+                        {o.method && o.method !== "INTERNAL" ? <span className="rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800">{methodLabel(o.method)}</span> : null}
+                      </p>
                       <p className="text-xs mt-1.5">
                         <span className="text-slate-500">Worker: </span>
                         <span className="font-medium">{o.workerName || <span className="text-amber-600">Unassigned</span>}</span>

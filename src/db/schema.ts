@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   serial,
@@ -171,21 +172,132 @@ export const workerRoles = pgTable(
   (table) => [unique("worker_roles_worker_id_role_unique").on(table.workerId, table.role)]
 );
 
-// ---------- Size breakdown per order item ----------
+/**
+ * ---------- The exact garment VARIANTS on an order line ----------
+ *
+ * This table began life as an order-item SIZE breakdown. It is now the order's
+ * VARIANT table: one row per exact garment the school actually ordered,
+ * identified by item + size + colour + quantity.
+ *
+ * The table name is unchanged on purpose. Renaming it would be a destructive
+ * migration against a live database for no functional gain, and everything that
+ * already reads it - the order Sizes tab, POST /api/batches and the assign screen
+ * - keeps working. What changed is that a variant may now have:
+ *   - a colour as well as a size (`color`, new and nullable);
+ *   - neither (`size` is no longer NOT NULL), so both "10 navy blazers, no size
+ *     run" and "6 house-red polos in M" are expressible.
+ *
+ * Both are widenings: every existing row keeps its meaning, and a row written
+ * before this change is simply a variant with no colour.
+ *
+ * `completed` is retained but is no longer the figure to trust - it is derived
+ * from the production ledger now (see lib/production-route.ts). It stays so
+ * historical rows and anything already reading it keep working.
+ */
 export const orderItemSizes = pgTable("order_item_sizes", {
   id: serial("id").primaryKey(),
   orderItemId: integer("order_item_id")
     .references(() => orderItems.id, { onDelete: "cascade" })
     .notNull(),
-  size: text("size").notNull(),
+  size: text("size"),
+  color: text("color"),
   quantity: integer("quantity").notNull().default(0),
   completed: integer("completed").notNull().default(0),
 },
   (table) => [
     index("order_item_sizes_order_item_id_idx").on(table.orderItemId),
-    // One size row per item: POST /api/order-sizes replaces the whole set,
-    // so a duplicate (item, size) pair could only come from a bug.,
-    uniqueIndex("order_item_sizes_item_size_unique").on(table.orderItemId, table.size)
+    index("order_item_sizes_color_idx").on(table.color),
+    /**
+     * One row per exact variant.
+     *
+     * This REPLACES the old unique `(order_item_id, size)` index, which is now
+     * wrong rather than merely incomplete: it would reject "size M navy" and
+     * "size M black" as duplicates of each other. Dropping an index destroys no
+     * data - it is the one DROP in migration 0007, and variants cannot exist
+     * without it.
+     *
+     * The `coalesce(..., '')` form is deliberate. Postgres treats NULLs as
+     * distinct in a unique index, so a plain `(item, size, colour)` index would
+     * allow unlimited rows for a variant with neither. The expression form makes
+     * NULL compare equal to NULL, works on every Postgres version (unlike
+     * `NULLS NOT DISTINCT`, which needs 15+), and the test database enforces it
+     * identically.
+     */
+    uniqueIndex("order_item_sizes_variant_unique").on(
+      table.orderItemId,
+      sql`coalesce(${table.size}, '')`,
+      sql`coalesce(${table.color}, '')`
+    )
+  ]
+);
+
+// ---------- Production routes ----------
+/**
+ * A route is the ordered list of stages ONE garment actually passes through.
+ *
+ * WHY THIS EXISTS
+ *   The eight-stage list was hardcoded in five independent places and every batch
+ *   was forced through all eight, up front, whether the garment needed them or
+ *   not. A polo that is bought in cut-and-sew form has no CUTTING stage. A
+ *   ready-made cardigan has no SEWING stage. Forcing them into the pipeline
+ *   created rows that could never be worked - and worse, the progress and
+ *   bottleneck views then reported those garments as "stuck at CUTTING" or
+ *   "waiting for SEWING" when no such stage existed for them.
+ *
+ *   A route is therefore a SUBSET of the existing stages, in an order that suits
+ *   the garment. It may include all eight, skip stages, start later or end
+ *   earlier. It never invents a stage: `stage` values still come from
+ *   lib/format.ts, so roles, labels, inspection and payroll all keep working.
+ *
+ * `product_id` NULL means the organization's generic default route. A product may
+ * have its own; `is_default` picks which one a new batch starts from. The route
+ * can still be overridden per batch, and once a batch is created its own route is
+ * frozen as its production_operations rows - see production_operations.route_position.
+ */
+export const productionRoutes = pgTable("production_routes", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productId: integer("product_id").references(() => products.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  isDefault: boolean("is_default").notNull().default(false),
+  isActive: boolean("is_active").notNull().default(true),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("production_routes_product_id_idx").on(table.productId),
+    index("production_routes_organization_id_idx").on(table.organizationId)
+  ]
+);
+
+/**
+ * The stages of one route, in order.
+ *
+ * `method` is where the production-method axis lives: a route can say that this
+ * garment's MONOGRAMMING is outsourced while its SEWING is internal, without any
+ * other stage knowing about it.
+ *
+ * `role_required` is optional and overrides the generic STAGE_ROLES mapping when
+ * set, so a route can demand a specific role at a stage the default map does not
+ * cover (notably DELIVERY, which the default map only gained in Task 2).
+ */
+export const productionRouteStages = pgTable("production_route_stages", {
+  id: serial("id").primaryKey(),
+  routeId: integer("route_id")
+    .references(() => productionRoutes.id, { onDelete: "cascade" })
+    .notNull(),
+  position: integer("position").notNull(),
+  stage: text("stage").notNull(),
+  method: text("method").notNull().default("INTERNAL"),
+  roleRequired: text("role_required"),
+  notes: text("notes"),
+},
+  (table) => [
+    index("production_route_stages_route_id_idx").on(table.routeId),
+    uniqueIndex("production_route_stages_route_position_unique").on(table.routeId, table.position),
+    // A route may not list the same stage twice: that would create two rows
+    // competing to be "the" monogramming stage for one batch.
+    uniqueIndex("production_route_stages_route_stage_unique").on(table.routeId, table.stage)
   ]
 );
 
@@ -200,12 +312,29 @@ export const productionBatches = pgTable("production_batches", {
   quantity: integer("quantity").notNull().default(0),
   size: text("size"),
   color: text("color"),
+  /**
+   * The exact variant this batch produces, when it was allocated from one.
+   *
+   * `size` and `color` above stay as the batch's own snapshot - they are what
+   * every existing screen, delivery line and printed document already reads, and
+   * a snapshot must survive later edits to the order. This id is the authoritative
+   * link used for variant-level allocation ceilings.
+   */
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
+  /**
+   * The route this batch was built from - reference only. The batch's OWN frozen
+   * route is its set of production_operations rows in route_position order, so
+   * editing a product's route later can never rewrite history.
+   */
+  routeId: integer("route_id").references(() => productionRoutes.id, { onDelete: "set null" }),
   status: text("status").notNull().default("PENDING"),
   createdAt: timestamp("created_at").defaultNow(),
 },
   (table) => [
     index("production_batches_order_id_idx").on(table.orderId),
-    index("production_batches_order_item_id_idx").on(table.orderItemId)
+    index("production_batches_order_item_id_idx").on(table.orderItemId),
+    index("production_batches_order_variant_id_idx").on(table.orderVariantId),
+    index("production_batches_route_id_idx").on(table.routeId)
   ]
 );
 
@@ -216,6 +345,28 @@ export const productionOperations = pgTable("production_operations", {
     .references(() => productionBatches.id, { onDelete: "cascade" })
     .notNull(),
   stage: text("stage").notNull(),
+  /**
+   * Where this stage sits in THIS BATCH's route - the frozen route.
+   *
+   * "The next applicable stage" is the operation with the next higher position in
+   * the same batch, not `STAGES[STAGES.indexOf(stage) + 1]`, which assumed every
+   * garment walks the same eight stages in the same order. A polo whose route
+   * skips CUTTING, or a ready-made cardigan whose route starts at PACKING, is
+   * expressed purely by which rows exist and what their positions are.
+   *
+   * NULL on rows created before routes existed; those batches fall back to the
+   * eight-stage order, so no historical batch changes behaviour.
+   */
+  routePosition: integer("route_position"),
+  /** The route stage definition this row came from. Reference only. */
+  routeStageId: integer("route_stage_id").references(() => productionRouteStages.id, { onDelete: "set null" }),
+  /**
+   * How this stage is produced: INTERNAL, MACHINE, OUTSOURCED, READY_MADE or
+   * VENDOR_PROCESSING. A second axis, orthogonal to `stage`. Defaults to
+   * INTERNAL, which is exactly what every existing row is, so no historical job
+   * changes meaning.
+   */
+  method: text("method").notNull().default("INTERNAL"),
   workerId: integer("worker_id").references(() => workers.id),
   // Agreed price for THIS job/stage, not the worker's general profile.
   // Null on historical records falls back to their legacy rate.
@@ -241,9 +392,16 @@ export const productionOperations = pgTable("production_operations", {
     index("production_operations_worker_id_idx").on(table.workerId),
     index("production_operations_stage_idx").on(table.stage),
     index("production_operations_status_idx").on(table.status),
+    index("production_operations_method_idx").on(table.method),
+    index("production_operations_route_stage_id_idx").on(table.routeStageId),
+    // The frozen route is read as "this batch's operations in position order",
+    // so two rows may never claim the same position. NULL positions (pre-route
+    // batches) do not collide: Postgres treats NULLs as distinct here, which is
+    // exactly what legacy rows need.
+    uniqueIndex("production_operations_batch_position_unique").on(table.productionBatchId, table.routePosition),
     // One row per stage per batch. Nothing enforced this before, and the,
     // "next stage" lookup in POST /api/inspections takes the first match, so,
-    // a duplicate row would silently starve one of the two.,
+    // a duplicate row would silently starve one of the two.
     uniqueIndex("production_operations_batch_stage_unique").on(table.productionBatchId, table.stage)
   ]
 );
@@ -268,6 +426,73 @@ export const stageInspections = pgTable("stage_inspections", {
     index("stage_inspections_inspected_at_idx").on(table.inspectedAt)
   ]
 );
+// ---------- External production work ----------
+/**
+ * One dispatch of work OUT of the factory and back again.
+ *
+ * A stage whose `method` is OUTSOURCED, VENDOR_PROCESSING or MACHINE is still an
+ * ordinary `production_operations` row - it has the same counters, the same
+ * inspection/acceptance gate and the same place in the route. This table records
+ * the shipments behind it, because one stage can be sent out more than once and
+ * each dispatch has its own outcome.
+ *
+ * THE QUANTITY RULE THIS EXISTS TO ENFORCE
+ *   Quantity sent is NOT quantity returned, and quantity returned is NOT quantity
+ *   accepted. 100 sent / 96 returned / 2 rejected-damaged / 2 short is a normal
+ *   outcome and all four figures are kept separately. Only the ACCEPTED figure
+ *   becomes available to the next route stage, and it does so through the
+ *   production movement ledger - never by editing a counter.
+ *
+ * `vendor_name` is free text, matching the existing `material_purchases.supplier`
+ * convention. Vendors are deliberately NOT `workers` rows: payroll iterates every
+ * worker, so a vendor placed there would accrue phantom piecework. Whether the
+ * business wants a vendor master with payment terms is an open decision flagged
+ * for Task 4; this table does not pre-empt it, and adding a `vendor_id` later is
+ * additive.
+ *
+ * `unit_cost` / `total_cost` are recorded but not yet classified into the
+ * profitability cost categories - that is Task 4. They are nullable so a dispatch
+ * can be tracked before anyone knows the price.
+ */
+export const externalWorkOrders = pgTable("external_work_orders", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productionOperationId: integer("production_operation_id")
+    .references(() => productionOperations.id, { onDelete: "cascade" })
+    .notNull(),
+  productionBatchId: integer("production_batch_id")
+    .references(() => productionBatches.id, { onDelete: "cascade" })
+    .notNull(),
+  /** Stage identity carried as data, like every production_movements row. */
+  stage: text("stage").notNull(),
+  method: text("method").notNull(),
+  vendorName: text("vendor_name").notNull(),
+  quantitySent: integer("quantity_sent").notNull().default(0),
+  quantityReturned: integer("quantity_returned").notNull().default(0),
+  quantityAccepted: integer("quantity_accepted").notNull().default(0),
+  /** Rejected or damaged on return. */
+  quantityRejected: integer("quantity_rejected").notNull().default(0),
+  /** Never came back. Distinct from rejected: nothing arrived to judge. */
+  quantityShort: integer("quantity_short").notNull().default(0),
+  unitCost: integer("unit_cost"),
+  totalCost: integer("total_cost"),
+  status: text("status").notNull().default("SENT"),
+  sentAt: timestamp("sent_at").defaultNow(),
+  returnedAt: timestamp("returned_at"),
+  closedAt: timestamp("closed_at"),
+  sentBy: text("sent_by"),
+  acceptedBy: text("accepted_by"),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("external_work_orders_operation_id_idx").on(table.productionOperationId),
+    index("external_work_orders_batch_id_idx").on(table.productionBatchId),
+    index("external_work_orders_status_idx").on(table.status),
+    index("external_work_orders_method_idx").on(table.method)
+  ]
+);
+
 
 // ---------- Tailor support work (weaving, taping, other supporting work) ----
 // A tailor hands part of their garment work to a support worker. The parent
@@ -365,11 +590,28 @@ export const materialPurchases = pgTable("material_purchases", {
   totalCost: integer("total_cost").notNull().default(0),
   purchaseDate: date("purchase_date").notNull(),
   orderId: integer("order_id").references(() => orders.id),
+  /**
+   * READY-MADE linkage.
+   *
+   * Buying a finished garment is a PURCHASE, not labour: it stays in this table
+   * with its own cost and is never recorded as tailor piecework. These two links
+   * tie a purchased finished good to the exact variant and to the route stage it
+   * satisfies, so accepting it can release quantity downstream.
+   *
+   * `material_id` is NOT NULL, so a ready-made garment is a `materials` row - use
+   * `materials.category` = 'Ready-made garment'. That needs no new table and no
+   * change to stock keeping, and it is what keeps a ready-made purchase visibly
+   * distinct from outsourced production (which lives in external_work_orders).
+   */
+  productionOperationId: integer("production_operation_id").references(() => productionOperations.id, { onDelete: "set null" }),
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
   notes: text("notes"),
 },
   (table) => [
     index("material_purchases_material_id_idx").on(table.materialId),
-    index("material_purchases_order_id_idx").on(table.orderId)
+    index("material_purchases_order_id_idx").on(table.orderId),
+    index("material_purchases_operation_id_idx").on(table.productionOperationId),
+    index("material_purchases_order_variant_id_idx").on(table.orderVariantId)
   ]
 );
 

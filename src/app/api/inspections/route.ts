@@ -11,8 +11,8 @@ import {
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE, STAFF } from "@/lib/authz";
-import { nextStage } from "@/lib/format";
 import { MOVEMENT_EVENTS, applyMovements } from "@/lib/production-ledger";
+import { releaseApprovedToNextStage, statusFromQuantities } from "@/lib/production-route";
 
 /**
  * GET /api/inspections?operationId=&orderId=&limit=
@@ -221,59 +221,25 @@ export async function POST(req: Request) {
           reason: "Inspection rejected these pieces", notes: b.notes || null, occurredAt: new Date() },
       ]);
 
-      const newApproved = derived.quantityApproved;
-      const newRemaining = derived.quantityRemaining;
-      const uninspected = derived.quantityCompleted - derived.quantityInspected;
-      const status =
-        newRemaining <= 0
-          ? "COMPLETED"
-          : uninspected > 0
-            ? "SUBMITTED"
-            : "IN_PROGRESS";
+      // 3. Only approved pieces move to the next APPLICABLE ROUTE STAGE.
+      //
+      // Shared with external-work acceptance and ready-made acceptance, so all
+      // three paths release quantity by exactly the same rule and none of them can
+      // drift from the others. It reads THIS BATCH's frozen route, so a garment
+      // whose route skips a stage releases into the stage that actually follows.
+      await releaseApprovedToNextStage(tx, op, derived.quantityApproved, actor);
+      // One status rule for every path that can finish a stage.
+      const status = statusFromQuantities(derived);
       const [row] = await tx
         .update(productionOperations)
         .set({
           inspector: inspector.name,
           inspectedAt: new Date(),
           status,
-          completedAt: newRemaining <= 0 ? op.completedAt ?? new Date() : null,
+          completedAt: status === "COMPLETED" ? op.completedAt ?? new Date() : null,
         })
         .where(eq(productionOperations.id, opId))
         .returning();
-
-      // 3. Only approved pieces move to the next stage.
-      //
-      // `nextStage()` replaces this file's private copy of the eight-stage array,
-      // so there is now ONE definition of stage order. It stays monotonic: the
-      // next stage's received figure can only ever rise to the amount actually
-      // approved here, and it is written as a ledger delta rather than an
-      // overwrite, so the flow is itself auditable.
-      if (approved > 0) {
-        const following = nextStage(op.stage);
-        if (following) {
-          const [next] = await tx
-            .select()
-            .from(productionOperations)
-            .where(
-              and(
-                eq(productionOperations.productionBatchId, op.productionBatchId),
-                eq(productionOperations.stage, following)
-              )
-            )
-            .limit(1);
-          if (next) {
-            const flow = newApproved - (next.quantityReceived ?? 0);
-            if (flow > 0) {
-              await applyMovements(tx, next, actor, [
-                { type: MOVEMENT_EVENTS.STAGE_RECEIPT, quantity: flow, workerId: next.workerId,
-                  referenceType: "PRODUCTION_OPERATION", referenceId: op.id,
-                  reason: `${flow} piece(s) approved at ${op.stage} and released to ${following}`,
-                  occurredAt: new Date() },
-              ]);
-            }
-          }
-        }
-      }
       return row;
     });
 

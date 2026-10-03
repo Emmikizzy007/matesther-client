@@ -23,7 +23,7 @@ import {
   inputCls,
   Btn,
 } from "@/components/ui";
-import { naira, fmtDate, stageLabel, EXPENSE_CATEGORIES, PAYMENT_METHODS, STAGES, personHoldsRole } from "@/lib/format";
+import { naira, fmtDate, stageLabel, EXPENSE_CATEGORIES, PAYMENT_METHODS, STAGES, STAGE_ROLES, personHoldsRole } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 
 const STAGE_ORDER = STAGES as readonly string[];
@@ -122,17 +122,28 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
       const res = await fetch(`/api/order-sizes?itemId=${it.id}`, { cache: "no-store" }).then((r) => r.json());
       setSizeRows(
         res.sizes && res.sizes.length
-          ? res.sizes.map((s: any) => ({ size: s.size, quantity: String(s.quantity), completed: String(s.completed) }))
-          : ["S", "M", "L", "XL"].map((s) => ({ size: s, quantity: "", completed: "0" }))
+          ? res.sizes.map((s: any) => ({
+              size: s.size ?? "", color: s.color ?? "", quantity: String(s.quantity),
+              // `completedRecorded` is carried through untouched and sent back, so
+              // saving the variants can never zero a figure someone recorded.
+              completed: String(s.completedRecorded ?? 0),
+              // What is shown: derived from the production ledger, not typed.
+              completedFromProduction: Number(s.completedFromProduction ?? 0),
+            }))
+          : ["S", "M", "L", "XL"].map((s) => ({ size: s, color: "", quantity: "", completed: "0", completedFromProduction: 0 }))
       );
     } catch {
-      setSizeRows(["S", "M", "L", "XL"].map((s) => ({ size: s, quantity: "", completed: "0" })));
+      setSizeRows(["S", "M", "L", "XL"].map((s) => ({ size: s, color: "", quantity: "", completed: "0", completedFromProduction: 0 })));
     }
   }
 
   async function saveSizes(e: React.FormEvent) {
     e.preventDefault();
-    const clean = sizeRows.filter((r) => r.size && Number(r.quantity) > 0);
+    // A variant needs a size OR a colour: "10 navy blazers, no size run" is a real
+    // order line, and requiring a size is what made it impossible to record.
+    const clean = sizeRows
+      .filter((r) => (r.size || r.color) && Number(r.quantity) > 0)
+      .map((r) => ({ size: r.size, color: r.color, quantity: Number(r.quantity), completed: Number(r.completed) || 0 }));
     const res = await fetch("/api/order-sizes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -165,12 +176,14 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
   if (err || !data) return <p className="text-sm text-red-700">Failed to load order: {err}</p>;
 
   const { order, items, batches, usage, purchases, expenses, payments, packing, deliveries, quality, rework, costs, progress, totalQuantity, packedQuantity, deliveredQuantity } = data;
-  const expectedSpecialty: Record<string, string> = { CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole", BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer", DELIVERY: "Packer" };
+  // Was another hand-typed copy of the stage -> role map; now the shared one, so
+  // this page and the server's assignment gate cannot disagree.
+  const expectedSpecialty = STAGE_ROLES;
   const marginColor = costs.margin >= 20 ? "text-emerald-700" : costs.margin >= 0 ? "text-amber-700" : "text-red-700";
 
   const tabs = [
     { k: "production", label: "Production Timeline" },
-    { k: "sizes", label: "Sizes" },
+    { k: "sizes", label: "Variants" },
     { k: "materials", label: `Materials (${purchases.length + usage.length})` },
     { k: "expenses", label: `Expenses (${expenses.length})` },
     { k: "payments", label: `Payments (${payments.length})` },
@@ -546,10 +559,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
                   title={`${it.productName} - ${it.quantity} pcs ordered`}
                   subtitle={
                     sz.length
-                      ? `${totalDone}/${totalOrdered} finished • ${outstanding.length ? "Outstanding: " + outstanding.map((r: any) => `${r.size} (${r.quantity - r.completed} left)`).join(", ") : "All sizes finished ✓"}`
-                      : "No size breakdown set yet - set it to track which sizes are finished"
+                      ? `${totalDone}/${totalOrdered} finished • ${outstanding.length ? "Outstanding: " + outstanding.map((r: any) => `${r.variant || r.size} (${r.quantity - r.completed} left)`).join(", ") : "All variants finished ✓"}`
+                      : "No variants recorded yet - set them to track which exact garments are finished"
                   }
-                  action={<Btn variant="secondary" onClick={() => openSizes(it)}>{sz.length ? "Edit sizes" : "Set sizes"}</Btn>}
+                  action={<Btn variant="secondary" onClick={() => openSizes(it)}>{sz.length ? "Edit variants" : "Set variants"}</Btn>}
                 />
                 {sz.length > 0 && (
                   <div className="p-5 flex flex-wrap gap-2">
@@ -557,7 +570,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
                       const done = (r.completed ?? 0) >= (r.quantity ?? 0);
                       return (
                         <div key={r.id} className={`rounded-lg border px-4 py-2.5 text-center min-w-[88px] ${done ? "border-emerald-300 bg-emerald-50" : "border-amber-200 bg-amber-50/40"}`}>
-                          <p className="text-[11px] font-bold text-slate-500">{r.size}</p>
+                          {/* The exact garment, not just a size: colour is what makes
+                              "navy size 8" and "black size 8" two different tiles. */}
+                          <p className="text-[11px] font-bold text-slate-500">{r.color || "No colour"}</p>
+                          <p className="text-[11px] font-semibold text-slate-600">{r.size ? `Size ${r.size}` : "No size"}</p>
                           <p className="text-lg font-extrabold text-slate-900">{r.completed}<span className="text-xs font-semibold text-slate-400">/{r.quantity}</span></p>
                           <p className={`text-[10px] font-bold ${done ? "text-emerald-700" : "text-amber-700"}`}>{done ? "FINISHED" : `${r.quantity - r.completed} LEFT`}</p>
                         </div>
@@ -569,7 +585,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
             );
           })}
           <p className="text-xs text-slate-500">
-            Hand sizes to tailors as pieces are cut - update each size's finished count here, and the
+            Hand exact garments to tailors as pieces are cut - the finished count here is derived from
             “Outstanding” line always shows what is still on the floor.
           </p>
         </div>
@@ -949,29 +965,37 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
         </form>
       </Modal>
 
-      {/* Sizes manager */}
-      <Modal open={!!sizesItem} onClose={() => setSizesItem(null)} title={`Size breakdown - ${sizesItem?.productName || ""}`}>
+      {/* Exact garment variants */}
+      <Modal open={!!sizesItem} onClose={() => setSizesItem(null)} title={`Exact garments ordered - ${sizesItem?.productName || ""}`} wide>
         <form onSubmit={saveSizes} className="space-y-3">
           <p className="text-xs text-slate-500">
-            How many of each size were ordered (should total the item quantity), and how many of
-            each are finished so far.
+            One line per exact garment: size, colour and how many were ordered. Production is allocated
+            against these lines, so Navy in size 8 and Black in size 8 are two different things, and
+            each can only be allocated as many times as it was ordered.
           </p>
           <div className="text-[10px] font-bold uppercase text-slate-400 grid grid-cols-12 gap-2">
-            <span className="col-span-4">Size</span>
-            <span className="col-span-3">Ordered</span>
-            <span className="col-span-3">Finished</span>
+            <span className="col-span-3">Size</span>
+            <span className="col-span-3">Colour</span>
+            <span className="col-span-2">Ordered</span>
+            <span className="col-span-2">Finished</span>
             <span className="col-span-2" />
           </div>
           {sizeRows.map((r, i) => (
             <div key={i} className="grid grid-cols-12 gap-2 items-center">
-              <input value={r.size} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, size: e.target.value }; setSizeRows(n); }} placeholder="Size (S, M, 4-5…)" className={`${inputCls} col-span-4`} />
-              <input type="number" min="0" value={r.quantity} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, quantity: e.target.value }; setSizeRows(n); }} placeholder="Ordered" className={`${inputCls} col-span-3`} />
-              <input type="number" min="0" value={r.completed} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, completed: e.target.value }; setSizeRows(n); }} placeholder="Finished" className={`${inputCls} col-span-3`} />
+              <input value={r.size} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, size: e.target.value }; setSizeRows(n); }} placeholder="S, M, 4-5…" className={`${inputCls} col-span-3`} />
+              <input value={r.color ?? ""} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, color: e.target.value }; setSizeRows(n); }} placeholder="Navy, House Red…" className={`${inputCls} col-span-3`} />
+              <input type="number" min="0" value={r.quantity} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, quantity: e.target.value }; setSizeRows(n); }} placeholder="Ordered" className={`${inputCls} col-span-2`} />
+              {/* Not editable. It is derived from what production actually got
+                  approved at the last stage of each batch for this variant. */}
+              <span className="col-span-2 text-sm font-semibold text-emerald-700" title="Derived from the production trail - approved at the final stage of each batch for this exact garment">
+                {r.completedFromProduction > 0 ? r.completedFromProduction : Number(r.completed) || 0}
+                {r.completedFromProduction > 0 && <span className="ml-1 text-[10px] font-normal text-slate-400">from production</span>}
+              </span>
               <button type="button" onClick={() => setSizeRows(sizeRows.filter((_, x) => x !== i))} className="col-span-2 text-red-600 text-xs font-semibold text-center">Remove</button>
             </div>
           ))}
-          <button type="button" onClick={() => setSizeRows([...sizeRows, { size: "", quantity: "", completed: "0" }])} className="text-xs font-semibold text-matesther-700 hover:underline">
-            + Add size
+          <button type="button" onClick={() => setSizeRows([...sizeRows, { size: "", color: "", quantity: "", completed: "0", completedFromProduction: 0 }])} className="text-xs font-semibold text-matesther-700 hover:underline">
+            + Add a size / colour
           </button>
           <div className="flex justify-end gap-2 pt-2">
             <Btn variant="secondary" onClick={() => setSizesItem(null)}>Cancel</Btn>

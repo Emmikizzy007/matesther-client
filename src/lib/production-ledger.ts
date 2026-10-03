@@ -19,7 +19,18 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
  *   quantity_rework    = INSPECTION_REWORK
  *   quantity_rejected  = INSPECTION_REJECTED + REJECTED_CORRECTION
  *   quantity_inspected = approved + rework + rejected
- *   quantity_remaining = max(0, received - approved - rejected)
+ *   quantity_remaining = max(0, received - approved - rejected - short)
+ *
+ * where, from Task 3 onward,
+ *   completed also counts EXTERNAL_RETURNED and RECEIVED_READYMADE
+ *             (RECEIVED_READYMADE is NOT in `received`: the stage was already
+ *              allocated its target when the batch was created, so counting the
+ *              purchase there too would double it)
+ *   approved  also counts EXTERNAL_ACCEPTED and READYMADE_ACCEPTED
+ *   rejected  also counts EXTERNAL_REJECTED and READYMADE_REJECTED
+ *   short     is EXTERNAL_SHORT - no column of its own, ledger only
+ *
+ * EXTERNAL_SENT is in no bucket at all: sending work out is not production.
  *
  * Every one of those formulas is exactly what the previous hand-written
  * arithmetic produced, so no historical figure changes meaning. What changes is
@@ -59,6 +70,41 @@ export const MOVEMENT_EVENTS = {
   RECEIVED_CORRECTION: "RECEIVED_CORRECTION",
   SUBMITTED_CORRECTION: "SUBMITTED_CORRECTION",
   REJECTED_CORRECTION: "REJECTED_CORRECTION",
+
+  /* ---- Task 3: work that leaves the factory ----
+   *
+   * The same ledger, not a second one. Four separate figures are kept because
+   * they are four different facts: what was SENT is not what came BACK, and what
+   * came back is not what was ACCEPTED. 100 sent / 96 returned / 2 damaged /
+   * 4 short is a normal outcome and every one of those numbers survives.
+   *
+   * Only EXTERNAL_ACCEPTED lands in the approved bucket, so only accepted
+   * quantity is ever released to the next route stage.                    */
+  /** A dispatch went out. Deliberately in NO bucket: sending work out is not
+   *  production, and counting it would let a stage look further along than it is. */
+  EXTERNAL_SENT: "EXTERNAL_SENT",
+  /** What physically came back, before anyone judged it. The external equivalent
+   *  of a worker submitting pieces for inspection. */
+  EXTERNAL_RETURNED: "EXTERNAL_RETURNED",
+  /** Accepted on return. THIS is what becomes available downstream. */
+  EXTERNAL_ACCEPTED: "EXTERNAL_ACCEPTED",
+  /** Rejected or damaged on return. */
+  EXTERNAL_REJECTED: "EXTERNAL_REJECTED",
+  /** Never came back at all. Not a rejection - nothing arrived to judge - but it
+   *  must close out the outstanding quantity or the stage could never finish. */
+  EXTERNAL_SHORT: "EXTERNAL_SHORT",
+
+  /* ---- Task 3: a finished garment bought in ----
+   *
+   * A ready-made purchase is a PURCHASE with its own cost, recorded in
+   * material_purchases. It is never tailor labour and never outsourced
+   * production. These events only move the quantity that the purchase makes
+   * available to the route; the money stays where it already was.            */
+  RECEIVED_READYMADE: "RECEIVED_READYMADE",
+  /** Accepted on receipt - the only figure released downstream. */
+  READYMADE_ACCEPTED: "READYMADE_ACCEPTED",
+  /** Faulty on receipt. */
+  READYMADE_REJECTED: "READYMADE_REJECTED",
 } as const;
 
 export type MovementEvent = (typeof MOVEMENT_EVENTS)[keyof typeof MOVEMENT_EVENTS];
@@ -69,8 +115,42 @@ const RECEIVED_EVENTS: string[] = [
   MOVEMENT_EVENTS.STAGE_RECEIPT,
   MOVEMENT_EVENTS.RECEIVED_CORRECTION,
 ];
-const COMPLETED_EVENTS: string[] = [MOVEMENT_EVENTS.SUBMISSION, MOVEMENT_EVENTS.SUBMITTED_CORRECTION];
-const REJECTED_EVENTS: string[] = [MOVEMENT_EVENTS.INSPECTION_REJECTED, MOVEMENT_EVENTS.REJECTED_CORRECTION];
+/**
+ * A ready-made purchase counts as SUBMITTED work, but deliberately NOT as
+ * received.
+ *
+ * The stage was already allocated its target when the batch was created, so adding
+ * the purchase to `received` as well would double it: allocate 50, buy 50, and the
+ * stage would claim to hold 100 - which would then let a second purchase of 50
+ * through the capacity check. Nobody "submits" a garment that was bought finished,
+ * so the purchase belongs in the submitted bucket, where it makes the stage
+ * inspectable without inflating what it holds.
+ */
+const COMPLETED_EVENTS: string[] = [
+  MOVEMENT_EVENTS.SUBMISSION,
+  MOVEMENT_EVENTS.SUBMITTED_CORRECTION,
+  MOVEMENT_EVENTS.EXTERNAL_RETURNED,
+  MOVEMENT_EVENTS.RECEIVED_READYMADE,
+];
+const APPROVED_EVENTS: string[] = [
+  MOVEMENT_EVENTS.INSPECTION_APPROVED,
+  MOVEMENT_EVENTS.EXTERNAL_ACCEPTED,
+  MOVEMENT_EVENTS.READYMADE_ACCEPTED,
+];
+const REWORK_EVENTS: string[] = [MOVEMENT_EVENTS.INSPECTION_REWORK];
+const REJECTED_EVENTS: string[] = [
+  MOVEMENT_EVENTS.INSPECTION_REJECTED,
+  MOVEMENT_EVENTS.REJECTED_CORRECTION,
+  MOVEMENT_EVENTS.EXTERNAL_REJECTED,
+  MOVEMENT_EVENTS.READYMADE_REJECTED,
+];
+/**
+ * Never came back from outside. Kept out of `rejected` on purpose - a short
+ * quantity is not a damaged garment and Task 4 must be able to cost them
+ * differently - but subtracted from what is still outstanding, so a stage that
+ * lost pieces externally can still be closed instead of hanging forever.
+ */
+const SHORT_EVENTS: string[] = [MOVEMENT_EVENTS.EXTERNAL_SHORT];
 
 /** Events that move a quantity. Used to reject a correction with no real effect. */
 export const CORRECTION_EVENTS: string[] = [
@@ -108,22 +188,8 @@ export async function deriveQuantities(
   handle: Db,
   operationId: number
 ): Promise<DerivedQuantities> {
-  const [row] = await handle
-    .select({
-      received: sumBucket(RECEIVED_EVENTS),
-      completed: sumBucket(COMPLETED_EVENTS),
-      approved: sumBucket([MOVEMENT_EVENTS.INSPECTION_APPROVED]),
-      rework: sumBucket([MOVEMENT_EVENTS.INSPECTION_REWORK]),
-      rejected: sumBucket(REJECTED_EVENTS),
-    })
-    .from(productionMovements)
-    .where(eq(productionMovements.productionOperationId, operationId));
-
-  const quantityReceived = Math.max(0, Number(row?.received ?? 0));
-  const quantityCompleted = Math.max(0, Number(row?.completed ?? 0));
-  const quantityApproved = Math.max(0, Number(row?.approved ?? 0));
-  const quantityRework = Math.max(0, Number(row?.rework ?? 0));
-  const quantityRejected = Math.max(0, Number(row?.rejected ?? 0));
+  const detail = await deriveDetail(handle, operationId);
+  const { quantityReceived, quantityCompleted, quantityApproved, quantityRework, quantityRejected } = detail;
   return {
     quantityReceived,
     quantityCompleted,
@@ -131,7 +197,62 @@ export async function deriveQuantities(
     quantityRework,
     quantityRejected,
     quantityInspected: quantityApproved + quantityRework + quantityRejected,
-    quantityRemaining: Math.max(0, quantityReceived - quantityApproved - quantityRejected),
+    quantityRemaining: Math.max(
+      0,
+      quantityReceived - quantityApproved - quantityRejected - detail.quantityShort
+    ),
+  };
+}
+
+/**
+ * The same derivation, plus the figures that have no column of their own.
+ *
+ * `quantityShort` is deliberately NOT a column on production_operations: it only
+ * ever arises on work sent outside, it is fully recoverable from the ledger, and
+ * keeping it out of the seven counters means `applyMovements` can keep writing
+ * exactly the columns that exist. It is included in `remaining`, so a stage that
+ * lost pieces externally can still close.
+ *
+ * For every batch produced before Task 3 this returns `quantityShort: 0` and the
+ * remaining formula reduces to exactly the one it replaced.
+ */
+export async function deriveDetail(
+  handle: Db,
+  operationId: number
+): Promise<DerivedQuantities & { quantityShort: number }> {
+  const [row] = await handle
+    .select({
+      received: sumBucket(RECEIVED_EVENTS),
+      completed: sumBucket(COMPLETED_EVENTS),
+      approved: sumBucket(APPROVED_EVENTS),
+      rework: sumBucket(REWORK_EVENTS),
+      rejected: sumBucket(REJECTED_EVENTS),
+      short: sumBucket(SHORT_EVENTS),
+    })
+    .from(productionMovements)
+    .where(eq(productionMovements.productionOperationId, operationId));
+  const base = deriveQuantitiesFromRow(row);
+  return { ...base, quantityShort: Math.max(0, Number(row?.short ?? 0)) };
+}
+
+function deriveQuantitiesFromRow(row: {
+  received?: unknown; completed?: unknown; approved?: unknown;
+  rework?: unknown; rejected?: unknown; short?: unknown;
+} | undefined): DerivedQuantities {
+  const quantityReceived = Math.max(0, Number(row?.received ?? 0));
+  const quantityCompleted = Math.max(0, Number(row?.completed ?? 0));
+  const quantityApproved = Math.max(0, Number(row?.approved ?? 0));
+  const quantityRework = Math.max(0, Number(row?.rework ?? 0));
+  const quantityRejected = Math.max(0, Number(row?.rejected ?? 0));
+  const quantityShort = Math.max(0, Number(row?.short ?? 0));
+  return {
+    quantityReceived,
+    quantityCompleted,
+    quantityApproved,
+    quantityRework,
+    quantityRejected,
+    quantityInspected: quantityApproved + quantityRework + quantityRejected,
+    quantityRemaining: Math.max(0, quantityReceived - quantityApproved - quantityRejected - quantityShort),
   };
 }
 
@@ -193,7 +314,7 @@ export async function approvedAtStage(
   stage: string
 ): Promise<number> {
   const [row] = await handle
-    .select({ approved: sumBucket([MOVEMENT_EVENTS.INSPECTION_APPROVED]) })
+    .select({ approved: sumBucket(APPROVED_EVENTS) })
     .from(productionMovements)
     .where(
       and(
@@ -217,6 +338,9 @@ export async function inspectionSubtotal(
 ): Promise<{ approved: number; rework: number; rejected: number }> {
   const [row] = await handle
     .select({
+      // Deliberately the INSPECTION events only, not APPROVED_EVENTS: this exists
+      // to stop a correction unwinding what a human inspector recorded, so an
+      // external acceptance must not become part of that floor.
       approved: sumBucket([MOVEMENT_EVENTS.INSPECTION_APPROVED]),
       rework: sumBucket([MOVEMENT_EVENTS.INSPECTION_REWORK]),
       rejected: sumBucket([MOVEMENT_EVENTS.INSPECTION_REJECTED]),
@@ -270,8 +394,8 @@ export async function reconcileQuantities(batchId?: number) {
           operationId: productionMovements.productionOperationId,
           received: sumBucket(RECEIVED_EVENTS),
           completed: sumBucket(COMPLETED_EVENTS),
-          approved: sumBucket([MOVEMENT_EVENTS.INSPECTION_APPROVED]),
-          rework: sumBucket([MOVEMENT_EVENTS.INSPECTION_REWORK]),
+          approved: sumBucket(APPROVED_EVENTS),
+          rework: sumBucket(REWORK_EVENTS),
           rejected: sumBucket(REJECTED_EVENTS),
         })
         .from(productionMovements)

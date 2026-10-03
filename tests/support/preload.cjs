@@ -58,6 +58,7 @@ const MIGRATIONS = [
   "0004_worker_roles",
   "0005_support_work_and_payroll",
   "0006_production_ledger_and_indexes",
+  "0007_variants_routes_and_external_work",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 
@@ -104,6 +105,18 @@ const REQUIRED_COLUMNS = [
   ["production_movements", "event_type"],
   ["production_movements", "source"],
   ["production_movements", "stage"],
+  // Fails loudly if migration 0007 was not applied: variants, routes, the
+  // production-method axis and external work all depend on these.
+  ["order_item_sizes", "color"],
+  ["production_routes", "is_default"],
+  ["production_route_stages", "position"],
+  ["production_route_stages", "method"],
+  ["production_operations", "route_position"],
+  ["production_operations", "method"],
+  ["production_batches", "order_variant_id"],
+  ["production_batches", "route_id"],
+  ["external_work_orders", "quantity_short"],
+  ["material_purchases", "order_variant_id"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);

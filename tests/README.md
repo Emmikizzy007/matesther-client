@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 135 tests in about 55 seconds. No server, no `DATABASE_URL`, no network,
+Runs 177 tests in about 75 seconds. No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists
@@ -31,6 +31,7 @@ place and untouched.
 | `multi-role.test.ts` | One person with several roles: no duplicate people, no duplicate roles, role removal keeps the person, legacy single-role workers unchanged, and the cutter-supervisor and self-inspection controls still holding when the role is one of several |
 | `pwa-branding.test.ts` | Installability contract, and the official-logo endpoint: Owner-only upload, the committed official mark served byte-for-byte when none is uploaded, SVG and undersized uploads refused, the stored logo returned **byte-for-byte**, square OS icons, the install button never faked, and the mobile safe-area / tap-target / iOS-zoom fixes |
 | `whatsapp-sharing.test.ts` | WhatsApp deep links: correct `wa.me` number normalisation, refusal to guess an unusable number, no application URL in a shared message, confidentiality handling on the Owner-only payment sheet, and the Owner-only guard still holding on the documents behind the share buttons |
+| `route-driven-production.test.ts` | Exact garment variants (item + optional size + optional colour), variant-level allocation ceilings and partial allocation, routes that shorten / start late / end early / skip stages / run in their own order, the route being frozen on the batch, per-stage production methods, the five methods staying distinct, external work keeping sent / returned / accepted / rejected / short as separate figures with only the accepted figure moving on, ready-made purchases staying purchases, and worker dashboards showing the exact garment allocated |
 | `production-integrity.test.ts` | Quantity integrity: every counter derived from the production movement ledger, the four measured free-text quantity attacks refused, audited corrections with a mandatory reason, the upstream-approved ceiling that stops downstream over-allocation, approved quantity never correctable, the ledger append-only, an unmapped event type inert, the delivery stage role gate, the grouped payroll SQL agreeing with the pure pay rule, and order edits committing atomically |
 | `support-payroll.test.ts` | Tailor support work paid on approved pieces only, the ban on approving your own support work (including a supervisor who also does the work), assignment and inspection history preserved, salaried non-production staff, the payroll breakdown and payment status, Owner-only payroll and payment sheet, and duplicate-payment prevention |
 
@@ -59,7 +60,7 @@ inspection route against the actual data layer.
   suite; their schema is kept identical to the matching `drizzle/` migration,
   which is.
 - **One deliberate migration deviation.** pg-mem has no plpgsql interpreter, so
-  it cannot run `DO $$ ... $$` guard blocks. Migrations `0003`, `0004`, `0005` and `0006` each
+  it cannot run `DO $$ ... $$` guard blocks. Migrations `0003` to `0007` each
   wrap their `ADD CONSTRAINT` statements in one purely so the migration is
   re-runnable; because this database is always created empty those guards could
   never fire, so the statements inside run directly. The resulting schema is
@@ -97,6 +98,18 @@ inspection route against the actual data layer.
   | Count rework instead of approved pieces in the grouped payroll SQL | `payroll-rules` 29 only | all 133 others passed |
   | Restore the empty-set 500 on `PUT /api/orders/[id]` | `production-integrity` 19 only | all 133 others passed |
   | Remove the ceiling that stops an order line being cut below its committed production | `production-integrity` 20 only | all 134 others passed |
+  | Read stage order from the global eight-stage array instead of the batch's frozen route | `route-driven-production` 15 only | all 173 others passed |
+  | Drop the variant-level allocation ceiling | `route-driven-production` 7 only | all 173 others passed |
+  | Count a dispatch as production (`EXTERNAL_SENT` into the submitted bucket) | `route-driven-production` 25 and 26 | all 172 others passed |
+  | Release what came BACK downstream instead of what was ACCEPTED | `route-driven-production` 27 only | all 173 others passed |
+  | Let a ready-made purchase inflate what the stage holds | `route-driven-production` 33 only | all 173 others passed |
+  | Allow a ready-made stage part-way through a route | `route-driven-production` 37 only | all 173 others passed |
+  | Let a supervisor accept back the work they themselves sent out | `route-driven-production` 30 only | all 173 others passed |
+  | Let a ready-made receipt be judged twice | `route-driven-production` 32 only | all 173 others passed |
+  | Let an accepted external figure be un-accepted | `route-driven-production` 29 only | all 173 others passed |
+  | Let a dispatch send out more garments than the stage holds | `route-driven-production` 23 and 24 | all 172 others passed |
+  | Let a worker submit pieces against an outsourced or bought-in stage | `route-driven-production` 28 and 30 | all 175 others passed |
+  | Treat `MACHINE` as work that leaves the factory | `route-driven-production` 29 only | all 176 others passed |
 
   **A mutation this suite initially SURVIVED, and the fix.** The first version of
   "an unknown ledger event type cannot move a quantity counter" passed even with
@@ -135,6 +148,16 @@ replaced by something that runs in both engines:
   (real PostgreSQL), never in the `drizzle/` migration the suite applies.
 - `generate_series` is **not implemented** — measurement scripts must insert rows
   in a loop.
+- `NULLS NOT DISTINCT` (Postgres 15+) **fails to parse**, which is why the variant
+  uniqueness uses a `coalesce(size,'')` / `coalesce(color,'')` expression index
+  instead: it works on every Postgres version *and* is enforced identically here.
+  Verified both ways in the emulator - "size 8 navy" and "size 8 black" coexist,
+  a second "size 8 navy" is refused, and so is a second size-less colour-less row.
+- `CREATE TABLE IF NOT EXISTS` against a table that already exists reports an
+  unconsumed-AST error. That is an emulator quirk, not invalid SQL: the same three
+  statements run cleanly on an empty database. It only affects scripts that
+  re-run the `deploy/` files against an already-upgraded emulator to prove they
+  are no-ops.
 - A correlated `NOT EXISTS` with a table alias fails to resolve the column. The
   ledger backfill uses `NOT IN (SELECT ...)` instead, which is also what makes it
   re-runnable.

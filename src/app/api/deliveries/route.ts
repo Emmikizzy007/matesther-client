@@ -41,7 +41,8 @@ async function prepareLines(orderId: number, raw: DeliveryInput["lines"]) {
     const size = String(line.size ?? "").trim().toUpperCase();
     if (size.length > 40) throw new Error("Keep size labels under 40 characters.");
     const itemSizes = sizes.filter((s) => s.orderItemId === itemId);
-    if (size && itemSizes.length && !itemSizes.some((s) => s.size.toUpperCase() === size))
+    // `size` is nullable now that a variant may have a colour but no size run.
+    if (size && itemSizes.length && !itemSizes.some((s) => String(s.size ?? "").toUpperCase() === size))
       throw new Error(`Size ${size} is not listed for ${productNames.get(item.productId ?? -1) ?? "this garment"}. Update the order sizes first.`);
     totals.set(itemId, (totals.get(itemId) ?? 0) + qty);
     if (totals.get(itemId)! > item.quantity) throw new Error("This delivery contains more of a garment than were ordered.");

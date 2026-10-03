@@ -4,9 +4,10 @@ import { db } from "@/db";
 import { productionOperations, productionBatches, orders, customers, workers, orderItems, products } from "@/db/schema";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE } from "@/lib/authz";
-import { STAGE_ROLES } from "@/lib/format";
+import { STAGE_ROLES, isExternalMethod, isPurchasedMethod, methodLabel, variantLabel } from "@/lib/format";
 import { workerHoldsRole, type RoleCache } from "@/lib/worker-roles";
 import { MOVEMENT_EVENTS, applyMovements } from "@/lib/production-ledger";
+import { roleForStage } from "@/lib/production-route";
 
 const STATUSES = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD", "CANCELLED"];
 
@@ -114,6 +115,11 @@ export async function GET(req: Request) {
         quantityRework: productionOperations.quantityRework,
         inspector: productionOperations.inspector,
         status: productionOperations.status,
+        // Route and method: what a card must show so a supervisor can tell an
+        // in-house sewing job from one that is out with a vendor, and can see where
+        // this stage sits in THIS batch's route rather than in a global list.
+        method: productionOperations.method,
+        routePosition: productionOperations.routePosition,
         assignedAt: productionOperations.assignedAt,
         submittedAt: productionOperations.submittedAt,
         expectedCompletionDate: productionOperations.expectedCompletionDate,
@@ -124,6 +130,7 @@ export async function GET(req: Request) {
         batchQuantity: productionBatches.quantity,
         size: productionBatches.size,
         color: productionBatches.color,
+        orderVariantId: productionBatches.orderVariantId,
         orderId: orders.id,
         orderNumber: orders.orderNumber,
         dueDate: orders.dueDate,
@@ -152,17 +159,40 @@ export async function GET(req: Request) {
       : [];
     const byProduct = new Map(catalog.map((product) => [product.id, product.name]));
 
-    const rows = page.map(({ productId, ...op }) => ({
-      ...op,
-      batchNumber: op.batchNumber ?? "-",
-      batchQuantity: op.batchQuantity ?? 0,
-      garment: productId ? byProduct.get(productId) ?? "Uniform item" : "Full order",
-      orderNumber: op.orderNumber ?? "-",
-      customer: op.customer ?? "-",
-      workerName: op.workerName ?? null,
-      paymentType: op.paymentType ?? null,
-      pendingInspection: Math.max(0, op.quantityCompleted - op.quantityInspected),
-    }));
+    // How many stages each batch on this page actually has, so a card can say
+    // "stage 2 of 3" instead of implying the eight-stage pipeline. One grouped
+    // query, limited to the batches on this page.
+    const pageBatchIds = [...new Set(page.map((row) => row.productionBatchId))];
+    const routeLengths = pageBatchIds.length
+      ? await db
+          .select({ batchId: productionOperations.productionBatchId, stages: sql<number>`count(*)` })
+          .from(productionOperations)
+          .where(inArray(productionOperations.productionBatchId, pageBatchIds))
+          .groupBy(productionOperations.productionBatchId)
+      : [];
+    const lengthByBatch = new Map(routeLengths.map((row) => [Number(row.batchId), Number(row.stages)]));
+
+    const rows = page.map(({ productId, ...op }) => {
+      const routeLength = lengthByBatch.get(op.productionBatchId) ?? 0;
+      return {
+        ...op,
+        batchNumber: op.batchNumber ?? "-",
+        batchQuantity: op.batchQuantity ?? 0,
+        garment: productId ? byProduct.get(productId) ?? "Uniform item" : "Full order",
+        // The exact garment this job is for, not the whole order.
+        variant: variantLabel(op.size, op.color),
+        method: op.method ?? "INTERNAL",
+        methodLabel: methodLabel(op.method),
+        routePosition: op.routePosition ?? null,
+        routeLength,
+        routeStageNumber: op.routePosition ?? null,
+        orderNumber: op.orderNumber ?? "-",
+        customer: op.customer ?? "-",
+        workerName: op.workerName ?? null,
+        paymentType: op.paymentType ?? null,
+        pendingInspection: Math.max(0, op.quantityCompleted - op.quantityInspected),
+      };
+    });
     return NextResponse.json(rows, {
       headers: { "Cache-Control": "private, no-store", "X-Total-Count": String(total) },
     });
@@ -189,6 +219,19 @@ export async function PUT(req: Request) {
         error: "A cutter-supervisor cannot assign, change or complete Cutting jobs. An Owner or non-cutting supervisor must handle Cutting. Submit your own pieces through My Jobs.",
       }, { status: 403 });
     if (session.role === "WORKER" || (session.role === "PRODUCTION_MANAGER" && body.submitQty !== undefined)) {
+      // Checked BEFORE ownership, so the answer is about the stage rather than a
+      // confusing "this is not your job" on a job nobody could ever submit against.
+      // A stage produced outside the factory, or satisfied by buying finished
+      // garments in, has no worker submission: allowing one would let a SUBMISSION
+      // event sit beside the EXTERNAL_RETURNED / RECEIVED_READYMADE events for the
+      // same garments and count them twice.
+      if (isExternalMethod(current.method) || isPurchasedMethod(current.method))
+        return NextResponse.json({
+          error: `This stage is ${methodLabel(current.method).toLowerCase()}, so nobody submits pieces against it. `
+            + (isPurchasedMethod(current.method)
+              ? "Record the purchase and accept it on arrival under External Work & Ready-made."
+              : "Record what comes back under External Work & Ready-made; only what Matesther accepts counts."),
+        }, { status: 400 });
       const workerId = await getLinkedWorkerId(session);
       if (!workerId || current.workerId !== workerId)
         return NextResponse.json({ error: "You can only submit your own assigned jobs." }, { status: 403 });
@@ -237,8 +280,12 @@ export async function PUT(req: Request) {
     const roleCache: RoleCache = new Map();
     if (access?.cutterSupervisor && workerId !== current.workerId && (await workerHoldsRole(person, "Cutter", roleCache)))
       return NextResponse.json({ error: "Cutter assignments must be made by the Owner or a non-cutting supervisor." }, { status: 403 });
-    if (person && STAGE_ROLES[current.stage] && !(await workerHoldsRole(person, STAGE_ROLES[current.stage], roleCache)))
-      return NextResponse.json({ error: `${current.stage.replaceAll("_", " ")} needs a ${STAGE_ROLES[current.stage]}.` }, { status: 400 });
+    // The role a stage needs: the batch's own route may override the default map,
+    // which is how a route can demand a Packer at DELIVERY on one garment and
+    // something else on another without a code change.
+    const requiredRole = await roleForStage(db, current);
+    if (person && requiredRole && !(await workerHoldsRole(person, requiredRole, roleCache)))
+      return NextResponse.json({ error: `${current.stage.replaceAll("_", " ")} needs a ${requiredRole}.` }, { status: 400 });
     if (changedWorker && (current.quantityCompleted > 0 || current.quantityInspected > 0 || current.quantityApproved > 0))
       return NextResponse.json({ error: "This job already has production history. Keep the assigned worker; use a new batch to split the work." }, { status: 400 });
 
