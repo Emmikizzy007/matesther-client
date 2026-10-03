@@ -248,8 +248,16 @@ function OwnerDashboard({ d }: any) {
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-semibold truncate">{o.orderNumber} <span className="font-normal text-slate-500">• {o.customer}</span></p>
                   <div className="flex items-center gap-2 mt-1">
-                    <ProgressBar pct={o.progress} className="max-w-[120px]" />
-                    <span className="text-[11px] text-slate-500">{o.progress}%</span>
+                    {/* The bar measures APPROVED work, because that is the only
+                        quantity that has actually been made and signed off. The
+                        submitted figure stays visible beside it, so a batch whose
+                        work is all awaiting inspection reads as such instead of
+                        looking finished. */}
+                    <ProgressBar pct={o.approvedProgress ?? o.progress} className="max-w-[120px]" />
+                    <span className="text-[11px] text-slate-500">{o.approvedProgress ?? o.progress}% approved</span>
+                    {o.progress > (o.approvedProgress ?? 0) && (
+                      <span className="text-[11px] text-violet-700">{o.progress}% submitted</span>
+                    )}
                   </div>
                 </div>
                 <div className="text-right shrink-0">
