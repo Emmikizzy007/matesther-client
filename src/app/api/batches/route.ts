@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { orders, orderItems, orderItemSizes, productionBatches, productionOperations, workers } from "@/db/schema";
 import { STAGES } from "@/lib/format";
+import { MOVEMENT_EVENTS, applyMovements } from "@/lib/production-ledger";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, productionAccess, OWNER, STAFF } from "@/lib/authz";
 import { workerHoldsRole } from "@/lib/worker-roles";
@@ -95,13 +96,14 @@ export async function POST(req: Request) {
       batchNumber = `B-${order.orderNumber.replace("ORD-", "")}-${String.fromCharCode(65 + suffix++)}`;
     } while (existing.some((batch) => batch.batchNumber === batchNumber));
     if (body.batchNumber) batchNumber = String(body.batchNumber).trim().slice(0, 80);
+    const actor = { userId: session.id, name: session.name };
     const batch = await db.transaction(async (tx) => {
       const [newBatch] = await tx.insert(productionBatches).values({
         orderId, orderItemId: itemId, batchNumber, quantity,
         size: size || null, color: color || null,
         status: cutter.id ? "IN_PROGRESS" : "PENDING",
       }).returning();
-      await tx.insert(productionOperations).values(STAGES.map((stage) => {
+      const created = await tx.insert(productionOperations).values(STAGES.map((stage) => {
         const assignment = stage === "CUTTING" ? cutter : stage === "SEWING" ? tailor : { id: null, rate: null };
         return {
           productionBatchId: newBatch.id, stage,
@@ -112,7 +114,24 @@ export async function POST(req: Request) {
           status: stage === "CUTTING" && cutter.id ? "IN_PROGRESS" : "PENDING",
           expectedCompletionDate: body.expectedCompletionDate || order.dueDate || null,
         };
-      }));
+      })).returning();
+      // The quantity placed in front of the first stage is itself a ledger event.
+      // Without this row the counters would have no evidence behind them, and the
+      // later derivation in POST /api/inspections would have nothing to sum.
+      // Later stages start at zero and only ever receive what an inspection
+      // approves upstream, so they get no allocation row here.
+      for (const op of created) {
+        if (op.quantityReceived > 0) {
+          await applyMovements(tx, op, actor, [{
+            type: MOVEMENT_EVENTS.ALLOCATION,
+            quantity: op.quantityReceived,
+            workerId: op.workerId,
+            referenceType: "PRODUCTION_BATCH",
+            referenceId: newBatch.id,
+            reason: `Batch ${batchNumber} allocated ${op.quantityReceived} garment(s) to ${op.stage}`,
+          }]);
+        }
+      }
       return newBatch;
     });
     await refreshBatchAndOrder(batch.id);

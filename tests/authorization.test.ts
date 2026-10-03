@@ -234,6 +234,7 @@ test("a Worker may only submit a completed quantity, never other fields", async 
   const tailor = await createWorker(owner.cookie, { name: tailorName, specialty: "Tailor" });
   const tailorLogin = await createStaff(owner.cookie, { name: tailorName, role: "WORKER" });
 
+  const cutterLogin = await createStaff(owner.cookie, { name: cutterName, role: "WORKER" });
   const order = await createOrder(owner.cookie, { quantity: 6 });
   const batch = await api("POST", "/api/batches", {
     cookie: owner.cookie,
@@ -249,13 +250,43 @@ test("a Worker may only submit a completed quantity, never other fields", async 
   });
   await expectStatus(batch, 201, "Create batch for scope test");
   const jobs = await api("GET", "/api/operations", { cookie: owner.cookie });
+  const cutting = jobs.data.find((job: any) => job.productionBatchId === batch.data.id && job.stage === "CUTTING");
   const sewing = jobs.data.find((job: any) => job.productionBatchId === batch.data.id && job.stage === "SEWING");
-  assert.ok(sewing, "Sewing stage should exist");
+  assert.ok(cutting && sewing, "Cutting and sewing stages should exist");
 
-  // The Owner puts 6 garments in front of the tailor so the job is genuinely active.
+  // CHANGED, DELIBERATELY. This setup used to put 6 garments in front of the
+  // tailor by TYPING `quantityReceived: 6` into the sewing job. That write path
+  // no longer exists: it let anyone invent a quantity with no event behind it and
+  // no record of who did it. The 6 garments now arrive the only legitimate way -
+  // the cutter submits them and the Owner approves them - which is also what
+  // makes the "between 1 and 6" assertion below mean something.
+  await expectStatus(
+    await api("PUT", "/api/operations", { cookie: cutterLogin.cookie, body: { id: cutting.id, submitQty: 6 } }),
+    200, "Cutter submits the 6 allocated garments"
+  );
+  await expectStatus(
+    await api("POST", "/api/inspections", {
+      cookie: owner.cookie,
+      body: { operationId: cutting.id, quantityApproved: 6, quantityRework: 0, quantityRejected: 0 },
+    }),
+    201, "Owner approves all 6, releasing them to sewing"
+  );
+  const released = await api("GET", "/api/operations", { cookie: owner.cookie });
+  const sewingNow = released.data.find((job: any) => job.id === sewing.id);
+  assert.equal(sewingNow.quantityReceived, 6, "Sewing holds exactly the 6 approved upstream");
+
+  // Typing a quantity in is now refused outright, and says where to go instead.
+  const typed = await api("PUT", "/api/operations", {
+    cookie: owner.cookie,
+    body: { id: sewing.id, quantityReceived: 500, status: "IN_PROGRESS" },
+  });
+  assert.equal(typed.status, 400, "An Owner may not invent a quantity either");
+  assert.match(String(typed.data.error), /quantity received/i, "The refusal names the field");
+  assert.match(String(typed.data.error), /correction/i, "The refusal points at the audited correction path");
+
   const activated = await api("PUT", "/api/operations", {
     cookie: owner.cookie,
-    body: { id: sewing.id, quantityReceived: 6, status: "IN_PROGRESS" },
+    body: { id: sewing.id, status: "IN_PROGRESS" },
   });
   await expectStatus(activated, 200, "Owner activates the sewing job");
 

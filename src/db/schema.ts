@@ -8,6 +8,8 @@ import {
   date,
   varchar,
   unique,
+  index,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 // ---------- Organizations ----------
@@ -37,7 +39,11 @@ export const users = pgTable("users", {
   phone: text("phone"),
   status: text("status").notNull().default("ACTIVE"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("users_organization_id_idx").on(table.organizationId)
+  ]
+);
 
 // ---------- Sessions (signed-in staff) ----------
 export const sessions = pgTable("sessions", {
@@ -47,7 +53,12 @@ export const sessions = pgTable("sessions", {
     .notNull(),
   createdAt: timestamp("created_at").defaultNow(),
   expiresAt: timestamp("expires_at").notNull(),
-});
+},
+  (table) => [
+    index("sessions_user_id_idx").on(table.userId),
+    index("sessions_expires_at_idx").on(table.expiresAt)
+  ]
+);
 
 // ---------- Customers (Schools / Companies) ----------
 export const customers = pgTable("customers", {
@@ -87,7 +98,14 @@ export const orders = pgTable("orders", {
   balance: integer("balance").notNull().default(0),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("orders_customer_id_idx").on(table.customerId),
+    index("orders_status_idx").on(table.status),
+    index("orders_due_date_idx").on(table.dueDate),
+    index("orders_created_at_idx").on(table.createdAt)
+  ]
+);
 
 // ---------- Order items ----------
 export const orderItems = pgTable("order_items", {
@@ -100,7 +118,11 @@ export const orderItems = pgTable("order_items", {
   unitPrice: integer("unit_price").notNull().default(0),
   totalPrice: integer("total_price").notNull().default(0),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("order_items_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Workers ----------
 export const workers = pgTable("workers", {
@@ -121,7 +143,12 @@ export const workers = pgTable("workers", {
   status: text("status").notNull().default("ACTIVE"),
   archivedAt: timestamp("archived_at"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("workers_organization_id_idx").on(table.organizationId),
+    index("workers_status_idx").on(table.status)
+  ]
+);
 
 // ---------- Worker roles (one person, many production roles) ----------
 // A single person may legitimately be a Cutter AND a Tailor AND an Inspection
@@ -153,7 +180,14 @@ export const orderItemSizes = pgTable("order_item_sizes", {
   size: text("size").notNull(),
   quantity: integer("quantity").notNull().default(0),
   completed: integer("completed").notNull().default(0),
-});
+},
+  (table) => [
+    index("order_item_sizes_order_item_id_idx").on(table.orderItemId),
+    // One size row per item: POST /api/order-sizes replaces the whole set,
+    // so a duplicate (item, size) pair could only come from a bug.,
+    uniqueIndex("order_item_sizes_item_size_unique").on(table.orderItemId, table.size)
+  ]
+);
 
 // ---------- Production batches ----------
 export const productionBatches = pgTable("production_batches", {
@@ -168,7 +202,12 @@ export const productionBatches = pgTable("production_batches", {
   color: text("color"),
   status: text("status").notNull().default("PENDING"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("production_batches_order_id_idx").on(table.orderId),
+    index("production_batches_order_item_id_idx").on(table.orderItemId)
+  ]
+);
 
 // ---------- Production operations (one row per stage per batch) ----------
 export const productionOperations = pgTable("production_operations", {
@@ -196,7 +235,18 @@ export const productionOperations = pgTable("production_operations", {
   inspectedAt: timestamp("inspected_at"),
   completedAt: timestamp("completed_at"),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("production_operations_batch_id_idx").on(table.productionBatchId),
+    index("production_operations_worker_id_idx").on(table.workerId),
+    index("production_operations_stage_idx").on(table.stage),
+    index("production_operations_status_idx").on(table.status),
+    // One row per stage per batch. Nothing enforced this before, and the,
+    // "next stage" lookup in POST /api/inspections takes the first match, so,
+    // a duplicate row would silently starve one of the two.,
+    uniqueIndex("production_operations_batch_stage_unique").on(table.productionBatchId, table.stage)
+  ]
+);
 
 // ---------- Stage inspections (audit trail - never overwritten) ----------
 export const stageInspections = pgTable("stage_inspections", {
@@ -212,7 +262,12 @@ export const stageInspections = pgTable("stage_inspections", {
   quantityRejected: integer("quantity_rejected").notNull().default(0),
   notes: text("notes"),
   inspectedAt: timestamp("inspected_at").defaultNow(),
-});
+},
+  (table) => [
+    index("stage_inspections_operation_id_idx").on(table.productionOperationId),
+    index("stage_inspections_inspected_at_idx").on(table.inspectedAt)
+  ]
+);
 
 // ---------- Tailor support work (weaving, taping, other supporting work) ----
 // A tailor hands part of their garment work to a support worker. The parent
@@ -252,7 +307,14 @@ export const supportAssignments = pgTable("support_assignments", {
   }),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("support_assignments_worker_id_idx").on(table.workerId),
+    index("support_assignments_assigned_by_idx").on(table.assignedByWorkerId),
+    index("support_assignments_operation_id_idx").on(table.productionOperationId),
+    index("support_assignments_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Support-work inspections (append-only audit trail) ----------
 // Mirrors stage_inspections: every pass is a new row, so rework and rejection
@@ -270,7 +332,12 @@ export const supportInspections = pgTable("support_inspections", {
   quantityRejected: integer("quantity_rejected").notNull().default(0),
   notes: text("notes"),
   inspectedAt: timestamp("inspected_at").defaultNow(),
-});
+},
+  (table) => [
+    index("support_inspections_assignment_id_idx").on(table.supportAssignmentId),
+    index("support_inspections_inspected_at_idx").on(table.inspectedAt)
+  ]
+);
 
 // ---------- Materials ----------
 export const materials = pgTable("materials", {
@@ -299,7 +366,12 @@ export const materialPurchases = pgTable("material_purchases", {
   purchaseDate: date("purchase_date").notNull(),
   orderId: integer("order_id").references(() => orders.id),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("material_purchases_material_id_idx").on(table.materialId),
+    index("material_purchases_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Material usage ----------
 export const materialUsage = pgTable("material_usage", {
@@ -315,7 +387,13 @@ export const materialUsage = pgTable("material_usage", {
   unitCost: integer("unit_cost").notNull().default(0),
   totalCost: integer("total_cost").notNull().default(0),
   usedAt: timestamp("used_at").defaultNow(),
-});
+},
+  (table) => [
+    index("material_usage_order_id_idx").on(table.orderId),
+    index("material_usage_material_id_idx").on(table.materialId),
+    index("material_usage_operation_id_idx").on(table.productionOperationId)
+  ]
+);
 
 // ---------- Expenses ----------
 export const expenses = pgTable("expenses", {
@@ -327,7 +405,11 @@ export const expenses = pgTable("expenses", {
   amount: integer("amount").notNull().default(0),
   expenseDate: date("expense_date").notNull(),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("expenses_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Payments ----------
 export const payments = pgTable("payments", {
@@ -340,7 +422,11 @@ export const payments = pgTable("payments", {
   paymentMethod: text("payment_method").notNull().default("Bank Transfer"),
   reference: text("reference"),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("payments_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Quality checks ----------
 export const qualityChecks = pgTable("quality_checks", {
@@ -353,7 +439,11 @@ export const qualityChecks = pgTable("quality_checks", {
   quantityFailed: integer("quantity_failed").notNull().default(0),
   notes: text("notes"),
   checkedAt: timestamp("checked_at").defaultNow(),
-});
+},
+  (table) => [
+    index("quality_checks_operation_id_idx").on(table.productionOperationId)
+  ]
+);
 
 // ---------- Rework records ----------
 export const reworkRecords = pgTable("rework_records", {
@@ -365,7 +455,11 @@ export const reworkRecords = pgTable("rework_records", {
   reason: text("reason"),
   status: text("status").notNull().default("PENDING"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("rework_records_operation_id_idx").on(table.productionOperationId)
+  ]
+);
 
 // ---------- Packing records ----------
 export const packingRecords = pgTable("packing_records", {
@@ -377,7 +471,11 @@ export const packingRecords = pgTable("packing_records", {
   packageCount: integer("package_count").notNull().default(0),
   packedAt: timestamp("packed_at").defaultNow(),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("packing_records_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Worker payments (payroll records) ----------
 export const workerPayments = pgTable(
@@ -408,7 +506,11 @@ export const workerPayments = pgTable(
     notes: text("notes"),
     createdAt: timestamp("created_at").defaultNow(),
   },
-  (table) => [unique("worker_payments_idempotency_key_unique").on(table.idempotencyKey)]
+  (table) => [
+    unique("worker_payments_idempotency_key_unique").on(table.idempotencyKey),
+    index("worker_payments_worker_id_idx").on(table.workerId),
+    index("worker_payments_period_month_idx").on(table.periodMonth),
+  ]
 );
 
 // ---------- Worker overtime ----------
@@ -425,7 +527,12 @@ export const workerOvertime = pgTable("worker_overtime", {
   category: text("category").notNull().default("OVERTIME"),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("worker_overtime_worker_id_idx").on(table.workerId),
+    index("worker_overtime_worked_on_idx").on(table.workedOn)
+  ]
+);
 
 // ---------- Deliveries ----------
 export const deliveries = pgTable("deliveries", {
@@ -439,7 +546,11 @@ export const deliveries = pgTable("deliveries", {
   deliveryAddress: text("delivery_address"),
   status: text("status").notNull().default("PENDING"),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("deliveries_order_id_idx").on(table.orderId)
+  ]
+);
 
 // Snapshot the exact garment and size contents of each shipment. Keeping the
 // description here means a historical delivery sheet survives product edits.
@@ -450,4 +561,69 @@ export const deliveryLines = pgTable("delivery_lines", {
   description: text("description").notNull(),
   size: text("size"),
   quantity: integer("quantity").notNull(),
-});
+},
+  (table) => [
+    index("delivery_lines_delivery_id_idx").on(table.deliveryId),
+    index("delivery_lines_order_item_id_idx").on(table.orderItemId)
+  ]
+);
+
+// ---------- Production movement ledger ----------
+/**
+ * Append-only record of every event that changes a production quantity.
+ *
+ * WHY THIS EXISTS
+ *   `production_operations` stores seven counters that two different routes used
+ *   to be able to write directly, so a counter could be moved without any record
+ *   of who moved it, when, or why - and could even be moved below the figure its
+ *   own inspection history proves. The counters are now a derived cache of this
+ *   ledger (see src/lib/production-ledger.ts): every quantity is the sum of the
+ *   events that produced it, and a correction is itself an event with a reason.
+ *
+ * TWO DELIBERATE DESIGN CHOICES FOR TASK 3
+ *   1. `event_type` is DATA, not a closed enum in code. Task 3 adds
+ *      SENT_EXTERNAL / RETURNED_EXTERNAL / ACCEPTED_RETURN / RECEIVED_READYMADE /
+ *      MATERIAL_ISSUED to the same table instead of building a second ledger.
+ *   2. `stage` is stored on every row. Stage identity therefore never depends on
+ *      a row's position in a global eight-element array, which is what lets a
+ *      route position replace that array index when garments stop following the
+ *      same eight stages.
+ *
+ * Rows are never updated and never deleted. `source` distinguishes events
+ * recorded as they happened ('LIVE') from rows reconstructed by the 0006
+ * backfill for production that predates the ledger ('INFERRED').
+ */
+export const productionMovements = pgTable("production_movements", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productionOperationId: integer("production_operation_id")
+    .references(() => productionOperations.id, { onDelete: "cascade" })
+    .notNull(),
+  // Denormalised so a whole batch's history is one indexed lookup.
+  productionBatchId: integer("production_batch_id")
+    .references(() => productionBatches.id, { onDelete: "cascade" })
+    .notNull(),
+  stage: text("stage").notNull(),
+  eventType: text("event_type").notNull(),
+  /** Signed where a correction can reduce a quantity; never null. */
+  quantity: integer("quantity").notNull().default(0),
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }),
+  actorUserId: integer("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  actorName: text("actor_name").notNull(),
+  source: text("source").notNull().default("LIVE"),
+  /** The row that caused this event, e.g. referenceType 'STAGE_INSPECTION'. */
+  referenceType: text("reference_type"),
+  referenceId: integer("reference_id"),
+  /** Required for corrections and reassignments: the human reason. */
+  reason: text("reason"),
+  notes: text("notes"),
+  occurredAt: timestamp("occurred_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("production_movements_operation_id_idx").on(table.productionOperationId),
+    index("production_movements_batch_id_idx").on(table.productionBatchId),
+    index("production_movements_event_type_idx").on(table.eventType),
+    index("production_movements_occurred_at_idx").on(table.occurredAt),
+  ]
+);

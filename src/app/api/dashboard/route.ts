@@ -15,13 +15,15 @@ import {
   stageInspections,
   products,
 } from "@/db/schema";
-import { desc } from "drizzle-orm";
+import { desc, gt, sql } from "drizzle-orm";
 import { batchProgress } from "@/lib/server";
 import { workerAccruals, buildGrowth, currentMonth } from "@/lib/payroll";
 import { guard, getSessionUser, ANYONE } from "@/lib/authz";
 import { getWorkerDashboard } from "@/lib/worker-dashboard";
-
-const STAGES = ["CUTTING", "SEWING", "MONOGRAMMING", "BUTTONHOLE", "BUTTON_TACKING", "IRONING", "PACKING", "DELIVERY"];
+import { batchApprovedProgress } from "@/lib/server";
+// One definition of stage order, shared with api/inspections, api/reports and
+// Settings. This file used to keep its own private copy of the array.
+import { STAGES } from "@/lib/format";
 
 export async function GET(req: Request) {
   const denied = await guard(req, ANYONE);
@@ -50,24 +52,60 @@ export async function GET(req: Request) {
       expenseRows,
       paymentRows,
       materialRows,
-      purchaseRows,
+      purchaseTotalRows,
       usageRows,
-      inspectionRows,
+      recentInspectionRows,
+      reworkInspectionRows,
       productRows,
     ] = await Promise.all([
-      db.select().from(orders).orderBy(desc(orders.createdAt)),
-      db.select().from(customers),
-      db.select().from(orderItems),
-      db.select().from(productionBatches),
+      // Every one of these used to be `select()` - a whole row of every table in
+      // the business, most of whose columns this route never reads. Each now asks
+      // for exactly the columns it uses, and the two "recent" lists and the
+      // material total are resolved by the database instead of by downloading the
+      // table and slicing it in Node.
+      db.select({
+        id: orders.id, orderNumber: orders.orderNumber, status: orders.status,
+        orderDate: orders.orderDate, dueDate: orders.dueDate, totalAmount: orders.totalAmount,
+        balance: orders.balance, customerId: orders.customerId, createdAt: orders.createdAt,
+      }).from(orders).orderBy(desc(orders.createdAt)),
+      db.select({ id: customers.id, name: customers.name }).from(customers),
+      db.select({
+        id: orderItems.id, orderId: orderItems.orderId,
+        productId: orderItems.productId, quantity: orderItems.quantity,
+      }).from(orderItems),
+      db.select({
+        id: productionBatches.id, orderId: productionBatches.orderId, orderItemId: productionBatches.orderItemId,
+        batchNumber: productionBatches.batchNumber, quantity: productionBatches.quantity,
+        size: productionBatches.size, color: productionBatches.color, status: productionBatches.status,
+      }).from(productionBatches),
       db.select().from(productionOperations),
-      db.select().from(workers),
-      db.select().from(expenses).orderBy(desc(expenses.expenseDate)),
-      db.select().from(payments).orderBy(desc(payments.paymentDate)),
-      db.select().from(materials),
-      db.select().from(materialPurchases),
-      db.select().from(materialUsage),
-      db.select().from(stageInspections).orderBy(desc(stageInspections.inspectedAt)),
-      db.select().from(products),
+      db.select({
+        id: workers.id, name: workers.name, specialty: workers.specialty, status: workers.status,
+      }).from(workers),
+      db.select({
+        id: expenses.id, description: expenses.description, category: expenses.category,
+        amount: expenses.amount, expenseDate: expenses.expenseDate, orderId: expenses.orderId,
+      }).from(expenses).orderBy(desc(expenses.expenseDate)),
+      // Only the five most recent payments are ever shown.
+      db.select({
+        id: payments.id, amount: payments.amount, paymentDate: payments.paymentDate,
+        paymentMethod: payments.paymentMethod, reference: payments.reference, orderId: payments.orderId,
+      }).from(payments).orderBy(desc(payments.paymentDate)).limit(5),
+      db.select({
+        id: materials.id, name: materials.name, unit: materials.unit,
+        currentStock: materials.currentStock, reorderLevel: materials.reorderLevel, unitCost: materials.unitCost,
+      }).from(materials),
+      // A single number, so a single aggregate: this was a full scan of every
+      // purchase ever made just to add one column up.
+      db.select({ total: sql<number>`coalesce(sum(${materialPurchases.totalCost}), 0)` }).from(materialPurchases),
+      db.select({ usedAt: materialUsage.usedAt, totalCost: materialUsage.totalCost }).from(materialUsage),
+      // Six recent inspections, and six needing rework - not every inspection ever
+      // recorded. At the measured scale this table held 15,638 rows and both lists
+      // were produced by downloading all of them.
+      db.select().from(stageInspections).orderBy(desc(stageInspections.inspectedAt)).limit(6),
+      db.select().from(stageInspections).where(gt(stageInspections.quantityRework, 0))
+        .orderBy(desc(stageInspections.inspectedAt)).limit(6),
+      db.select({ id: products.id, name: products.name }).from(products),
     ]);
     const productMap = new Map(productRows.map((p) => [p.id, p]));
     const itemMap = new Map(itemRows.map((i) => [i.id, i]));
@@ -104,7 +142,7 @@ export async function GET(req: Request) {
 
     const revenue = orderRows.reduce((s, o) => s + (o.totalAmount ?? 0), 0);
     const expenseTotal = expenseRows.reduce((s, e) => s + (e.amount ?? 0), 0);
-    const materialCost = purchaseRows.reduce((s, p) => s + (p.totalCost ?? 0), 0);
+    const purchaseCost = Number(purchaseTotalRows[0]?.total ?? 0);
     const usageCost = usageRows.reduce((s, u) => s + (u.totalCost ?? 0), 0);
     const outstanding = orderRows
       .filter((o) => o.status !== "CANCELLED")
@@ -130,6 +168,10 @@ export async function GET(req: Request) {
       const os = opsByBatch.get(b.id) ?? [];
       return {
         progress: batchProgress(os, b.quantity ?? 0),
+        // Progress measured on APPROVED pieces, not merely submitted ones. The
+        // submitted figure counts work nobody has accepted yet, so it can read
+        // 100% on a batch that has failed every inspection.
+        approvedProgress: batchApprovedProgress(os, b.quantity ?? 0),
         approved: os.reduce((s: number, o: any) => s + (o.quantityApproved ?? 0), 0),
       };
     }
@@ -139,6 +181,15 @@ export async function GET(req: Request) {
       );
       if (batches.length === 0) return 0;
       const ps = batches.map((b) => batchCounts(b).progress);
+      return ps.reduce((a, b) => a + b, 0) / ps.length;
+    }
+    /** The same roll-up, on approved pieces only. */
+    function orderApprovedProgress(orderId: number): number {
+      const batches = (batchesByOrder.get(orderId) ?? []).filter(
+        (b) => !(b.status === "CANCELLED" && batchCounts(b).approved === 0)
+      );
+      if (batches.length === 0) return 0;
+      const ps = batches.map((b) => batchCounts(b).approvedProgress);
       return ps.reduce((a, b) => a + b, 0) / ps.length;
     }
     const qtyByOrder = new Map<number, number>();
@@ -180,7 +231,7 @@ export async function GET(req: Request) {
         pendingInspection: Math.max(0, (o.quantityCompleted ?? 0) - (o.quantityInspected ?? 0)),
       };
     };
-    const inspectionContext = (i: typeof inspectionRows[number]) => {
+    const inspectionContext = (i: typeof recentInspectionRows[number]) => {
       const op = opMap.get(i.productionOperationId);
       const batch = op ? batchMap.get(op.productionBatchId) : undefined;
       const order = batch ? orderMap.get(batch.orderId) : undefined;
@@ -248,8 +299,8 @@ export async function GET(req: Request) {
         workerActivity,
         inspection: {
           awaiting,
-          recentApproved: inspectionRows.slice(0, 6).map(inspectionContext),
-          reworkRequired: inspectionRows.filter((i) => i.quantityRework > 0).slice(0, 6).map(inspectionContext),
+          recentApproved: recentInspectionRows.map(inspectionContext),
+          reworkRequired: reworkInspectionRows.map(inspectionContext),
         },
       });
     }
@@ -269,6 +320,7 @@ export async function GET(req: Request) {
       balance: o.balance,
       quantity: qtyByOrder.get(o.id) ?? 0,
       progress: Math.round(orderProgress(o.id)),
+      approvedProgress: Math.round(orderApprovedProgress(o.id)),
     }));
 
     const nearDeadline = orderRows
@@ -282,6 +334,7 @@ export async function GET(req: Request) {
         dueDate: o.dueDate,
         status: o.status,
         progress: Math.round(orderProgress(o.id)),
+        approvedProgress: Math.round(orderApprovedProgress(o.id)),
       }));
 
     const tasks = opRows
@@ -312,7 +365,7 @@ export async function GET(req: Request) {
         delayed,
         revenue,
         expenseTotal,
-        materialCost,
+        materialCost: purchaseCost,
         outstanding,
         profit,
         totalCost,
@@ -355,7 +408,7 @@ export async function GET(req: Request) {
         orderNumber: orderMap.get(p.orderId)?.orderNumber ?? "-",
         customer: customerMap.get(orderMap.get(p.orderId)?.customerId ?? -1)?.name ?? "-",
       })),
-      recentInspections: inspectionRows.slice(0, 6).map(inspectionContext),
+      recentInspections: recentInspectionRows.map(inspectionContext),
       inspectionQueue: opRows
         .filter((o) => (o.quantityCompleted ?? 0) > (o.quantityInspected ?? 0) && o.status !== "CANCELLED")
         .map(opContext)

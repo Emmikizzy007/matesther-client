@@ -45,8 +45,12 @@ export default function SupportWorkPage() {
   function fetchAll() {
     return Promise.all([
       fetch("/api/support-work", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
-      fetch("/api/operations", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
+      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
+      // This page only offers a dropdown of jobs support work can be attached to,
+      // so it asks for active jobs only. It used to download every production job
+      // in the system - measured at 14,593 rows and 11 MB - to populate a <select>
+      // that can only ever show the active ones.
+      fetch("/api/operations?status=PENDING,IN_PROGRESS,SUBMITTED&limit=1000", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
     ]);
   }
 

@@ -30,7 +30,7 @@ export default function AssignProductionPage() {
     try {
       const [orderResponse, workerResponse, accessResponse] = await Promise.all([
         fetch("/api/production-orders", { cache: "no-store" }),
-        fetch("/api/workers", { cache: "no-store" }),
+        fetch("/api/workers?view=slim", { cache: "no-store" }),
         fetch("/api/production-access", { cache: "no-store" }),
       ]);
       const [orderData, workerData, accessData] = await Promise.all([orderResponse.json(), workerResponse.json(), accessResponse.json()]);

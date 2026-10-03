@@ -100,3 +100,26 @@ export function batchProgress(
   const done = ops.reduce((s, o) => s + (o.quantityCompleted ?? 0), 0);
   return Math.min(100, (done / (batchQty * ops.length)) * 100);
 }
+
+/**
+ * The same roll-up measured on APPROVED pieces.
+ *
+ * `batchProgress` counts work a worker has SUBMITTED, which nobody has accepted
+ * yet - so a batch where every piece failed inspection can still read as
+ * complete. This is the figure that answers "how much of this batch has actually
+ * been made and signed off", and it is what the dashboard's approved progress
+ * reports. Both are returned, so the difference between "submitted" and
+ * "accepted" stays visible rather than being averaged away.
+ *
+ * Dividing by `batchQty * ops.length` means a batch with fewer stages than the
+ * full eight still computes correctly, which is what lets a garment follow a
+ * shorter route later without this function changing.
+ */
+export function batchApprovedProgress(
+  ops: { quantityApproved: number | null }[],
+  batchQty: number
+): number {
+  if (!batchQty || batchQty <= 0 || ops.length === 0) return 0;
+  const done = ops.reduce((s, o) => s + (o.quantityApproved ?? 0), 0);
+  return Math.min(100, (done / (batchQty * ops.length)) * 100);
+}

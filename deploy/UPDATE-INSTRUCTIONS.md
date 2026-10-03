@@ -57,4 +57,21 @@ After deploying:
 
 The same change is recorded for the ORM as `drizzle/0005_support_work_and_payroll.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
 
+## Release: production movement ledger, indexes and quantity integrity
+
+1. **Back up the client database first.**
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-production-ledger.sql` and Run. It is additive and repeatable. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, and no change to any existing column's type or meaning. The only writes are `INSERT`s into the brand-new `production_movements` table, and each is guarded so a second run inserts nothing.
+3. **Read the NOTICE and WARNING output.** The two new unique indexes are pre-flighted for existing duplicates. If a duplicate exists the index is *skipped* and the offending ids are reported — nothing is deleted to make it fit. Run verification queries **V1** and **V2** at the bottom of the file, decide with the business which row is real, then re-run the file.
+4. **Run verification query V3 (the drift check) before deploying the code.** Any row it returns is a quantity counter that disagrees with the ledger behind it — that is, a figure that was changed in the past without an event. V3 changes nothing; it only reports.
+5. Only then deploy the new application code. **SQL first, code second.** The new code refuses free-text quantity edits on `PUT /api/operations` and writes to `production_movements`, so deploying it before this file would fail.
+
+### What changes for the people using the system
+
+- The **Qty received / Qty submitted / Qty rejected** boxes are gone from the production job modal and the order page. Those figures are now shown, not typed, because each is the sum of the events that produced it.
+- A stage receives **only** what the previous stage approved. That was already the intent; it can no longer be bypassed by typing a larger number.
+- A real mis-count is still correctable, through a recorded correction that stores who made it, when, and the written reason. Approved quantity is **never** correctable — it only moves through an inspection by someone other than the person who did the work.
+- The Production board now pages 200 jobs at a time with a "Load more" control, and its stage filter is applied by the database.
+
+The same change is recorded for the ORM as `drizzle/0006_production_ledger_and_indexes.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path. Note that the `deploy/` file additionally pre-flights the unique indexes, which the `drizzle/` file does not.
+
 **Never run `deploy/full-setup.sql` or `deploy/schema-only.sql` on an existing client project.** Those files are for brand-new empty databases; `full-setup.sql` contains a destructive demo-data reset.

@@ -17,7 +17,7 @@
  *
  * ONE DELIBERATE DEVIATION, DOCUMENTED
  *   pg-mem has no plpgsql interpreter, so it cannot execute `DO $$ ... $$`
- *   guard blocks. Migrations 0003, 0004 and 0005 each wrap their ADD CONSTRAINT
+ *   guard blocks. Migrations 0003, 0004, 0005 and 0006 each wrap their ADD CONSTRAINT
  *   statements in such a block purely so the migration is re-runnable. Because
  *   this database is always created empty, those guards could never fire, so the
  *   statements inside are executed directly. The resulting schema is identical.
@@ -57,6 +57,7 @@ const MIGRATIONS = [
   "0003_catchup_live_schema",
   "0004_worker_roles",
   "0005_support_work_and_payroll",
+  "0006_production_ledger_and_indexes",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 
@@ -98,6 +99,11 @@ const REQUIRED_COLUMNS = [
   ["worker_overtime", "category"],
   ["worker_payments", "idempotency_key"],
   ["workers", "department"],
+  // Fails loudly if migration 0006 was not applied: the production movement
+  // ledger is the source of truth for every derived quantity counter.
+  ["production_movements", "event_type"],
+  ["production_movements", "source"],
+  ["production_movements", "stage"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);

@@ -43,6 +43,17 @@ export function daysUntil(dateStr: string | null | undefined): number | null {
  * MONOGRAMMING / EMBROIDERY is a separate, fully tracked stage
  * because nearly every uniform carries a school/company logo.
  */
+/**
+ * The production stages, in order.
+ *
+ * SINGLE SOURCE OF TRUTH. api/inspections, api/dashboard, api/reports and the
+ * Settings page each used to keep their own private copy of this list, so the
+ * four could drift apart. They now all import this one.
+ *
+ * Task 3 turns this into a per-garment ROUTE: not every product passes through
+ * every stage, so a route will select and order a subset of these values. Until
+ * then this array is the default route that every batch already follows.
+ */
 export const STAGES = [
   "CUTTING",
   "SEWING",
@@ -171,7 +182,40 @@ export const STAGE_ROLES: Record<string, string> = {
   BUTTON_TACKING: "Button Tacking",
   IRONING: "Ironer",
   PACKING: "Packer",
+  // DELIVERY was missing, so the gate in PUT /api/operations
+  // (`if (person && STAGE_ROLES[stage])`) was falsy for it and ANY active worker
+  // could be assigned to the delivery stage. Both the Production board and the
+  // order page already showed "Packer" for it, so this makes the server agree
+  // with what the UI has always claimed.
+  DELIVERY: "Packer",
 };
+
+/** Position of a stage in the default route, or -1 when it is not one. */
+export function stageIndex(stage: string | null | undefined): number {
+  return stage ? (STAGES as readonly string[]).indexOf(stage) : -1;
+}
+
+/**
+ * The stage that follows `stage` in the default route, or null at the end.
+ *
+ * POST /api/inspections uses this to move approved pieces forward. Task 3
+ * replaces the argument with a garment's own route; the call sites stay the same.
+ */
+export function nextStage(stage: string | null | undefined): string | null {
+  const index = stageIndex(stage);
+  if (index < 0 || index >= STAGES.length - 1) return null;
+  return STAGES[index + 1];
+}
+
+/**
+ * The stage that precedes `stage` in the default route, or null at the start.
+ * Used to bound a correction: a stage may never hold more than the stage before
+ * it actually approved.
+ */
+export function previousStage(stage: string | null | undefined): string | null {
+  const index = stageIndex(stage);
+  return index > 0 ? STAGES[index - 1] : null;
+}
 
 /** True when a role is one of the production-stage roles. */
 export function isProductionRole(role: string | null | undefined): boolean {

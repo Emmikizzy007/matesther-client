@@ -8,42 +8,110 @@ import {
   customers,
   workers,
 } from "@/db/schema";
-import { eq, and, desc } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE, STAFF } from "@/lib/authz";
+import { nextStage } from "@/lib/format";
+import { MOVEMENT_EVENTS, applyMovements } from "@/lib/production-ledger";
 
 /**
- * GET /api/inspections?operationId=&orderId=
+ * GET /api/inspections?operationId=&orderId=&limit=
  * Inspection audit trail (never overwritten - every inspection is a row).
+ *
+ * FILTERING NOW HAPPENS IN SQL. This route used to fetch the whole
+ * `stage_inspections` table, the whole `production_operations` table, every
+ * batch, every order, every customer and every worker, join them in JavaScript
+ * and only THEN apply `operationId` / `orderId` / the worker's own scope.
+ *
+ * That also had a correctness consequence worth stating: `limit(100)` was applied
+ * BEFORE those filters, so a filtered request could return far fewer than 100
+ * rows - or none at all - even when plenty of matching inspections existed. The
+ * limit is now applied last, to the filtered set.
  */
 export async function GET(req: Request) {
   const __g = await guard(req, ANYONE);
   if (__g) return __g;
   const __user = await getSessionUser(req);
-  if (__user?.role === "WORKER" && (await getLinkedWorkerId(__user)) === null)
+  if (!__user) return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
+  const myWorkerId = __user.role === "WORKER" ? await getLinkedWorkerId(__user) : null;
+  if (__user.role === "WORKER" && myWorkerId === null)
     return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
   try {
     const { searchParams } = new URL(req.url);
-    const operationId = searchParams.get("operationId");
-    const orderId = searchParams.get("orderId");
-    const limit = Number(searchParams.get("limit") || 100);
+    const operationId = searchParams.get("operationId") ? Number(searchParams.get("operationId")) : null;
+    const orderId = searchParams.get("orderId") ? Number(searchParams.get("orderId")) : null;
+    const rawLimit = Number(searchParams.get("limit") || 100);
+    const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 500) : 100;
 
-    const [rows, ops, batches, orderRows, customerRows, workerRows] =
-      await Promise.all([
-        db.select().from(stageInspections).orderBy(desc(stageInspections.inspectedAt)).limit(limit),
-        db.select().from(productionOperations),
-        db.select().from(productionBatches),
-        db.select().from(orders),
-        db.select().from(customers),
-        db.select().from(workers),
-      ]);
+    // Restrict to a set of operations, resolved with indexed lookups. Each
+    // active filter contributes one candidate list and the result is their
+    // intersection, so the narrowing happens in SQL rather than in Node.
+    const scopes: number[][] = [];
+    if (operationId) scopes.push([operationId]);
+    if (__user.role === "WORKER") {
+      // Workers only see inspection history on their own jobs.
+      const own = await db
+        .select({ id: productionOperations.id })
+        .from(productionOperations)
+        .where(eq(productionOperations.workerId, myWorkerId!));
+      scopes.push(own.map((row) => row.id));
+    }
+    if (orderId) {
+      const forOrder = await db
+        .select({ id: productionOperations.id })
+        .from(productionOperations)
+        .innerJoin(productionBatches, eq(productionBatches.id, productionOperations.productionBatchId))
+        .where(eq(productionBatches.orderId, orderId));
+      scopes.push(forOrder.map((row) => row.id));
+    }
+    const scopeIds = scopes.length ? scopes.reduce((left, right) => left.filter((id) => right.includes(id))) : null;
+    if (scopeIds !== null && scopeIds.length === 0)
+      return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
+
+    const rows = await db
+      .select()
+      .from(stageInspections)
+      .where(scopeIds === null ? undefined : inArray(stageInspections.productionOperationId, scopeIds))
+      .orderBy(desc(stageInspections.inspectedAt), desc(stageInspections.id))
+      .limit(limit);
+    if (!rows.length) return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
+
+    // Enrich only the rows being returned, one indexed lookup per relation.
+    const opIds = [...new Set(rows.map((row) => row.productionOperationId))];
+    const ops = await db
+      .select({
+        id: productionOperations.id, stage: productionOperations.stage, workerId: productionOperations.workerId,
+        productionBatchId: productionOperations.productionBatchId,
+      })
+      .from(productionOperations)
+      .where(inArray(productionOperations.id, opIds));
     const opMap = new Map(ops.map((o) => [o.id, o]));
+    const batchIds = [...new Set(ops.map((o) => o.productionBatchId))];
+    const batches = batchIds.length
+      ? await db
+          .select({ id: productionBatches.id, batchNumber: productionBatches.batchNumber, orderId: productionBatches.orderId })
+          .from(productionBatches).where(inArray(productionBatches.id, batchIds))
+      : [];
     const bMap = new Map(batches.map((b) => [b.id, b]));
+    const orderIds = [...new Set(batches.map((b) => b.orderId))];
+    const orderRows = orderIds.length
+      ? await db
+          .select({ id: orders.id, orderNumber: orders.orderNumber, customerId: orders.customerId })
+          .from(orders).where(inArray(orders.id, orderIds))
+      : [];
     const oMap = new Map(orderRows.map((o) => [o.id, o]));
+    const customerIds = [...new Set(orderRows.map((o) => o.customerId).filter((v): v is number => !!v))];
+    const customerRows = customerIds.length
+      ? await db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
+      : [];
     const cMap = new Map(customerRows.map((c) => [c.id, c]));
+    const workerIds = [...new Set(ops.map((o) => o.workerId).filter((v): v is number => !!v))];
+    const workerRows = workerIds.length
+      ? await db.select({ id: workers.id, name: workers.name }).from(workers).where(inArray(workers.id, workerIds))
+      : [];
     const wMap = new Map(workerRows.map((w) => [w.id, w]));
 
-    let data = rows.map((r) => {
+    const data = rows.map((r) => {
       const op = opMap.get(r.productionOperationId);
       const batch = op ? bMap.get(op.productionBatchId) : undefined;
       const order = batch ? oMap.get(batch.orderId) : undefined;
@@ -57,14 +125,7 @@ export async function GET(req: Request) {
         workerName: op?.workerId ? wMap.get(op.workerId)?.name ?? null : null,
       };
     });
-    // Workers only see inspection history on their own jobs
-    if (__user?.role === "WORKER") {
-      const __wid = await getLinkedWorkerId(__user);
-      data = data.filter((d: any) => opMap.get(d.productionOperationId)?.workerId === __wid);
-    }
-    if (operationId) data = data.filter((d) => d.productionOperationId === Number(operationId));
-    if (orderId) data = data.filter((d) => d.orderId === Number(orderId));
-    return NextResponse.json(data);
+    return NextResponse.json(data, { headers: { "Cache-Control": "private, no-store" } });
   } catch (e: any) {
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }
@@ -78,6 +139,14 @@ export async function GET(req: Request) {
  * - total inspected may not exceed pieces still awaiting inspection
  * - only APPROVED pieces flow to the next production stage
  * - rework pieces return to the worker; rejected pieces stay recorded
+ *
+ * ATOMIC AND LEDGER-BACKED. The inspection row, the counters it produces and the
+ * quantity that flows to the next stage are written in ONE transaction. Before
+ * this they were five separate writes, so two supervisors inspecting the same job
+ * at the same moment could each read the same `quantity_approved` and one
+ * approval would be lost. The counters themselves are now derived from the
+ * production movement ledger, so the audit trail and the figures it produced can
+ * never disagree.
  */
 export async function POST(req: Request) {
   const __g = await guard(req, STAFF);
@@ -125,65 +194,88 @@ export async function POST(req: Request) {
         { status: 400 }
       );
 
-    // 1. Record the inspection (audit trail)
-    await db.insert(stageInspections).values({
-      productionOperationId: opId,
-      inspectedBy: inspector.name,
-      pieceRate: agreedRate,
-      quantityApproved: approved,
-      quantityRework: rework,
-      quantityRejected: rejected,
-      notes: b.notes || null,
-    });
+    const actor = { userId: inspector.id, name: inspector.name };
+    const updated = await db.transaction(async (tx) => {
+      // 1. Record the inspection (audit trail) and the ledger rows it implies,
+      //    so the counters and their evidence are written together.
+      const [recorded] = await tx.insert(stageInspections).values({
+        productionOperationId: opId,
+        inspectedBy: inspector.name,
+        pieceRate: agreedRate,
+        quantityApproved: approved,
+        quantityRework: rework,
+        quantityRejected: rejected,
+        notes: b.notes || null,
+      }).returning({ id: stageInspections.id });
 
-    // 2. Update stage counters
-    const newApproved = (op.quantityApproved ?? 0) + approved;
-    const newRemaining = Math.max(0, (op.quantityReceived ?? 0) - newApproved - (op.quantityRejected ?? 0) - rejected);
-    const uninspected = (op.quantityCompleted ?? 0) - (op.quantityInspected ?? 0) - total;
-    const status =
-      newRemaining <= 0
-        ? "COMPLETED"
-        : uninspected > 0
-          ? "SUBMITTED"
-          : "IN_PROGRESS";
+      // 2. Stage counters are DERIVED from the ledger, not incremented by hand.
+      const derived = await applyMovements(tx, op, actor, [
+        { type: MOVEMENT_EVENTS.INSPECTION_APPROVED, quantity: approved, workerId: op.workerId,
+          referenceType: "STAGE_INSPECTION", referenceId: recorded.id,
+          reason: "Inspection approved these pieces", notes: b.notes || null, occurredAt: new Date() },
+        { type: MOVEMENT_EVENTS.INSPECTION_REWORK, quantity: rework, workerId: op.workerId,
+          referenceType: "STAGE_INSPECTION", referenceId: recorded.id,
+          reason: "Inspection sent these pieces back for rework", notes: b.notes || null, occurredAt: new Date() },
+        { type: MOVEMENT_EVENTS.INSPECTION_REJECTED, quantity: rejected, workerId: op.workerId,
+          referenceType: "STAGE_INSPECTION", referenceId: recorded.id,
+          reason: "Inspection rejected these pieces", notes: b.notes || null, occurredAt: new Date() },
+      ]);
 
-    const [updated] = await db
-      .update(productionOperations)
-      .set({
-        quantityInspected: (op.quantityInspected ?? 0) + total,
-        quantityApproved: newApproved,
-        quantityRework: (op.quantityRework ?? 0) + rework,
-        quantityRejected: (op.quantityRejected ?? 0) + rejected,
-        quantityRemaining: newRemaining,
-        inspector: inspector.name,
-        inspectedAt: new Date(),
-        status,
-        completedAt: newRemaining <= 0 ? op.completedAt ?? new Date() : null,
-      })
-      .where(eq(productionOperations.id, opId))
-      .returning();
+      const newApproved = derived.quantityApproved;
+      const newRemaining = derived.quantityRemaining;
+      const uninspected = derived.quantityCompleted - derived.quantityInspected;
+      const status =
+        newRemaining <= 0
+          ? "COMPLETED"
+          : uninspected > 0
+            ? "SUBMITTED"
+            : "IN_PROGRESS";
+      const [row] = await tx
+        .update(productionOperations)
+        .set({
+          inspector: inspector.name,
+          inspectedAt: new Date(),
+          status,
+          completedAt: newRemaining <= 0 ? op.completedAt ?? new Date() : null,
+        })
+        .where(eq(productionOperations.id, opId))
+        .returning();
 
-    // 3. Only approved pieces move to the next stage
-    const STAGE_ORDER = ["CUTTING", "SEWING", "MONOGRAMMING", "BUTTONHOLE", "BUTTON_TACKING", "IRONING", "PACKING", "DELIVERY"];
-    if (approved > 0) {
-      const idx = STAGE_ORDER.indexOf(op.stage);
-      if (idx >= 0 && idx < STAGE_ORDER.length - 1) {
-        const siblings = await db
-          .select()
-          .from(productionOperations)
-          .where(eq(productionOperations.productionBatchId, op.productionBatchId));
-        const next = siblings.find((s) => s.stage === STAGE_ORDER[idx + 1]);
-        if (next && newApproved > (next.quantityReceived ?? 0)) {
-          await db
-            .update(productionOperations)
-            .set({
-              quantityReceived: newApproved,
-              quantityRemaining: Math.max(0, newApproved - (next.quantityApproved ?? 0) - (next.quantityRejected ?? 0)),
-            })
-            .where(eq(productionOperations.id, next.id));
+      // 3. Only approved pieces move to the next stage.
+      //
+      // `nextStage()` replaces this file's private copy of the eight-stage array,
+      // so there is now ONE definition of stage order. It stays monotonic: the
+      // next stage's received figure can only ever rise to the amount actually
+      // approved here, and it is written as a ledger delta rather than an
+      // overwrite, so the flow is itself auditable.
+      if (approved > 0) {
+        const following = nextStage(op.stage);
+        if (following) {
+          const [next] = await tx
+            .select()
+            .from(productionOperations)
+            .where(
+              and(
+                eq(productionOperations.productionBatchId, op.productionBatchId),
+                eq(productionOperations.stage, following)
+              )
+            )
+            .limit(1);
+          if (next) {
+            const flow = newApproved - (next.quantityReceived ?? 0);
+            if (flow > 0) {
+              await applyMovements(tx, next, actor, [
+                { type: MOVEMENT_EVENTS.STAGE_RECEIPT, quantity: flow, workerId: next.workerId,
+                  referenceType: "PRODUCTION_OPERATION", referenceId: op.id,
+                  reason: `${flow} piece(s) approved at ${op.stage} and released to ${following}`,
+                  occurredAt: new Date() },
+              ]);
+            }
+          }
         }
       }
-    }
+      return row;
+    });
 
     await refreshBatchAndOrder(op.productionBatchId);
     return NextResponse.json(updated, { status: 201 });

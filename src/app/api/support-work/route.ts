@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
+import { desc, eq, inArray, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   supportAssignments,
@@ -28,27 +28,96 @@ export const dynamic = "force-dynamic";
  */
 
 /** GET /api/support-work - a Worker sees only support work they are part of. */
+/**
+ * GET /api/support-work?limit=&offset=
+ *
+ * Support work handed from a tailor to a helper. A tailor signs in as a Worker,
+ * so a Worker needs both sides of the record: work handed TO them, and work THEY
+ * handed out for inspection.
+ *
+ * This used to read eight whole tables - every support assignment, every worker,
+ * every order, every customer, every production operation, every batch, every
+ * order item and every product - and join them in JavaScript. At the measured
+ * scale that was 20,064 rows read to return 750. The worker's own scope is now a
+ * WHERE clause, and only the rows being returned are enriched.
+ */
 export async function GET(req: Request) {
   const denied = await guard(req, ANYONE);
   if (denied) return denied;
   try {
     const session = await getSessionUser(req);
     if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
-    // A tailor signs in as a Worker, so a Worker needs both sides of the record:
-    // work handed to them, and work they handed out for inspection.
     const myWorkerId = session.role === "WORKER" ? await getLinkedWorkerId(session) : null;
+    if (session.role === "WORKER" && myWorkerId === null)
+      return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
 
-    const [assignments, people, orderRows, customerRows, ops, batches, items, garments] =
-      await Promise.all([
-        db.select().from(supportAssignments),
-        db.select().from(workers),
-        db.select().from(orders),
-        db.select().from(customers),
-        db.select().from(productionOperations),
-        db.select().from(productionBatches),
-        db.select().from(orderItems),
-        db.select().from(products),
-      ]);
+    const query = new URL(req.url).searchParams;
+    const rawLimit = query.get("limit") ? Number(query.get("limit")) : NaN;
+    const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : null;
+    const rawOffset = query.get("offset") ? Number(query.get("offset")) : 0;
+    const offset = Number.isSafeInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
+    // A Worker's scope cannot be widened by a query string.
+    const scope = myWorkerId !== null
+      ? or(eq(supportAssignments.workerId, myWorkerId), eq(supportAssignments.assignedByWorkerId, myWorkerId))
+      : undefined;
+
+    const [totalRow] = await db
+      .select({ total: sql<number>`count(*)` })
+      .from(supportAssignments)
+      .where(scope);
+
+    const builder = db
+      .select()
+      .from(supportAssignments)
+      .where(scope)
+      // Newest first, which is the order the previous JavaScript sort produced.
+      // The id tiebreaker keeps paging stable for rows created in the same instant.
+      .orderBy(desc(supportAssignments.createdAt), supportAssignments.id);
+    const assignments = await (limit !== null ? builder.limit(limit).offset(offset) : builder);
+    if (!assignments.length)
+      return NextResponse.json([], {
+        headers: { "Cache-Control": "private, no-store", "X-Total-Count": String(Number(totalRow?.total ?? 0)) },
+      });
+
+    // Enrich only what is on this page.
+    const personIds = [...new Set(assignments.flatMap((row) =>
+      [row.workerId, row.assignedByWorkerId, row.approvedByWorkerId].filter((v): v is number => !!v)))];
+    const opIds = [...new Set(assignments.map((row) => row.productionOperationId).filter((v): v is number => !!v))];
+    const orderIds = [...new Set(assignments.map((row) => row.orderId).filter((v): v is number => !!v))];
+
+    const [people, ops, orderRows] = await Promise.all([
+      personIds.length
+        ? db.select({ id: workers.id, name: workers.name }).from(workers).where(inArray(workers.id, personIds))
+        : Promise.resolve([] as { id: number; name: string }[]),
+      opIds.length
+        ? db.select({ id: productionOperations.id, stage: productionOperations.stage, productionBatchId: productionOperations.productionBatchId })
+            .from(productionOperations).where(inArray(productionOperations.id, opIds))
+        : Promise.resolve([] as { id: number; stage: string; productionBatchId: number }[]),
+      orderIds.length
+        ? db.select({ id: orders.id, orderNumber: orders.orderNumber, customerId: orders.customerId })
+            .from(orders).where(inArray(orders.id, orderIds))
+        : Promise.resolve([] as { id: number; orderNumber: string; customerId: number | null }[]),
+    ]);
+    const batchIds = [...new Set(ops.map((op) => op.productionBatchId))];
+    const customerIds = [...new Set(orderRows.map((order) => order.customerId).filter((v): v is number => !!v))];
+    const [batches, customerRows] = await Promise.all([
+      batchIds.length
+        ? db.select({ id: productionBatches.id, batchNumber: productionBatches.batchNumber, size: productionBatches.size, color: productionBatches.color, orderItemId: productionBatches.orderItemId })
+            .from(productionBatches).where(inArray(productionBatches.id, batchIds))
+        : Promise.resolve([] as { id: number; batchNumber: string; size: string | null; color: string | null; orderItemId: number | null }[]),
+      customerIds.length
+        ? db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
+        : Promise.resolve([] as { id: number; name: string }[]),
+    ]);
+    const itemIds = [...new Set(batches.map((batch) => batch.orderItemId).filter((v): v is number => !!v))];
+    const items = itemIds.length
+      ? await db.select({ id: orderItems.id, productId: orderItems.productId }).from(orderItems).where(inArray(orderItems.id, itemIds))
+      : [];
+    const productIds = [...new Set(items.map((item) => item.productId).filter((v): v is number => !!v))];
+    const garments = productIds.length
+      ? await db.select({ id: products.id, name: products.name }).from(products).where(inArray(products.id, productIds))
+      : [];
 
     const personById = new Map(people.map((person) => [person.id, person]));
     const orderById = new Map(orderRows.map((order) => [order.id, order]));
@@ -58,43 +127,38 @@ export async function GET(req: Request) {
     const itemById = new Map(items.map((item) => [item.id, item]));
     const productById = new Map(garments.map((garment) => [garment.id, garment]));
 
-    const rows = assignments
-      .filter(
-        (row) =>
-          !myWorkerId || row.workerId === myWorkerId || row.assignedByWorkerId === myWorkerId
-      )
-      .map((row) => {
-        const parent = row.productionOperationId ? opById.get(row.productionOperationId) : undefined;
-        const batch = parent ? batchById.get(parent.productionBatchId) : undefined;
-        const order = row.orderId ? orderById.get(row.orderId) : undefined;
-        const garment = batch?.orderItemId
-          ? productById.get(itemById.get(batch.orderItemId)?.productId ?? -1)
-          : undefined;
-        return {
-          ...row,
-          supportWorker: personById.get(row.workerId)?.name ?? "-",
-          assignedBy: personById.get(row.assignedByWorkerId)?.name ?? "-",
-          approvedBy: row.approvedByWorkerId ? personById.get(row.approvedByWorkerId)?.name ?? "-" : null,
-          orderNumber: order?.orderNumber ?? "-",
-          customer: order?.customerId ? customerById.get(order.customerId)?.name ?? "-" : "-",
-          stage: parent?.stage ?? null,
-          batchNumber: batch?.batchNumber ?? null,
-          size: batch?.size ?? null,
-          color: batch?.color ?? null,
-          garment: garment?.name ?? null,
-          pending: supportPending(row),
-        };
-      })
-      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0));
+    const rows = assignments.map((row) => {
+      const parent = row.productionOperationId ? opById.get(row.productionOperationId) : undefined;
+      const batch = parent ? batchById.get(parent.productionBatchId) : undefined;
+      const order = row.orderId ? orderById.get(row.orderId) : undefined;
+      const garment = batch?.orderItemId
+        ? productById.get(itemById.get(batch.orderItemId)?.productId ?? -1)
+        : undefined;
+      return {
+        ...row,
+        supportWorker: personById.get(row.workerId)?.name ?? "-",
+        assignedBy: personById.get(row.assignedByWorkerId)?.name ?? "-",
+        approvedBy: row.approvedByWorkerId ? personById.get(row.approvedByWorkerId)?.name ?? "-" : null,
+        orderNumber: order?.orderNumber ?? "-",
+        customer: order?.customerId ? customerById.get(order.customerId)?.name ?? "-" : "-",
+        stage: parent?.stage ?? null,
+        batchNumber: batch?.batchNumber ?? null,
+        size: batch?.size ?? null,
+        color: batch?.color ?? null,
+        garment: garment?.name ?? null,
+        pending: supportPending(row),
+      };
+    });
 
-    return NextResponse.json(rows, { headers: { "Cache-Control": "private, no-store" } });
+    return NextResponse.json(rows, {
+      headers: { "Cache-Control": "private, no-store", "X-Total-Count": String(Number(totalRow?.total ?? 0)) },
+    });
   } catch (error) {
     console.error("Support work load failed", error);
     return NextResponse.json({ error: "Unable to load support work." }, { status: 500 });
   }
 }
 
-/** POST /api/support-work - the parent tailor (or the Owner) hands work out. */
 export async function POST(req: Request) {
   const denied = await guard(req, ANYONE);
   if (denied) return denied;

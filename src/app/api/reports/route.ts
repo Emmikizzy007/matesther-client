@@ -15,6 +15,7 @@ import {
   expenses,
 } from "@/db/schema";
 import { inspectionEarnings } from "@/lib/job-pay";
+import { STAGES as SHARED_STAGES } from "@/lib/format";
 
 export async function GET(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
@@ -73,7 +74,9 @@ export async function GET(req: Request) {
     });
 
     // Production performance per stage (official 8-stage Matesther workflow)
-    const STAGES = ["CUTTING", "SEWING", "MONOGRAMMING", "BUTTONHOLE", "BUTTON_TACKING", "IRONING", "PACKING", "DELIVERY"];
+    // Shared with api/dashboard, api/inspections and Settings - this file used
+    // to keep its own private copy of the stage list.
+    const STAGES = SHARED_STAGES;
     const production = STAGES.map((stage) => {
       const sop = opRows.filter((o) => o.stage === stage);
       return {

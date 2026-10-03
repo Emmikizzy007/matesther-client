@@ -175,76 +175,114 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
     const { id } = await params;
     const orderId = Number(id);
     const b = await req.json();
-    // Update items in place - items linked to production batches keep their id
+    // Update items in place - items linked to production batches keep their id.
+    //
+    // The whole edit runs in ONE transaction. It used to be a sequence of
+    // independent writes, so a failure part-way through left an order with its
+    // items changed, its total recalculated, and an error returned to the client -
+    // a committed change nobody knew had happened. Now it either all applies or
+    // none of it does.
     if (b.items) {
-      const existingItems = await db
-        .select()
-        .from(orderItems)
-        .where(eq(orderItems.orderId, orderId));
-      const linkedItemIds = new Set(
-        (
-          await db
-            .select()
-            .from(productionBatches)
-            .where(eq(productionBatches.orderId, orderId))
-        )
-          .filter((bb) => bb.orderItemId)
-          .map((bb) => bb.orderItemId)
-      );
-      const usedExisting = new Set<number>();
-
-      for (const it of b.items) {
-        const qty = Number(it.quantity) || 0;
-        const price = Number(it.unitPrice) || 0;
-        const match = existingItems.find(
-          (e) => !usedExisting.has(e.id) && e.productId === Number(it.productId)
+      await db.transaction(async (tx) => {
+        const existingItems = await tx
+          .select()
+          .from(orderItems)
+          .where(eq(orderItems.orderId, orderId));
+        const linkedItemIds = new Set(
+          (
+            await tx
+              .select()
+              .from(productionBatches)
+              .where(eq(productionBatches.orderId, orderId))
+          )
+            .filter((bb) => bb.orderItemId)
+            .map((bb) => bb.orderItemId)
         );
-        if (match) {
-          usedExisting.add(match.id);
-          await db
-            .update(orderItems)
-            .set({ quantity: qty, unitPrice: price, totalPrice: qty * price, notes: it.notes || null })
-            .where(eq(orderItems.id, match.id));
-        } else {
-          await db.insert(orderItems).values({
-            orderId,
-            productId: Number(it.productId),
-            quantity: qty,
-            unitPrice: price,
-            totalPrice: qty * price,
-            notes: it.notes || null,
-          });
-        }
-      }
+        const usedExisting = new Set<number>();
 
-      // Only remove old items that have NO production batch attached
-      for (const e of existingItems) {
-        if (!usedExisting.has(e.id) && !linkedItemIds.has(e.id)) {
-          await db.delete(orderItems).where(eq(orderItems.id, e.id));
+        // How much of each line is already committed to production. Cutting an
+        // order line below this used to be accepted silently, which left a batch
+        // in production for more garments than the order now says were ordered -
+        // i.e. over-allocation created after the fact, with no audit row. This is
+        // the same ceiling POST /api/batches enforces when a batch is created.
+        const allocatedByItem = new Map<number, number>();
+        for (const batch of await tx
+          .select()
+          .from(productionBatches)
+          .where(eq(productionBatches.orderId, orderId))) {
+          if (!batch.orderItemId || batch.status === "CANCELLED") continue;
+          allocatedByItem.set(batch.orderItemId, (allocatedByItem.get(batch.orderItemId) ?? 0) + batch.quantity);
         }
-      }
 
-      const items = await db
-        .select()
-        .from(orderItems)
-        .where(eq(orderItems.orderId, orderId));
-      const total = items.reduce((s, i) => s + (i.totalPrice ?? 0), 0);
-      await db.update(orders).set({ totalAmount: total }).where(eq(orders.id, orderId));
+        for (const it of b.items) {
+          const qty = Number(it.quantity) || 0;
+          const price = Number(it.unitPrice) || 0;
+          const match = existingItems.find(
+            (e) => !usedExisting.has(e.id) && e.productId === Number(it.productId)
+          );
+          if (match) {
+            const allocated = allocatedByItem.get(match.id) ?? 0;
+            if (qty < allocated)
+              throw new Error(
+                `ALLOCATED:${match.quantity}:${allocated}:${qty}`
+              );
+            usedExisting.add(match.id);
+            await tx
+              .update(orderItems)
+              .set({ quantity: qty, unitPrice: price, totalPrice: qty * price, notes: it.notes || null })
+              .where(eq(orderItems.id, match.id));
+          } else {
+            await tx.insert(orderItems).values({
+              orderId,
+              productId: Number(it.productId),
+              quantity: qty,
+              unitPrice: price,
+              totalPrice: qty * price,
+              notes: it.notes || null,
+            });
+          }
+        }
+
+        // Only remove old items that have NO production batch attached
+        for (const e of existingItems) {
+          if (!usedExisting.has(e.id) && !linkedItemIds.has(e.id)) {
+            await tx.delete(orderItems).where(eq(orderItems.id, e.id));
+          }
+        }
+
+        const items = await tx
+          .select()
+          .from(orderItems)
+          .where(eq(orderItems.orderId, orderId));
+        const total = items.reduce((s, i) => s + (i.totalPrice ?? 0), 0);
+        await tx.update(orders).set({ totalAmount: total }).where(eq(orders.id, orderId));
+      });
     }
-    const [row] = await db
-      .update(orders)
-      .set({
-        customerId: b.customerId ? Number(b.customerId) : undefined,
-        orderDate: b.orderDate || undefined,
-        dueDate: b.dueDate === "" ? null : b.dueDate || undefined,
-        status: b.status || undefined,
-        notes: b.notes !== undefined ? b.notes : undefined,
-      })
-      .where(eq(orders.id, orderId))
-      .returning();
+    // Only the fields actually present. Passing an object whose every value is
+    // `undefined` makes Drizzle throw "No values to set" - which is how a request
+    // carrying only `items` used to return HTTP 500 *after* the item edits and the
+    // recalculated order total had already been committed. The client saw a
+    // failure and the database had changed.
+    const changes: Partial<typeof orders.$inferInsert> = {};
+    if (b.customerId) changes.customerId = Number(b.customerId);
+    if (b.orderDate) changes.orderDate = b.orderDate;
+    if (b.dueDate !== undefined) changes.dueDate = b.dueDate === "" ? null : b.dueDate || null;
+    if (b.status) changes.status = b.status;
+    if (b.notes !== undefined) changes.notes = b.notes;
+    const [row] = Object.keys(changes).length
+      ? await db.update(orders).set(changes).where(eq(orders.id, orderId)).returning()
+      : await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
     await refreshOrderMoney(orderId);
     return NextResponse.json(row);
   } catch (e: any) {
+    // Raised inside the transaction, so nothing was written: the order keeps its
+    // old quantity and the client is told exactly why.
+    const allocated = typeof e?.message === "string" && e.message.startsWith("ALLOCATED:") ? e.message.split(":") : null;
+    if (allocated)
+      return NextResponse.json({
+        error: `${allocated[2]} of these garments are already in production batches, so this line cannot be reduced below that. `
+          + `Cancel or reduce the batches first. (Ordered ${allocated[1]}, requested ${allocated[3]}.)`,
+      }, { status: 400 });
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }
 }

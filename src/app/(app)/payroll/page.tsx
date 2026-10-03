@@ -58,7 +58,7 @@ export default function PayrollPage() {
     setLoading(true);
     Promise.all([
       fetch(`/api/payroll?month=${month}`, { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers", { cache: "no-store" }).then((r) => r.json()),
+      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()),
     ])
       .then(([p, w]) => {
         if (p.error) setErr(p.error);

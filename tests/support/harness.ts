@@ -44,6 +44,7 @@ import * as deliveriesRoute from "@/app/api/deliveries/route";
 import * as expensesRoute from "@/app/api/expenses/route";
 import * as materialsRoute from "@/app/api/materials/route";
 import * as healthRoute from "@/app/api/health/route";
+import * as productionCorrectionsRoute from "@/app/api/production-corrections/route";
 
 export const HOST = "matesther.test";
 export const ORIGIN = `http://${HOST}`;
@@ -98,6 +99,8 @@ const ROUTES: Record<string, Handler> = {
   "GET /api/expenses": expensesRoute.GET,
   "GET /api/materials": materialsRoute.GET,
   "GET /api/health": healthRoute.GET,
+  "GET /api/production-corrections": productionCorrectionsRoute.GET,
+  "POST /api/production-corrections": productionCorrectionsRoute.POST,
 };
 
 /** Parameterised routes, matched in order. */

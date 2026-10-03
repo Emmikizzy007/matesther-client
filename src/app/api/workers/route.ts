@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { workers, users, productionOperations, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime } from "@/db/schema";
 import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
-import { inspectionEarnings } from "@/lib/job-pay";
 import {
   normaliseRoles,
   replaceWorkerRoles,
@@ -12,56 +11,153 @@ import {
   unknownRoles,
 } from "@/lib/worker-roles";
 
+/**
+ * Lifetime piecework for one worker, as SQL.
+ *
+ * This is the SAME rate precedence lib/job-pay.ts defines - inspection snapshot,
+ * then the job's agreed rate, then the worker's legacy profile rate - and only
+ * PER_PIECE people earn it. It replaced a loop that re-scanned every inspection
+ * in the database once per worker: O(workers x all inspections ever).
+ */
+const LIFETIME_EARNINGS = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
+
+/**
+ * `?view=slim` - what a worker DROPDOWN needs and nothing more.
+ *
+ * Seven screens fetch /api/workers purely to populate a <select>. Each of them
+ * used to trigger the full aggregation below (per-worker production totals,
+ * lifetime earnings, payroll history) and, for an Owner, the entire worker row.
+ * The Workers page itself still gets the complete profile.
+ */
+const SLIM_COLUMNS = {
+  id: workers.id,
+  name: workers.name,
+  specialty: workers.specialty,
+  status: workers.status,
+  paymentType: workers.paymentType,
+  isInspector: workers.isInspector,
+};
+
 export async function GET(req: Request) {
   const denied = await guard(req, STAFF);
   if (denied) return denied;
   try {
     const isManager = (await getSessionUser(req))?.role === "PRODUCTION_MANAGER";
     const query = new URL(req.url).searchParams;
-    const [people, operations, inspections, payRows, overtimeRows, roleMap] = await Promise.all([
-      db.select().from(workers), db.select().from(productionOperations), db.select().from(stageInspections),
-      db.select().from(workerPayments), db.select().from(workerOvertime), rolesByWorker(),
+    const slim = query.get("view") === "slim";
+    const showArchived = query.get("showArchived") === "1";
+    const roleMap = await rolesByWorker();
+
+    // A dropdown needs names and roles. It must not cost an aggregation pass
+    // over the whole production history.
+    if (slim) {
+      const rows = await db
+        .select(SLIM_COLUMNS)
+        .from(workers)
+        .where(showArchived ? undefined : eq(workers.status, "ACTIVE"));
+      const list = rows.map((person) => ({
+        ...person,
+        roles: roleMap.get(person.id) ?? [person.specialty],
+      }));
+      return NextResponse.json(list, { headers: { "Cache-Control": "private, no-store" } });
+    }
+
+    const idFilter = query.get("id") ? Number(query.get("id")) : null;
+    // Everything below is grouped by worker in SQL, so each table is read ONCE
+    // rather than once per person.
+    const [people, opStats, earnedRows, payIds, overtimeIds] = await Promise.all([
+      db
+        .select()
+        .from(workers)
+        .where(idFilter ? eq(workers.id, idFilter) : showArchived ? undefined : eq(workers.status, "ACTIVE")),
+      db
+        .select({
+          workerId: productionOperations.workerId,
+          jobs: sql<number>`count(*)`,
+          currentTasks: sql<number>`coalesce(sum(case when ${productionOperations.status} in ('IN_PROGRESS', 'SUBMITTED') then 1 else 0 end), 0)`,
+          assigned: sql<number>`coalesce(sum(${productionOperations.quantityReceived}), 0)`,
+          completed: sql<number>`coalesce(sum(${productionOperations.quantityCompleted}), 0)`,
+          rejected: sql<number>`coalesce(sum(${productionOperations.quantityRejected}), 0)`,
+          approved: sql<number>`coalesce(sum(${productionOperations.quantityApproved}), 0)`,
+        })
+        .from(productionOperations)
+        .where(idFilter ? eq(productionOperations.workerId, idFilter) : undefined)
+        .groupBy(productionOperations.workerId),
+      // Earnings are only ever shown to the Owner; a Production Manager is
+      // already blocked from seeing pay, so the query is skipped entirely.
+      isManager
+        ? Promise.resolve([] as { workerId: number; earnings: number }[])
+        : db
+            .select({ workerId: productionOperations.workerId, earnings: LIFETIME_EARNINGS })
+            .from(stageInspections)
+            .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
+            .innerJoin(workers, eq(workers.id, productionOperations.workerId))
+            .where(idFilter ? eq(productionOperations.workerId, idFilter) : undefined)
+            .groupBy(productionOperations.workerId),
+      db
+        .select({ workerId: workerPayments.workerId })
+        .from(workerPayments)
+        .where(idFilter ? eq(workerPayments.workerId, idFilter) : undefined)
+        .groupBy(workerPayments.workerId),
+      db
+        .select({ workerId: workerOvertime.workerId })
+        .from(workerOvertime)
+        .where(idFilter ? eq(workerOvertime.workerId, idFilter) : undefined)
+        .groupBy(workerOvertime.workerId),
     ]);
+    const statsByWorker = new Map(opStats.map((row) => [Number(row.workerId), row]));
+    const earnedByWorker = new Map(earnedRows.map((row) => [Number(row.workerId), Number(row.earnings) || 0]));
+    const hasPay = new Set(payIds.map((row) => Number(row.workerId)));
+    const hasOvertime = new Set(overtimeIds.map((row) => Number(row.workerId)));
+
     const personView = (person: typeof workers.$inferSelect) => isManager
       ? { id: person.id, name: person.name, phone: person.phone, specialty: person.specialty, status: person.status,
           paymentType: person.paymentType, isInspector: person.isInspector, createdAt: person.createdAt,
           department: person.department, jobTitle: person.jobTitle }
       : person;
     const expanded = people.map((person) => {
-      const mine = operations.filter((op) => op.workerId === person.id);
-      const byId = new Map(mine.map((op) => [op.id, op]));
-      const approved = mine.reduce((sum, op) => sum + op.quantityApproved, 0);
-      const earned = person.paymentType === "PER_PIECE"
-        ? inspections.reduce((sum, check) => {
-            const op = byId.get(check.productionOperationId);
-            return op ? sum + inspectionEarnings(check, op, person) : sum;
-          }, 0)
-        : person.paymentType === "MONTHLY" ? person.paymentRate : 0;
+      const stats = statsByWorker.get(person.id);
+      // MONTHLY people are shown their salary, exactly as before.
+      const earned = person.paymentType === "MONTHLY"
+        ? person.paymentRate
+        : earnedByWorker.get(person.id) ?? 0;
       return {
         ...personView(person),
         // Additive: every person still carries `specialty`; `roles` is the
         // full set, so a Cutter who also sews appears in both filters.
         roles: roleMap.get(person.id) ?? [person.specialty],
-        currentTasks: mine.filter((op) => ["IN_PROGRESS", "SUBMITTED"].includes(op.status)).length,
-        assigned: mine.reduce((sum, op) => sum + op.quantityReceived, 0),
-        completed: mine.reduce((sum, op) => sum + op.quantityCompleted, 0),
-        rejected: mine.reduce((sum, op) => sum + op.quantityRejected, 0),
-        approved,
-        hasHistory: mine.length > 0 || payRows.some((p) => p.workerId === person.id) || overtimeRows.some((p) => p.workerId === person.id),
+        currentTasks: Number(stats?.currentTasks ?? 0),
+        assigned: Number(stats?.assigned ?? 0),
+        completed: Number(stats?.completed ?? 0),
+        rejected: Number(stats?.rejected ?? 0),
+        approved: Number(stats?.approved ?? 0),
+        hasHistory: Number(stats?.jobs ?? 0) > 0 || hasPay.has(person.id) || hasOvertime.has(person.id),
         ...(!isManager ? { earnings: earned } : {}),
       };
     });
-    const id = Number(query.get("id"));
-    if (query.get("id")) {
-      const profile = expanded.find((person) => person.id === id);
+
+    if (idFilter) {
+      const profile = expanded.find((person) => person.id === idFilter);
       if (!profile) return NextResponse.json({ error: "Worker not found." }, { status: 404 });
-      const [batches, orderRows, schools] = await Promise.all([
-        db.select().from(productionBatches), db.select().from(orders), db.select().from(customers),
-      ]);
-      const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
-      const orderMap = new Map(orderRows.map((order) => [order.id, order]));
-      const schoolMap = new Map(schools.map((school) => [school.id, school]));
-      const history = operations.filter((op) => op.workerId === id).map((op) => {
+      // One person's history: filter in SQL instead of scanning every batch,
+      // order and customer to find the handful that belong to them.
+      const historyOps = await db.select().from(productionOperations).where(eq(productionOperations.workerId, idFilter));
+      const batchIds = [...new Set(historyOps.map((op) => op.productionBatchId))];
+      const historyBatches = batchIds.length
+        ? await db.select().from(productionBatches).where(inArray(productionBatches.id, batchIds))
+        : [];
+      const orderIds = [...new Set(historyBatches.map((batch) => batch.orderId))];
+      const historyOrders = orderIds.length
+        ? await db.select().from(orders).where(inArray(orders.id, orderIds))
+        : [];
+      const customerIds = [...new Set(historyOrders.map((order) => order.customerId).filter((value): value is number => !!value))];
+      const historySchools = customerIds.length
+        ? await db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
+        : [];
+      const batchMap = new Map(historyBatches.map((batch) => [batch.id, batch]));
+      const orderMap = new Map(historyOrders.map((order) => [order.id, order]));
+      const schoolMap = new Map(historySchools.map((school) => [school.id, school]));
+      const history = historyOps.map((op) => {
         const batch = batchMap.get(op.productionBatchId);
         const order = batch ? orderMap.get(batch.orderId) : undefined;
         return {
@@ -73,8 +169,7 @@ export async function GET(req: Request) {
       });
       return NextResponse.json({ ...profile, history }, { headers: { "Cache-Control": "private, no-store" } });
     }
-    const list = query.get("showArchived") === "1" ? expanded : expanded.filter((person) => person.status === "ACTIVE");
-    return NextResponse.json(list, { headers: { "Cache-Control": "private, no-store" } });
+    return NextResponse.json(expanded, { headers: { "Cache-Control": "private, no-store" } });
   } catch (error) {
     console.error("Workers load failed", error);
     return NextResponse.json({ error: "Unable to load workers." }, { status: 500 });

@@ -72,7 +72,7 @@ export default function DashboardPage() {
   if (view === "pm") return <ProductionDashboard d={d} />;
   if (view === "worker") return d.linked === false || !d.profile
     ? <div><h1 className="mb-5 text-2xl font-bold text-slate-900">Welcome, {user?.name}</h1><WorkerLinkNotice name={user?.name} /></div>
-    : <WorkerDashboard d={d} userName={user?.name || ""} />;
+    : <WorkerDashboard d={d} userName={user?.name || ""} refresh={() => setRetry((n) => n + 1)} />;
   return <OwnerDashboard d={d} userName={user?.name || ""} />;
 }
 
@@ -448,7 +448,7 @@ function ProductionDashboard({ d }: any) {
 }
 
 /* ================= WORKER DASHBOARD (personal work journal) ================= */
-function WorkerDashboard({ d, userName }: any) {
+function WorkerDashboard({ d, userName, refresh }: any) {
   const [submit, setSubmit] = useState<any>(null);
   const [qty, setQty] = useState("");
   const [busy, setBusy] = useState(false);
@@ -467,7 +467,11 @@ function WorkerDashboard({ d, userName }: any) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed");
       setSubmit(null);
-      window.location.reload();
+      setQty("");
+      // Refetch the dashboard payload instead of reloading the whole page: a
+      // reload re-downloads the app shell and re-authenticates just to show one
+      // changed quantity.
+      refresh?.();
     } catch (e: any) {
       setErr(e.message);
     } finally {

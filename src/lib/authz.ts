@@ -20,13 +20,38 @@ export interface SessionUser {
   workerId: number | null;
 }
 
-/** Resolve a server-managed session cookie, never trust a browser-supplied role. */
-export async function getSessionUser(req: Request): Promise<SessionUser | null> {
+/**
+ * Resolve a server-managed session cookie, never trust a browser-supplied role.
+ *
+ * MEMOISED PER REQUEST. `guard()` validates the session and then most handlers
+ * called this again to get the same user back, so every authenticated request
+ * paid for two `sessions` lookups and two `users` lookups. Measured on
+ * GET /api/operations: 4 of its 11 statements were authentication. Keying the
+ * cache on the Request object means a single request validates once, no call
+ * site changes, and two different requests can never share a result.
+ *
+ * This does not weaken anything: the same hashed-cookie -> sessions -> users
+ * check runs, the same ACTIVE and expiry rules apply, and a Request is used
+ * once. It only stops the identical check being repeated inside that request.
+ */
+const sessionByRequest = new WeakMap<Request, Promise<SessionUser | null>>();
+
+export function getSessionUser(req: Request): Promise<SessionUser | null> {
+  const cached = sessionByRequest.get(req);
+  if (cached) return cached;
+  const pending = resolveSessionUser(req);
+  sessionByRequest.set(req, pending);
+  return pending;
+}
+
+async function resolveSessionUser(req: Request): Promise<SessionUser | null> {
   try {
     const token = readSessionToken(req);
     if (!token) return null;
+    // Only the columns the check needs. Every authenticated request runs this,
+    // so it should not drag a whole row across the wire to read three fields.
     const [session] = await db
-      .select()
+      .select({ token: sessions.token, userId: sessions.userId, expiresAt: sessions.expiresAt })
       .from(sessions)
       .where(eq(sessions.token, hashSessionToken(token)))
       .limit(1);
@@ -35,7 +60,18 @@ export async function getSessionUser(req: Request): Promise<SessionUser | null> 
       await db.delete(sessions).where(eq(sessions.token, session.token));
       return null;
     }
-    const [user] = await db.select().from(users).where(eq(users.id, session.userId)).limit(1);
+    // Deliberately NOT `select()`: the users row carries `password_hash`, which
+    // this function never uses and must never hand back to a caller. Selecting
+    // the whole row meant every authenticated request in the system pulled a
+    // password hash into Node memory for nothing.
+    const [user] = await db
+      .select({
+        id: users.id, name: users.name, email: users.email, role: users.role,
+        organizationId: users.organizationId, workerId: users.workerId, status: users.status,
+      })
+      .from(users)
+      .where(eq(users.id, session.userId))
+      .limit(1);
     if (!user || user.status !== "ACTIVE") return null;
     return {
       id: user.id,
@@ -77,7 +113,23 @@ function comparableName(value: string): string {
  * record exists, find one exact, unambiguous name match in the same company.
  * Never match a substring or return another worker's production history.
  */
-export async function getLinkedWorkerId(user: SessionUser): Promise<number | null> {
+/**
+ * Memoised on the SessionUser object. Because getSessionUser now returns the
+ * same object for the whole request, this is per-request memoisation: a second
+ * call in the same handler is free, and a different request (a different object)
+ * can never reuse it. The matching rules below are unchanged.
+ */
+const linkedWorkerByUser = new WeakMap<SessionUser, Promise<number | null>>();
+
+export function getLinkedWorkerId(user: SessionUser): Promise<number | null> {
+  const cached = linkedWorkerByUser.get(user);
+  if (cached) return cached;
+  const pending = resolveLinkedWorkerId(user);
+  linkedWorkerByUser.set(user, pending);
+  return pending;
+}
+
+async function resolveLinkedWorkerId(user: SessionUser): Promise<number | null> {
   if (!["WORKER", "PRODUCTION_MANAGER"].includes(user.role) || !user.organizationId) return null;
   // Supervisors opt in to the factory role through Users. Regular Workers can
   // still be added before their Workers record and matched unambiguously later.

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Plus } from "lucide-react";
 import { Card, CardHeader, PageHeader, Loading, Modal, Field, inputCls, Btn, Badge } from "@/components/ui";
-import { naira } from "@/lib/format";
+import { naira, stageLabel, STAGES as STAGE_CODES } from "@/lib/format";
 import { useAuth, roleLabel } from "@/lib/auth";
 import { BrandLogo } from "@/components/BrandLogo";
 
@@ -98,7 +98,10 @@ export default function SettingsPage() {
     }
   }
 
-  const STAGES = ["Cutting", "Sewing", "Monogramming / Embroidery", "Buttonhole", "Button Tacking", "Ironing", "Packing", "Delivery"];
+  // Derived from the one stage list in lib/format rather than being a fifth
+  // hand-typed copy of it, so this page cannot drift from the pipeline the
+  // production routes actually run.
+  const STAGES = STAGE_CODES.map(stageLabel);
 
   return (
     <div>

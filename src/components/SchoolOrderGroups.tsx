@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { ChevronDown, School } from "lucide-react";
 import Link from "next/link";
 import { Card, EmptyState } from "@/components/ui";
@@ -21,14 +21,24 @@ export function SchoolOrderGroups<T extends Groupable>({
 }) {
   const [openKey, setOpenKey] = useState<string | null>(null);
   const { user } = useAuth();
-  const byOrder = new Map<string, { school: string; orderNumber: string; orderId: number | null; rows: T[] }>();
-  for (const row of rows) {
-    const key = row.orderId ? String(row.orderId) : `${row.customer}-${row.orderNumber}`;
-    const entry = byOrder.get(key) ?? { school: row.customer, orderNumber: row.orderNumber, orderId: row.orderId, rows: [] };
-    entry.rows.push(row);
-    byOrder.set(key, entry);
-  }
-  const groups = [...byOrder.entries()].sort((a, b) => a[1].school.localeCompare(b[1].school) || a[1].orderNumber.localeCompare(b[1].orderNumber));
+  /**
+   * Grouping is memoised on `rows`.
+   *
+   * This component rebuilt the map and re-sorted it on EVERY render - including
+   * the render caused by merely expanding or collapsing a card, which changes no
+   * data at all. With a few thousand jobs on the Production History page that was
+   * an O(n log n) sort per click.
+   */
+  const groups = useMemo(() => {
+    const byOrder = new Map<string, { school: string; orderNumber: string; orderId: number | null; rows: T[] }>();
+    for (const row of rows) {
+      const key = row.orderId ? String(row.orderId) : `${row.customer}-${row.orderNumber}`;
+      const entry = byOrder.get(key) ?? { school: row.customer, orderNumber: row.orderNumber, orderId: row.orderId, rows: [] };
+      entry.rows.push(row);
+      byOrder.set(key, entry);
+    }
+    return [...byOrder.entries()].sort((a, b) => a[1].school.localeCompare(b[1].school) || a[1].orderNumber.localeCompare(b[1].orderNumber));
+  }, [rows]);
   if (!groups.length) return <Card><EmptyState title={emptyTitle} hint={emptyHint} /></Card>;
 
   return <div className="space-y-3">

@@ -81,7 +81,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
     setLoading(true);
     Promise.all([
       fetch(`/api/orders/${id}`, { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers", { cache: "no-store" }).then((r) => r.json()),
+      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/materials", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/products", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/customers", { cache: "no-store" }).then((r) => r.json()),
@@ -630,11 +630,22 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
           <form
             onSubmit={async (e) => {
               e.preventDefault();
-              const body: any = { ...opModal, id: opModal.id };
+              // Only the fields this modal may change. It used to post the whole
+              // job object back, quantities included. Quantities are derived from
+              // what was allocated, submitted and inspected, so they are no longer
+              // editable here at all - the server refuses them.
+              const body: any = {
+                id: opModal.id,
+                workerId: opModal.workerId ?? null,
+                pieceRate: opModal.pieceRate,
+                expectedCompletionDate: opModal.expectedCompletionDate || null,
+                notes: opModal.notes ?? "",
+              };
               if (submitVal && Number(submitVal) > 0) {
+                // A submission is an event of its own, and cannot carry an edit.
                 body.submitQty = Number(submitVal);
-                delete body.quantityCompleted;
-                delete body.status;
+              } else {
+                body.status = opModal.status;
               }
               const r = await post("/api/operations", body, "PUT");
               if (r) { setOpModal(null); setSubmitVal(""); load(); }
@@ -664,9 +675,22 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
             <Field label="Submit more pieces for inspection (optional)">
               <input type="number" min="0" value={submitVal} onChange={(e) => setSubmitVal(e.target.value)} placeholder="e.g. 25" className={inputCls} />
             </Field>
-            <Field label="Qty received"><input type="number" min="0" value={opModal.quantityReceived ?? 0} onChange={(e) => setOpModal({ ...opModal, quantityReceived: Number(e.target.value) })} className={inputCls} /></Field>
-            <Field label="Qty submitted"><input type="number" min="0" value={opModal.quantityCompleted ?? 0} onChange={(e) => setOpModal({ ...opModal, quantityCompleted: Number(e.target.value) })} className={inputCls} /></Field>
-            <Field label="Qty rejected"><input type="number" min="0" value={opModal.quantityRejected ?? 0} onChange={(e) => setOpModal({ ...opModal, quantityRejected: Number(e.target.value) })} className={inputCls} /></Field>
+            {/* Derived quantities: shown, never typed. */}
+            <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-600 mb-2">Quantities - derived from the production trail</p>
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Received <strong>{opModal.quantityReceived ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Submitted <strong>{opModal.quantityCompleted ?? 0}</strong></span>
+                <span className="bg-white border border-emerald-200 rounded px-2 py-0.5">Approved <strong className="text-emerald-700">{opModal.quantityApproved ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Rework <strong>{opModal.quantityRework ?? 0}</strong></span>
+                <span className="bg-white border border-red-200 rounded px-2 py-0.5">Rejected <strong className="text-red-700">{opModal.quantityRejected ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Outstanding <strong>{opModal.quantityRemaining ?? 0}</strong></span>
+              </div>
+              <p className="mt-2 text-[11px] text-slate-500">
+                A stage receives only what the previous stage approved. To fix a genuine mis-count the Owner records an
+                audited correction, which keeps who changed it, when and why.
+              </p>
+            </div>
             <Field label="Expected completion"><input type="date" value={opModal.expectedCompletionDate || ""} onChange={(e) => setOpModal({ ...opModal, expectedCompletionDate: e.target.value })} className={inputCls} /></Field>
             <Field label="Notes" className="sm:col-span-2">
               <textarea value={opModal.notes || ""} onChange={(e) => setOpModal({ ...opModal, notes: e.target.value })} className={inputCls} rows={2} />
