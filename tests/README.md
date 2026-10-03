@@ -108,8 +108,8 @@ inspection route against the actual data layer.
   | Let a ready-made receipt be judged twice | `route-driven-production` 32 only | all 173 others passed |
   | Let an accepted external figure be un-accepted | `route-driven-production` 29 only | all 173 others passed |
   | Let a dispatch send out more garments than the stage holds | `route-driven-production` 23 and 24 | all 172 others passed |
-  | Let a worker submit pieces against an outsourced or bought-in stage | `route-driven-production` 28 and 30 | all 175 others passed |
-  | Treat `MACHINE` as work that leaves the factory | `route-driven-production` 29 only | all 176 others passed |
+  | Let a worker submit pieces against an outsourced or bought-in stage | `route-driven-production` 38 and 40 | all 175 others passed |
+  | Treat `MACHINE` as work that leaves the factory | `route-driven-production` 39 only | all 176 others passed |
 
   **A mutation this suite initially SURVIVED, and the fix.** The first version of
   "an unknown ledger event type cannot move a quantity counter" passed even with
