@@ -20,6 +20,7 @@ import {
 } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { refreshOrderMoney, batchProgress } from "@/lib/server";
+import { orderCosts, emptyOrderCosts, COST_LINES } from "@/lib/order-cost";
 import { guard, OWNER } from "@/lib/authz";
 
 export async function GET(
@@ -104,10 +105,24 @@ export async function GET(
       expByCat.set(e.category, (expByCat.get(e.category) ?? 0) + (e.amount ?? 0));
     const materialCost = usageRows.reduce((s, u) => s + (u.totalCost ?? 0), 0);
     const expenseCost = expenseRows.reduce((s, e) => s + (e.amount ?? 0), 0);
-    const totalCost = materialCost + expenseCost;
+
+    /**
+     * What this order really cost, in the nine categories Matesther runs on, computed
+     * server-side from records the system already keeps. See `lib/order-cost.ts`.
+     *
+     * `materialCost` and `expenseCost` above are the two raw record totals and are
+     * still reported, because they describe what was TYPED IN. Everything below is
+     * what was actually spent: ready-made buying, materials, internal and machine
+     * labour, support labour net of the deduction it caused, vendor work, packaging,
+     * delivery and other expenses.
+     */
+    const costOrderId = Number(id);
+    const costed =
+      (await orderCosts([costOrderId])).get(costOrderId) ?? emptyOrderCosts(order.totalAmount ?? 0);
+    const totalCost = costed.totalCost;
     const revenue = order.totalAmount ?? 0;
-    const profit = revenue - totalCost;
-    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
+    const profit = costed.profit;
+    const margin = costed.margin;
 
       const progressBatches = batches.filter(
         (b: any) =>
@@ -148,15 +163,32 @@ export async function GET(
         stage: ops.find((o) => o.id === r.productionOperationId)?.stage ?? "-",
       })),
       costs: {
+        // Raw record totals, unchanged - these describe what was entered, not what
+        // the order cost.
         materialCost,
         expenseCost,
         usageByCategory: [...usageByCat.entries()].map(([category, amount]) => ({ category, amount })),
         expensesByCategory: [...expByCat.entries()].map(([category, amount]) => ({ category, amount })),
+        purchaseTotal: purchaseRows.reduce((s, p) => s + (p.totalCost ?? 0), 0),
+
+        // The restated figure. `totalCost`, `profit` and `margin` now mean the full
+        // nine-category cost, so every screen that already reads them shows the
+        // correct number without being changed.
         totalCost,
         revenue,
         profit,
-        margin: Math.round(margin * 10) / 10,
-        purchaseTotal: purchaseRows.reduce((s, p) => s + (p.totalCost ?? 0), 0),
+        margin,
+        lines: COST_LINES.map(({ key, label }) => ({ key, label, amount: costed[key] as number })),
+        // Hand-entered expenses in these two categories describe material and labour
+        // that the computed lines already cover, so they are reported but NOT added
+        // into totalCost. Nothing is deleted and nothing is hidden.
+        superseded: {
+          materials: costed.supersededMaterials,
+          labour: costed.supersededLabour,
+        },
+        // The old formula's answer, kept side by side so a previously reported profit
+        // is never silently overwritten.
+        legacy: costed.legacy,
       },
       progress: overallProgress,
       totalQuantity: itemRows.reduce((s, i) => s + (i.quantity ?? 0), 0),

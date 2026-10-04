@@ -16,6 +16,7 @@ import {
 } from "@/db/schema";
 import { inspectionEarnings } from "@/lib/job-pay";
 import { STAGES as SHARED_STAGES } from "@/lib/format";
+import { orderCosts, unattributableCosts, COST_LINES } from "@/lib/order-cost";
 
 export async function GET(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
@@ -47,7 +48,19 @@ export async function GET(req: Request) {
     ]);
     const cMap = new Map(customerRows.map((c) => [c.id, c]));
 
-    // Profitability per order
+    /**
+     * Profitability per order.
+     *
+     * Was: filter every material_usage row and every expense row in JavaScript for
+     * each order, and call the sum "cost" - which counted no labour at all. Now one
+     * grouped pass over the cost records costs every order at once, in the nine
+     * categories the business actually runs on. See `lib/order-cost.ts`.
+     *
+     * `materialCost` and `expenseCost` are kept as the raw record totals so nothing
+     * that read them breaks, and `legacy` carries the old formula's answer beside the
+     * restated one rather than overwriting history.
+     */
+    const costedByOrder = await orderCosts(orderRows.map((o) => o.id));
     const profitability = orderRows.map((o) => {
       const usage = usageRows
         .filter((u) => u.orderId === o.id)
@@ -55,23 +68,30 @@ export async function GET(req: Request) {
       const exp = expenseRows
         .filter((e) => e.orderId === o.id)
         .reduce((s, e) => s + (e.amount ?? 0), 0);
-      const cost = usage + exp;
-      const revenue = o.totalAmount ?? 0;
-      const profit = revenue - cost;
+      const costed = costedByOrder.get(o.id);
       return {
         orderId: o.id,
         orderNumber: o.orderNumber,
         customer: cMap.get(o.customerId ?? -1)?.name ?? "-",
         status: o.status,
         quantity: itemRows.filter((i) => i.orderId === o.id).reduce((s, i) => s + (i.quantity ?? 0), 0),
-        revenue,
+        revenue: o.totalAmount ?? 0,
         materialCost: usage,
         expenseCost: exp,
-        totalCost: cost,
-        profit,
-        margin: revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : 0,
+        totalCost: costed?.totalCost ?? 0,
+        profit: costed?.profit ?? 0,
+        margin: costed?.margin ?? 0,
+        lines: COST_LINES.map(({ key, label }) => ({ key, label, amount: (costed?.[key] as number) ?? 0 })),
+        legacy: costed?.legacy ?? { totalCost: usage + exp, profit: (o.totalAmount ?? 0) - (usage + exp), margin: 0 },
       };
     });
+
+    /**
+     * Costs no single order can carry: salaries, and expenses recorded against the
+     * business rather than a job. Reported beside order profit so an order's margin is
+     * never read as the whole business's margin.
+     */
+    const businessCosts = await unattributableCosts();
 
     // Production performance per stage (official 8-stage Matesther workflow)
     // Shared with api/dashboard, api/inspections and Settings - this file used
@@ -156,6 +176,14 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       profitability,
+      /** The nine cost categories, labelled, so the screen can render them in order. */
+      costLines: COST_LINES,
+      /**
+       * What order profit deliberately leaves out. An order's margin is a DIRECT-cost
+       * margin: salaries and business-wide expenses are real costs but belong to no
+       * single order, and Matesther has no rule for spreading them - so none is invented.
+       */
+      businessCosts,
       production,
       materials: materialsReport,
       workers: workersReport,
