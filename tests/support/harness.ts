@@ -129,6 +129,9 @@ const ROUTES: Record<string, Handler> = {
   "POST /api/allocations": allocationsRoute.POST,
   "PUT /api/allocations": allocationsRoute.PUT,
   "POST /api/material-usage": materialUsageRoute.POST,
+  // Material can be returned to the store or written off after it was issued, which is
+  // how it actually happens, so the update path is part of the surface under test.
+  "PUT /api/material-usage": materialUsageRoute.PUT,
   "POST /api/ready-made": readyMadeRoute.POST,
   "PUT /api/ready-made": readyMadeRoute.PUT,
 };
@@ -146,6 +149,11 @@ export type ApiResponse = {
   status: number;
   data: any;
   cookie: string | null;
+  /**
+   * Response headers, so a test can assert what a paged endpoint reports in
+   * `X-Total-Count` rather than only what it returned in the body.
+   */
+  headers: Headers;
 };
 
 export type ApiOptions = {
@@ -197,6 +205,7 @@ export async function api(
     status: response.status,
     data,
     cookie: setCookie?.match(/matesther_session=([^;]+)/)?.[1] ?? null,
+    headers: response.headers,
   };
 }
 

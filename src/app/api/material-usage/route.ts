@@ -223,12 +223,19 @@ export async function POST(req: Request) {
 }
 
 /**
- * PUT /api/material-usage  { id, quantityReturned?, quantityWasted?, notes }
+ * PUT /api/material-usage  { id, quantityUsed?, quantityReturned?, quantityWasted?, notes }
  *
  * Recording what came back or was ruined AFTER the material was issued, which is how it
- * actually happens. Quantities can only be added to, never quietly reduced: material
- * already written off is a fact, and correcting one needs a new record with a reason
- * beside it rather than an edit that leaves no trace.
+ * actually happens: twelve yards go out, ten end up in the garments, two come back uncut.
+ *
+ * What may and may not move:
+ *   - returned and wasted can be ADDED to, never reduced. Once material is back in the
+ *     store or written off, that is a fact about the store, and correcting it means a new
+ *     record with a reason beside it rather than an edit that leaves no trace;
+ *   - used may fall, but only as far as the record still accounts for what was issued -
+ *     used + returned + wasted can never exceed issued, so lowering `used` without
+ *     recording where the material went simply leaves it outstanding against the job;
+ *   - and any return or write-off needs a written reason.
  */
 export async function PUT(req: Request) {
   const denied = await guard(req, OWNER);
@@ -241,17 +248,20 @@ export async function PUT(req: Request) {
     const [usage] = await db.select().from(materialUsage).where(eq(materialUsage.id, id)).limit(1);
     if (!usage) return NextResponse.json({ error: "Material record not found." }, { status: 404 });
 
+    let used: number | null;
     let returned: number | null;
     let wasted: number | null;
     try {
+      used = readQuantity(b, "quantityUsed");
       returned = readQuantity(b, "quantityReturned");
       wasted = readQuantity(b, "quantityWasted");
     } catch (error: any) {
       return NextResponse.json({ error: error?.message ?? "Quantities must be zero or more." }, { status: 400 });
     }
-    if (returned === null && wasted === null)
-      return NextResponse.json({ error: "Record a quantity returned or a quantity wasted." }, { status: 400 });
+    if (used === null && returned === null && wasted === null)
+      return NextResponse.json({ error: "Record a quantity used, returned or wasted." }, { status: 400 });
 
+    const nextUsed = used ?? usage.quantityUsed ?? 0;
     const nextReturned = returned ?? usage.quantityReturned ?? 0;
     const nextWasted = wasted ?? usage.quantityWasted ?? 0;
     if (returned !== null && returned < (usage.quantityReturned ?? 0))
@@ -264,10 +274,9 @@ export async function PUT(req: Request) {
       }, { status: 400 });
 
     const issued = usage.quantityIssued ?? usage.quantityUsed ?? 0;
-    const used = usage.quantityUsed ?? 0;
-    if (used + nextReturned + nextWasted > issued)
+    if (nextUsed + nextReturned + nextWasted > issued)
       return NextResponse.json({
-        error: `${used} used, ${nextReturned} returned and ${nextWasted} wasted is more than the ${issued} issued on this record.`,
+        error: `${nextUsed} used, ${nextReturned} returned and ${nextWasted} wasted is more than the ${issued} issued on this record.`,
       }, { status: 400 });
 
     const returnedDelta = nextReturned - (usage.quantityReturned ?? 0);
@@ -283,10 +292,12 @@ export async function PUT(req: Request) {
     const [row] = await db
       .update(materialUsage)
       .set({
+        quantityUsed: nextUsed,
         quantityReturned: nextReturned,
         quantityWasted: nextWasted,
-        // Wasted material is consumed, so it joins the cost of the job.
-        totalCost: (used + nextWasted) * unitCost,
+        // Used and wasted are both consumed, so both join the cost of the job. Material
+        // that came back to the store does not.
+        totalCost: (nextUsed + nextWasted) * unitCost,
         notes: b.notes === undefined ? usage.notes : String(b.notes).slice(0, 2000) || null,
       })
       .where(eq(materialUsage.id, id))

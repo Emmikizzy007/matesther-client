@@ -57,6 +57,35 @@ After deploying:
 
 The same change is recorded for the ORM as `drizzle/0005_support_work_and_payroll.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
 
+## Release: support-work cost detail, vendor payment detail and material detail
+
+1. **Back up the client database first.**
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-support-cost-material-detail.sql` and Run. It is additive and repeatable: 15 `ADD COLUMN IF NOT EXISTS`, 5 `CREATE INDEX IF NOT EXISTS`, 5 guarded `ADD CONSTRAINT`. There is no `CREATE TABLE`, no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no change to any existing column's type, default or meaning, and **it writes no data at all** - no backfill and nothing to restate.
+3. Run verification queries **V1** to **V5** at the bottom of the file. **V2 is the important one**: it proves no material row was touched, that nothing has a returned or wasted quantity yet, and that `total_cost` is still `quantity_used x unit_cost` on every pre-existing row. **V3** proves every support assignment still names a real tailor, so its deduction still lands on the right person.
+4. Only then deploy the new application code. **SQL first, code second.** The new code writes to the columns this file adds, so deploying it first would fail.
+
+### What changes in the numbers, and why that is not a restatement
+
+This script alters no row. Two rules change in the **application**, and both are reported rather than hidden:
+
+- **Order profit is now costed in nine categories** - ready-made garments, raw materials, internal labour, machine labour, support labour, outsourced/vendor work, packaging, delivery and other expenses - instead of two. Every line is computed server-side from records the system already keeps; none of it can be typed in by hand. The old formula's answer is still returned beside the new one as `legacy`, so a profit figure reported earlier is never silently overwritten.
+- **Support pay is deducted, not added.** A tailor's full piece rate belongs to the garment. If they sew it themselves they keep all of it; if they hand a piece to a helper at an agreed rate, that rate comes **out of** the tailor's commission for the same approved piece. At 300 a shirt with a helper agreed at 30, the helper is paid 30 and the tailor keeps 270 - and the order's labour cost is 300, not 330. Only **approved** pieces move money on either side, at the rate snapshotted when the work was judged.
+
+### The two rules that protect the money
+
+- **A deduction can never make anybody's pay negative.** It comes out of piece-rate earnings - production piecework plus any support piecework the worker earned themselves. Salary, overtime and other approved payments are left alone, because the rule is expressed against the tailor's *piece rate* and carving a helper's rate out of a contracted monthly salary would be inventing a payroll rule Matesther does not have. What a month cannot absorb is **held and reported** (`supportDeductionOwed`) and recovered from the first later month that has piece-rate earnings. It is never written off.
+- **A tailor paid a flat monthly salary has no commission to deduct from**, so no deduction arises for them. The helper is still paid by Matesther, and that payment then stands alone as a real extra cost of the order - it does not vanish.
+
+### What changes for the people using the system
+
+- A helper is handed **the exact share of a stage**, not a school to pick from scratch. The order, item, size, colour and stage come with it by inheritance, and the tailor can only hand out work they hold themselves.
+- The quantity handed out can never exceed the share. Forty garments can take forty weaves **and** forty tapes, but never forty-one weaves.
+- A vendor dispatch now carries **what was promised back, what is owed, what has been paid and the bank reference** it can be matched against. Money already paid can be added to but never quietly reduced - the same protection an accepted quantity already had. A vendor is not a worker: none of this reaches payroll, and ready-made buying is a purchase, never tailor labour.
+- Material is tracked as **issued / used / returned / wasted**, against a worker, an exact variant, a timestamp and a written reason. This is the same material system - `materials`, `material_purchases`, `material_usage` - and `materials.current_stock` is still the one and only stock figure. Used and wasted material is costed because both are consumed; returned material is not, and it goes back into stock.
+- **Ready-made garments stay out of stock.** A bought-in finished uniform is a purchase with its own cost, linked to the order and its variant. It does not touch `materials.current_stock`, because a finished uniform is not a raw material.
+
+The same change is recorded for the ORM as `drizzle/0009_support_cost_and_material_detail.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
 ## Release: production allocations - splitting one stage across several workers
 
 1. **Back up the client database first.**
