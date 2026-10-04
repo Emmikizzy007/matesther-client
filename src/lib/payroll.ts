@@ -96,7 +96,16 @@ export interface WorkerAccrual {
    * agreed at 30 pays the helper 30 and leaves the tailor 270.
    */
   supportPiecesDelegated: number;
+  /** What actually came OUT of this month's piece-rate earnings. */
   supportDeduction: number;
+  /**
+   * What this month's approvals asked for in total, before the cap. Equals
+   * `supportDeduction` whenever the month had enough piece-rate earnings to absorb
+   * it, which is the normal case.
+   */
+  supportDeductionArising: number;
+  /** Still to be recovered from this worker's later piece-rate earnings. */
+  supportDeductionOwed: number;
   salary: number;
   overtime: number;
   /** Other approved earnings recorded for the month (allowance, bonus). */
@@ -166,7 +175,39 @@ const SUPPORT_ROW = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${su
 const DEDUCTION_SUM = SUPPORT_SUM;
 
 type PieceworkRow = { workerId: number; pieces: number; piecework: number };
-type DeductionRow = { workerId: number; supportPiecesDelegated: number; supportDeduction: number };
+
+/** One worker's support deduction for one month, after the carry-forward walk. */
+export type DeductionMonth = {
+  /** Approved pieces this worker handed out that were inspected in this month. */
+  piecesDelegated: number;
+  /** What those approvals took, at the rate snapshotted on each inspection. */
+  arising: number;
+  /** What this month's piece-rate earnings could actually absorb. */
+  applied: number;
+  /** What is still to be recovered from later months. */
+  owed: number;
+};
+
+/**
+ * Month arithmetic that agrees exactly with `monthKey()`.
+ *
+ * `monthKey()` buckets on UTC (`toISOString()`), and Postgres `extract()` on these
+ * `timestamp` columns returns the stored UTC value - verified against a literal
+ * `2026-03-31 23:30:00`, which does not shift into April. Bucketing in SQL rather
+ * than in JavaScript is what lets the carry-forward be computed from aggregates
+ * instead of from every inspection row ever written.
+ */
+function monthIndexOf(key: string): number {
+  const [y, m] = key.split("-").map(Number);
+  return y * 12 + m;
+}
+function keyOfMonthIndex(index: number): string {
+  const year = Math.floor((index - 1) / 12);
+  const month = ((index - 1) % 12) + 1;
+  return `${year}-${String(month).padStart(2, "0")}`;
+}
+const monthIndexOfColumn = (column: any) =>
+  sql`(extract(year from ${column}) * 12 + extract(month from ${column}))`;
 type SupportRow = { workerId: number; supportPieces: number; supportPiecework: number };
 
 /** Stage piecework per worker for a month, in ONE grouped query. */
@@ -227,35 +268,140 @@ async function supportPiecework(from: Date, to: Date, workerId?: number): Promis
   );
 }
 
-/** What approved support work takes back from each tailor who handed it out. */
-async function supportDeductions(from: Date, to: Date, workerId?: number): Promise<Map<number, DeductionRow>> {
-  const rows = await db
-    .select({
-      workerId: supportAssignments.assignedByWorkerId,
-      supportPiecesDelegated: sql<number>`coalesce(sum(${supportInspections.quantityApproved}), 0)`,
-      supportDeduction: DEDUCTION_SUM,
-    })
-    .from(supportInspections)
-    .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
-    .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
-    .where(
-      and(
-        gte(supportInspections.inspectedAt, from),
-        lt(supportInspections.inspectedAt, to),
-        workerId === undefined ? undefined : eq(supportAssignments.assignedByWorkerId, workerId)
-      )
-    )
-    .groupBy(supportAssignments.assignedByWorkerId);
-  return new Map(
-    rows.map((row) => [
-      Number(row.workerId),
-      {
-        workerId: Number(row.workerId),
-        supportPiecesDelegated: Number(row.supportPiecesDelegated) || 0,
-        supportDeduction: Number(row.supportDeduction) || 0,
-      },
-    ])
-  );
+/**
+ * The carried-forward support deduction, month by month, for every worker.
+ *
+ * WHY A WALK IS NEEDED AT ALL
+ *   A tailor's full piece rate belongs to the garment, and a helper's agreed rate
+ *   is deducted from it. When the tailor approved no pieces of their own that month
+ *   there is nothing for it to come out of yet - so the remainder is held and
+ *   recovered from the first later month that has piece-rate earnings. It is never
+ *   written off, and it never makes anybody's pay negative.
+ *
+ * WHAT THE DEDUCTION MAY COME OUT OF
+ *   Piece-rate earnings only: production piecework plus any support piecework the
+ *   worker earned themselves. Salary, overtime and other approved payments are
+ *   left alone, because the rule is expressed against the tailor's PIECE RATE and
+ *   carving a helper's rate out of a contracted monthly salary would be inventing a
+ *   payroll rule Matesther does not have. A tailor on a pure salary therefore has
+ *   no base, and what is owed to them simply stays owed and visible.
+ *
+ * HOW FAR BACK IT LOOKS
+ *   To the first month any support work was ever inspected - a carry cannot predate
+ *   the first deduction. Where there has never been any support work this issues one
+ *   cheap `min()` and returns nothing, so the ordinary payroll path is unaffected.
+ *   Every figure is derived from `support_inspections` and `stage_inspections`; there
+ *   is no stored balance to drift out of step with them.
+ */
+async function deductionSchedule(
+  endMonth: string,
+  workerId?: number
+): Promise<Map<number, Map<string, DeductionMonth>>> {
+  const schedule = new Map<number, Map<string, DeductionMonth>>();
+  const [firstRow] = await db
+    .select({ first: sql<Date | null>`min(${supportInspections.inspectedAt})` })
+    .from(supportInspections);
+  const firstDate = firstRow?.first ? new Date(firstRow.first) : null;
+  if (!firstDate || Number.isNaN(firstDate.getTime())) return schedule;
+
+  const endIndex = monthIndexOf(endMonth);
+  const startIndex = Math.min(monthIndexOf(monthKey(firstDate)), endIndex);
+  if (startIndex > endIndex) return schedule;
+  const { from } = monthBounds(keyOfMonthIndex(startIndex));
+  const { to } = monthBounds(endMonth);
+  const scope = workerId === undefined ? undefined : workerId;
+
+  const supportMonth = monthIndexOfColumn(supportInspections.inspectedAt);
+  const stageMonth = monthIndexOfColumn(stageInspections.inspectedAt);
+
+  // Three grouped reads, each returning one row per worker per month rather than
+  // one row per inspection: the piece-rate earnings a deduction may come out of
+  // (production piecework, and support piecework the worker earned themselves), and
+  // the deductions arising against the worker who handed the work out.
+  const [stageBase, supportBase, arising] = await Promise.all([
+    db
+      .select({
+        workerId: PAID_WORKER,
+        monthIndex: stageMonth,
+        amount: PIECEWORK_SUM,
+      })
+      .from(stageInspections)
+      .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
+      .innerJoin(workers, eq(workers.id, productionOperations.workerId))
+      .where(and(gte(stageInspections.inspectedAt, from), lt(stageInspections.inspectedAt, to),
+        scope === undefined ? undefined : eq(PAID_WORKER, scope)))
+      .groupBy(PAID_WORKER, stageMonth),
+    db
+      .select({
+        workerId: supportAssignments.workerId,
+        monthIndex: supportMonth,
+        amount: SUPPORT_SUM,
+      })
+      .from(supportInspections)
+      .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
+      .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
+      .where(and(gte(supportInspections.inspectedAt, from), lt(supportInspections.inspectedAt, to),
+        scope === undefined ? undefined : eq(supportAssignments.workerId, scope)))
+      .groupBy(supportAssignments.workerId, supportMonth),
+    db
+      .select({
+        workerId: supportAssignments.assignedByWorkerId,
+        monthIndex: supportMonth,
+        pieces: sql<number>`coalesce(sum(${supportInspections.quantityApproved}), 0)`,
+        amount: DEDUCTION_SUM,
+      })
+      .from(supportInspections)
+      .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
+      .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
+      .where(and(gte(supportInspections.inspectedAt, from), lt(supportInspections.inspectedAt, to),
+        scope === undefined ? undefined : eq(supportAssignments.assignedByWorkerId, scope)))
+      .groupBy(supportAssignments.assignedByWorkerId, supportMonth),
+  ]);
+
+  const base = new Map<number, Map<number, number>>();
+  const addBase = (id: number, monthIndex: number, amount: number) => {
+    const byMonth = base.get(id) ?? new Map<number, number>();
+    byMonth.set(monthIndex, (byMonth.get(monthIndex) ?? 0) + amount);
+    base.set(id, byMonth);
+  };
+  for (const row of stageBase) addBase(Number(row.workerId), Number(row.monthIndex), Number(row.amount) || 0);
+  for (const row of supportBase) addBase(Number(row.workerId), Number(row.monthIndex), Number(row.amount) || 0);
+
+  const arisingByWorker = new Map<number, Map<number, { pieces: number; amount: number }>>();
+  for (const row of arising) {
+    const id = Number(row.workerId);
+    const byMonth = arisingByWorker.get(id) ?? new Map<number, { pieces: number; amount: number }>();
+    byMonth.set(Number(row.monthIndex), {
+      pieces: Number(row.pieces) || 0,
+      amount: Number(row.amount) || 0,
+    });
+    arisingByWorker.set(id, byMonth);
+  }
+
+  // Walk every month from the first deduction to the one asked for, in order, so a
+  // month with no activity still passes its carried balance along.
+  for (const [id, byMonth] of arisingByWorker) {
+    const months = new Map<string, DeductionMonth>();
+    let owed = 0;
+    for (let index = startIndex; index <= endIndex; index++) {
+      const entry = byMonth.get(index);
+      const arisingAmount = entry?.amount ?? 0;
+      const pool = owed + arisingAmount;
+      const available = Math.max(0, base.get(id)?.get(index) ?? 0);
+      const applied = Math.min(pool, available);
+      owed = pool - applied;
+      if (arisingAmount !== 0 || applied !== 0 || owed !== 0) {
+        months.set(keyOfMonthIndex(index), {
+          piecesDelegated: entry?.pieces ?? 0,
+          arising: arisingAmount,
+          applied,
+          owed,
+        });
+      }
+    }
+    schedule.set(id, months);
+  }
+  return schedule;
 }
 
 /** Amount already paid per worker for a month. `period_month` is TEXT, so this
@@ -339,12 +485,12 @@ function assemble(
   support: SupportRow | undefined,
   paid: number,
   extra: ExtraRow | undefined,
-  delegated?: DeductionRow
+  delegated?: DeductionMonth
 ): WorkerAccrual {
   const rate = w.paymentRate ?? 0;
   const piecework = stage?.piecework ?? 0;
   const supportEarned = support?.supportPiecework ?? 0;
-  const supportDeduction = delegated?.supportDeduction ?? 0;
+  const supportDeduction = delegated?.applied ?? 0;
   const salary = salaryFor(w, month);
   const overtime = extra?.overtime ?? 0;
   const other = extra?.other ?? 0;
@@ -366,8 +512,10 @@ function assemble(
     piecework,
     supportPieces: support?.supportPieces ?? 0,
     supportPiecework: supportEarned,
-    supportPiecesDelegated: delegated?.supportPiecesDelegated ?? 0,
+    supportPiecesDelegated: delegated?.piecesDelegated ?? 0,
     supportDeduction,
+    supportDeductionArising: delegated?.arising ?? 0,
+    supportDeductionOwed: delegated?.owed ?? 0,
     salary,
     overtime,
     other,
@@ -393,14 +541,14 @@ export async function accrualForWorker(workerId: number, month: string): Promise
   const [stage, support, delegated, paid, extra, roles] = await Promise.all([
     stagePiecework(from, to, workerId),
     supportPiecework(from, to, workerId),
-    supportDeductions(from, to, workerId),
+    deductionSchedule(month, workerId),
     paidByWorker([month], workerId),
     extrasByWorker([month], workerId),
     rolesForWorker(workerId),
   ]);
   return assemble(
     w, month, roles, stage.get(workerId), support.get(workerId),
-    paid.get(workerId) ?? 0, extra.get(workerId), delegated.get(workerId)
+    paid.get(workerId) ?? 0, extra.get(workerId), delegated.get(workerId)?.get(month)
   );
 }
 
@@ -420,7 +568,7 @@ export async function workerAccruals(month: string) {
     rolesByWorker(),
     stagePiecework(from, to),
     supportPiecework(from, to),
-    supportDeductions(from, to),
+    deductionSchedule(month),
     paidByWorker([month]),
     extrasByWorker([month]),
   ]);
@@ -428,7 +576,7 @@ export async function workerAccruals(month: string) {
     .map((w) =>
       assemble(
         w, month, roleMap.get(w.id) ?? [], stage.get(w.id), support.get(w.id),
-        paid.get(w.id) ?? 0, extra.get(w.id), delegated.get(w.id)
+        paid.get(w.id) ?? 0, extra.get(w.id), delegated.get(w.id)?.get(month)
       )
     )
     .sort((a, b) => b.due - a.due);
@@ -447,11 +595,15 @@ export async function workerAccruals(month: string) {
       piecework: t.piecework + r.piecework,
       supportPiecework: t.supportPiecework + r.supportPiecework,
       supportDeduction: t.supportDeduction + r.supportDeduction,
+      supportDeductionOwed: t.supportDeductionOwed + r.supportDeductionOwed,
       salary: t.salary + r.salary,
       overtime: t.overtime + r.overtime,
       other: t.other + r.other,
     }),
-    { piecework: 0, supportPiecework: 0, supportDeduction: 0, salary: 0, overtime: 0, other: 0 }
+    {
+      piecework: 0, supportPiecework: 0, supportDeduction: 0, supportDeductionOwed: 0,
+      salary: 0, overtime: 0, other: 0,
+    }
   );
   return { workers: rows, totals, breakdown };
 }
@@ -475,7 +627,7 @@ export async function workerHistory(workerId: number, month: string) {
   // One worker over twelve months is a small set, so the inspection rows are
   // fetched individually and bucketed in JS - the same `monthKey()` the
   // single-month path uses, which keeps the two paths from ever disagreeing.
-  const [stageRows, supportRows, delegatedRows, extraRows, paymentRows, roles] = await Promise.all([
+  const [stageRows, supportRows, extraRows, paymentRows, roles, delegated] = await Promise.all([
     db
       .select({
         inspectedAt: stageInspections.inspectedAt,
@@ -510,24 +662,6 @@ export async function workerHistory(workerId: number, month: string) {
           lt(supportInspections.inspectedAt, to)
         )
       ),
-    // The other side of support work: pieces this worker handed out, and what
-    // their approval took back out of this worker's own rate.
-    db
-      .select({
-        inspectedAt: supportInspections.inspectedAt,
-        quantityApproved: supportInspections.quantityApproved,
-        deduction: SUPPORT_ROW,
-      })
-      .from(supportInspections)
-      .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
-      .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
-      .where(
-        and(
-          eq(supportAssignments.assignedByWorkerId, workerId),
-          gte(supportInspections.inspectedAt, from),
-          lt(supportInspections.inspectedAt, to)
-        )
-      ),
     db
       .select()
       .from(workerOvertime)
@@ -544,16 +678,20 @@ export async function workerHistory(workerId: number, month: string) {
       .where(and(eq(workerPayments.workerId, workerId), inArray(workerPayments.periodMonth, months)))
       .orderBy(workerPayments.paymentDate),
     rolesForWorker(workerId),
+    // The other side of support work, carried forward across months exactly as the
+    // single-month accrual does it - one implementation, so the twelve-month view
+    // and the monthly payroll screen can never disagree about who owes what.
+    deductionSchedule(months[months.length - 1], workerId),
   ]);
+  const myDelegated = delegated.get(workerId);
 
   type HistoryBucket = {
     pieces: number; piecework: number; supportPieces: number; supportPiecework: number;
-    supportPiecesDelegated: number; supportDeduction: number;
     overtime: number; other: number; paid: number;
   };
   const emptyBucket = (): HistoryBucket => ({
     pieces: 0, piecework: 0, supportPieces: 0, supportPiecework: 0,
-    supportPiecesDelegated: 0, supportDeduction: 0, overtime: 0, other: 0, paid: 0,
+    overtime: 0, other: 0, paid: 0,
   });
   const bucket = new Map<string, HistoryBucket>();
   const ensure = (key: string) => {
@@ -573,11 +711,6 @@ export async function workerHistory(workerId: number, month: string) {
     entry.supportPieces += row.quantityApproved ?? 0;
     entry.supportPiecework += Number(row.earnings) || 0;
   }
-  for (const row of delegatedRows) {
-    const entry = ensure(monthKey(row.inspectedAt));
-    entry.supportPiecesDelegated += row.quantityApproved ?? 0;
-    entry.supportDeduction += Number(row.deduction) || 0;
-  }
   for (const row of extraRows) {
     const entry = ensure(monthKey(row.workedOn));
     if ((row.category ?? "OVERTIME") === "OTHER") entry.other += row.amount ?? 0;
@@ -589,8 +722,10 @@ export async function workerHistory(workerId: number, month: string) {
   for (const m of months) {
     const entry = bucket.get(m) ?? emptyBucket();
     const salary = salaryFor(w, m);
+    const delegatedMonth = myDelegated?.get(m);
+    const supportDeduction = delegatedMonth?.applied ?? 0;
     const due =
-      entry.piecework + entry.supportPiecework + salary + entry.overtime + entry.other - entry.supportDeduction;
+      entry.piecework + entry.supportPiecework + salary + entry.overtime + entry.other - supportDeduction;
     history.push({
       month: m,
       workerId: w.id,
@@ -607,8 +742,10 @@ export async function workerHistory(workerId: number, month: string) {
       piecework: entry.piecework,
       supportPieces: entry.supportPieces,
       supportPiecework: entry.supportPiecework,
-      supportPiecesDelegated: entry.supportPiecesDelegated,
-      supportDeduction: entry.supportDeduction,
+      supportPiecesDelegated: delegatedMonth?.piecesDelegated ?? 0,
+      supportDeduction,
+      supportDeductionArising: delegatedMonth?.arising ?? 0,
+      supportDeductionOwed: delegatedMonth?.owed ?? 0,
       salary,
       overtime: entry.overtime,
       other: entry.other,

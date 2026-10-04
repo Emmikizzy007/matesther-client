@@ -70,7 +70,8 @@ export async function GET(req: Request) {
     const notListed = {
       count: omitted.length,
       due: omitted.reduce((sum, row) => sum + row.due, 0),
-      supportDeduction: omitted.reduce((sum, row) => sum + row.supportDeduction, 0),
+      // Held back to be recovered from these workers' later piece-rate earnings.
+      supportDeductionOwed: omitted.reduce((sum, row) => sum + row.supportDeductionOwed, 0),
     };
 
     return NextResponse.json(
@@ -96,6 +97,8 @@ export async function GET(req: Request) {
           // person's own rate. Itemised so the bank figure can be explained.
           supportPiecesDelegated: row.supportPiecesDelegated,
           supportDeduction: row.supportDeduction,
+          supportDeductionArising: row.supportDeductionArising,
+          supportDeductionOwed: row.supportDeductionOwed,
           salary: row.salary,
           overtime: row.overtime,
           other: row.other,
