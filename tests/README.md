@@ -34,6 +34,8 @@ place and untouched.
 | `split-allocation.test.ts` | One exact garment at one stage split across several workers (100 navy size-10 polos at SEWING → 40 / 35 / 25): partial shares and per-person remaining figures, over-allocation refused against the ledger's own figure, resizing bounded both ways, reassignment moving only unworked quantity so earned work and its pay stay put, submissions bounded by each worker's own share, per-worker inspection attribution asked for rather than invented, pay following the person who made each approved garment at the rate agreed with them, separation of duties extended to a supervisor who holds a share, carry-over of work submitted before a stage was split, and unsplit stages behaving exactly as before |
 | `route-driven-production.test.ts` | Exact garment variants (item + optional size + optional colour), variant-level allocation ceilings and partial allocation, routes that shorten / start late / end early / skip stages / run in their own order, the route being frozen on the batch, per-stage production methods, the five methods staying distinct, external work keeping sent / returned / accepted / rejected / short as separate figures with only the accepted figure moving on, ready-made purchases staying purchases, and worker dashboards showing the exact garment allocated |
 | `production-integrity.test.ts` | Quantity integrity: every counter derived from the production movement ledger, the four measured free-text quantity attacks refused, audited corrections with a mandatory reason, the upstream-approved ceiling that stops downstream over-allocation, approved quantity never correctable, the ledger append-only, an unmapped event type inert, the delivery stage role gate, the grouped payroll SQL agreeing with the pure pay rule, and order edits committing atomically |
+| `support-cost-allocation.test.ts` | Support labour as an INTERNAL ALLOCATION of one cost rather than a second cost, in the business's own numbers (300 x 100 approved = 30,000 gross commission; 18 pieces delegated at 30 pays the helper 540 and leaves the tailor 29,460; the order's labour cost stays 30,000, **not** 30,540). Also: support work inheriting the exact share it was handed out from so a helper is never pointed at a school chosen from scratch, payment and deduction on approved pieces only, a monthly-paid tailor having no commission to deduct from so the helper's pay stands alone as a real cost, a deduction never driving pay negative with the remainder held rather than written off, and a tailor being unable to hand out another tailor's share or more of their own than exists per supporting operation |
+| `cost-and-material-detail.test.ts` | Outsourced work as an external production cost with its own money: payable, paid, bank reference, payment date and promised return date, payable never exceeding the cost of the work, paid never exceeding payable, money already sent never quietly reduced, and the vendor never reaching payroll or being mistaken for tailor labour. Material as issued / used / returned / wasted against one stock figure: the invariant that they must not exceed what was issued, a mandatory written reason for a return or write-off, a record written the old way still meaning and costing exactly what it did, returns and write-offs recorded after the issue and never un-recorded, and usage paged and filtered in the database rather than loaded whole |
 | `support-payroll.test.ts` | Tailor support work paid on approved pieces only, the ban on approving your own support work (including a supervisor who also does the work), assignment and inspection history preserved, salaried non-production staff, the payroll breakdown and payment status, Owner-only payroll and payment sheet, and duplicate-payment prevention |
 
 ## How it works
@@ -61,7 +63,7 @@ inspection route against the actual data layer.
   suite; their schema is kept identical to the matching `drizzle/` migration,
   which is.
 - **One deliberate migration deviation.** pg-mem has no plpgsql interpreter, so
-  it cannot run `DO $$ ... $$` guard blocks. Migrations `0003` to `0008` each
+  it cannot run `DO $$ ... $$` guard blocks. Migrations `0003` to `0009` each
   wrap their `ADD CONSTRAINT` statements in one purely so the migration is
   re-runnable; because this database is always created empty those guards could
   never fire, so the statements inside run directly. The resulting schema is
@@ -122,6 +124,35 @@ inspection route against the actual data layer.
   | Count a split stage twice on the Workers page | `split-allocation` 13 only | all 196 others passed |
   | Show the stage's nominal worker on every inspection row instead of the one credited | `split-allocation` 20 only | all 197 others passed |
   | Let a worker see every worker's inspection rows on a shared stage | `split-allocation` 20 only | all 197 others passed |
+
+  **Task 4: support cost allocation, vendor payment detail and material detail.** Each
+  of these twelve was applied, run, and reverted byte-for-byte (md5 checked), and the
+  working tree was confirmed clean afterwards. Every one was caught - **12 / 12**. Unlike
+  the tables above, each mutation was run against the single file that covers the rule
+  rather than the whole suite, so the count given is the number of tests in that file
+  which failed, not a whole-suite figure:
+
+  | Mutation | Caught by | Tests failed |
+  | --- | --- | --- |
+  | Deduct from a tailor who has no piece rate (drop the `PER_PIECE` gate on the tailor) | `support-cost-allocation` 3 | 1 |
+  | Make support pay ADDITIVE again instead of deducted | `support-cost-allocation` 1 | 1 |
+  | Remove the cap, so a deduction drives pay negative instead of being carried | `support-cost-allocation` 4 | 1 |
+  | Double-count delegated support labour in the order's cost | `support-cost-allocation` 1 and 2 | 2 |
+  | Deduct from a salaried tailor in the cost model too | `support-cost-allocation` 3 | 1 |
+  | Let the support quantity ceiling ignore what was already handed out | `support-cost-allocation` 5 | 1 |
+  | Let any tailor hand out another tailor's share | `support-cost-allocation` 5 | 1 |
+  | Stop returned material going back into stock | `cost-and-material-detail` 3 | 1 |
+  | Drop the issued = used + returned + wasted invariant | `cost-and-material-detail` 3 | 1 |
+  | Let a vendor be paid more than is owed | `cost-and-material-detail` 1 | 1 |
+  | Let money already sent to a vendor be quietly reduced | `cost-and-material-detail` 1 | 1 |
+  | Stop wasted material being costed | `cost-and-material-detail` 3 | 1 |
+
+  **One defect these caught in the implementation before it shipped**, and it was silent:
+  payroll's deduction was gated on the *helper's* payment type only, so it carried a
+  deduction against a monthly-paid tailor who had no commission for it to come out of -
+  540 held forever against somebody who could never repay it. The cost model already
+  gated on the tailor correctly, so the two sides of the same rule disagreed. Caught by
+  "a monthly-paid tailor has nothing to deduct from, so the helper's pay stands alone".
 
   **Three defects the split-allocation tests caught in the implementation before it
   shipped.** Worth recording because all three were silent - every test suite was
