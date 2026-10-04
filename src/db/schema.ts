@@ -689,15 +689,19 @@ export const materialUsage = pgTable("material_usage", {
   quantityUsed: integer("quantity_used").notNull().default(0),
   /**
    * Issued / returned / wasted, around the `quantity_used` figure that has always
-   * driven cost.
+   * been there.
    *
-   * `quantityUsed` stays the number cost is calculated from, so no existing record
-   * changes meaning: a row written before these columns existed reads as issued 0,
-   * returned 0, wasted 0, used N - and new records are checked so that
-   * issued = used + returned + wasted. Nothing here is a second inventory system;
-   * `materials.current_stock` is still adjusted exactly as it always was.
+   * `quantityIssued` is NULLABLE on purpose: NULL means "this record predates issue
+   * tracking, or nobody separated the two", which reads as issued = used. A zero would
+   * claim nothing at all was handed out, which is a different statement. Returned and
+   * wasted default to 0, so every row written before these columns existed keeps the
+   * meaning it already had and no historical figure is restated.
+   *
+   * New records are checked so that used + returned + wasted never exceeds issued.
+   * Nothing here is a second inventory system: `materials.current_stock` is still the
+   * one stock figure, adjusted by what leaves the store and what comes back to it.
    */
-  quantityIssued: integer("quantity_issued").notNull().default(0),
+  quantityIssued: integer("quantity_issued"),
   quantityReturned: integer("quantity_returned").notNull().default(0),
   quantityWasted: integer("quantity_wasted").notNull().default(0),
   /** Who the material was issued to, or which process consumed it. */

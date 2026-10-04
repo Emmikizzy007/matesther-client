@@ -48,7 +48,7 @@ ALTER TABLE "external_work_orders" ADD COLUMN IF NOT EXISTS "amount_payable" int
 ALTER TABLE "external_work_orders" ADD COLUMN IF NOT EXISTS "amount_paid" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "external_work_orders" ADD COLUMN IF NOT EXISTS "payment_reference" text;--> statement-breakpoint
 ALTER TABLE "external_work_orders" ADD COLUMN IF NOT EXISTS "paid_at" timestamp;--> statement-breakpoint
-ALTER TABLE "material_usage" ADD COLUMN IF NOT EXISTS "quantity_issued" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "material_usage" ADD COLUMN IF NOT EXISTS "quantity_issued" integer;--> statement-breakpoint
 ALTER TABLE "material_usage" ADD COLUMN IF NOT EXISTS "quantity_returned" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "material_usage" ADD COLUMN IF NOT EXISTS "quantity_wasted" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "material_usage" ADD COLUMN IF NOT EXISTS "worker_id" integer;--> statement-breakpoint

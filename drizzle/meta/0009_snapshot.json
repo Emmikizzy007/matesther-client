@@ -932,8 +932,7 @@
           "name": "quantity_issued",
           "type": "integer",
           "primaryKey": false,
-          "notNull": true,
-          "default": 0
+          "notNull": false
         },
         "quantity_returned": {
           "name": "quantity_returned",
