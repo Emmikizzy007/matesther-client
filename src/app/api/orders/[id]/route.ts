@@ -178,6 +178,31 @@ export async function GET(
         revenue,
         profit,
         margin,
+        // Each category on its own, so a screen can read one line without walking the
+        // array, and so the nine categories are named rather than implied.
+        readyMade: costed.readyMade,
+        materials: costed.materials,
+        internalLabour: costed.internalLabour,
+        machineLabour: costed.machineLabour,
+        supportLabour: costed.supportLabour,
+        outsourced: costed.outsourced,
+        packaging: costed.packaging,
+        delivery: costed.delivery,
+        otherExpenses: costed.other,
+        /**
+         * Both sides of support pay, shown because it is an internal allocation of ONE
+         * labour cost and not a second cost: Matesther really pays the support worker,
+         * and that same money really comes back out of the tailor's gross commission for
+         * the same approved pieces. `supportLabour` is what it adds to this order, which
+         * is zero whenever the tailor is paid per piece.
+         */
+        supportGrossPaid: costed.supportGrossPaid,
+        supportDeductedFromTailors: costed.supportDeductedFromTailors,
+        supportAllocation: {
+          grossPaidToSupportWorkers: costed.supportGrossPaid,
+          deductedFromTailorCommission: costed.supportDeductedFromTailors,
+          addedToOrderCost: costed.supportLabour,
+        },
         lines: COST_LINES.map(({ key, label }) => ({ key, label, amount: costed[key] as number })),
         // Hand-entered expenses in these two categories describe material and labour
         // that the computed lines already cover, so they are reported but NOT added

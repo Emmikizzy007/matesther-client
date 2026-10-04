@@ -9,6 +9,7 @@ import {
   supportInspections,
 } from "@/db/schema";
 import { and, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { inspectionEarnings } from "@/lib/job-pay";
 import { staffCategories } from "@/lib/format";
 import { rolesByWorker, rolesForWorker } from "@/lib/worker-roles";
@@ -172,7 +173,23 @@ const SUPPORT_ROW = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${su
  * inspection, so a later rate change cannot rewrite pay already earned.
  */
 
-const DEDUCTION_SUM = SUPPORT_SUM;
+/**
+ * The tailor whose commission a support deduction comes out of, joined alongside the
+ * helper whose rate sets its amount. Aliased because one support inspection touches two
+ * workers at once and a single `workers` join cannot be both.
+ */
+const supportTailor = alias(workers, "payroll_support_tailor");
+
+/**
+ * What an approved support inspection deducts from the tailor who handed it out.
+ *
+ * The amount is the helper's, at the rate snapshotted on the inspection - one movement
+ * of money, two sides of it. But it only arises where the tailor actually HAS a piece
+ * rate for it to come out of. A tailor paid a flat monthly salary earns no commission,
+ * so there is nothing to deduct from and nothing to carry: the helper is still paid, and
+ * that pay is a real extra cost of the work rather than a slice of somebody's commission.
+ */
+const DEDUCTION_SUM = sql`coalesce(sum(case when ${supportTailor.paymentType} = 'PER_PIECE' and ${workers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
 
 type PieceworkRow = { workerId: number; pieces: number; piecework: number };
 
@@ -353,6 +370,7 @@ async function deductionSchedule(
       .from(supportInspections)
       .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
       .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
+      .innerJoin(supportTailor, eq(supportTailor.id, supportAssignments.assignedByWorkerId))
       .where(and(gte(supportInspections.inspectedAt, from), lt(supportInspections.inspectedAt, to),
         scope === undefined ? undefined : eq(supportAssignments.assignedByWorkerId, scope)))
       .groupBy(supportAssignments.assignedByWorkerId, supportMonth),

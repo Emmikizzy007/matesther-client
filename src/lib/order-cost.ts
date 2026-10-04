@@ -37,22 +37,36 @@ import { EXPENSE_CATEGORIES, READY_MADE_CATEGORY, sameRole } from "@/lib/format"
  *                  rate snapshotted when the work was approved.
  *   machineLabour  the same, on stages produced by MACHINE. Matesther's own machine
  *                  work is in-house, so it is labour, not a vendor bill.
- *   supportLabour  what helpers earned on support work for this order, LESS what that
- *                  took back out of the tailors who handed it out. See below.
+ *   supportLabour  what support work ADDS to the order's labour cost, which is normally
+ *                  zero. See below - this is an internal allocation, not a second cost.
  *   outsourced     external_work_orders.total_cost - OUTSOURCED and VENDOR_PROCESSING.
  *                  A vendor is not a worker and never appears in payroll.
  *   packaging      expenses categorised "Packaging".
  *   delivery       expenses categorised "Transportation".
  *   other          every remaining expense category (Electricity, Repairs, Other).
  *
- * WHY SUPPORT LABOUR IS NET OF THE DEDUCTION
- *   A tailor's full piece rate belongs to the garment. Handing a piece to a helper at
- *   an agreed rate has that rate DEDUCTED from the tailor's, not added on top. So the
- *   garment's labour cost is the tailor's rate either way, and counting the helper's
- *   pay as well would double-count it. Subtracting the deduction is what makes the two
- *   sides cancel. Where the tailor has no piece rate to deduct from - a tailor paid a
- *   flat monthly salary - no deduction arises, and the helper's pay correctly stands
- *   alone as a real extra cost.
+ * SUPPORT LABOUR IS AN INTERNAL ALLOCATION OF ONE COST, NOT A SECOND COST
+ *   Matesther pays the support worker directly - that money really leaves the business.
+ *   But it is not an ADDITIONAL labour cost on top of the tailor's commission, because
+ *   it comes out of that commission for the very same approved pieces.
+ *
+ *     Tailor rate 300 x 100 approved pieces  = 30,000 gross commission
+ *     18 of those pieces delegated at 30     =    540 paid to the support worker
+ *     Tailor's commission after deduction    = 29,460
+ *     Total internal labour cost             = 30,000   (NOT 30,540)
+ *
+ *   So `internalLabour` above is the tailor's GROSS commission, which already contains
+ *   the delegated pieces at their full rate, and `supportLabour` is what support work
+ *   adds on top of that - the helper's payment less the deduction it caused, which
+ *   cancels to zero. Counting the helper's pay as well would double-count the same
+ *   labour. The two sides are reported separately as `supportGrossPaid` and
+ *   `supportDeductedFromTailors` so the allocation is visible instead of hidden behind
+ *   a zero, and payroll shows both the payment to the helper and the deduction from
+ *   the tailor.
+ *
+ *   Where the tailor has no piece rate to deduct from - a tailor paid a flat monthly
+ *   salary - no deduction arises and the helper's pay correctly stands alone as a real
+ *   extra cost, because there is no gross commission for it to be part of.
  *
  * WHAT IS DELIBERATELY NOT COUNTED
  *   Hand-entered expense rows in the "Materials" and "Labour" categories overlap the
@@ -72,7 +86,15 @@ export type OrderCosts = {
   materials: number;
   internalLabour: number;
   machineLabour: number;
+  /**
+   * What support work ADDS to labour cost: the helper's approved payment less the
+   * deduction it caused in the tailor's commission. Zero in the ordinary case.
+   */
   supportLabour: number;
+  /** The cash Matesther pays support workers on this order, on approved pieces only. */
+  supportGrossPaid: number;
+  /** What that same money took back out of the tailors' gross commission. */
+  supportDeductedFromTailors: number;
   outsourced: number;
   packaging: number;
   delivery: number;
@@ -87,12 +109,14 @@ export type OrderCosts = {
   legacy: { totalCost: number; profit: number; margin: number };
 };
 
-const EMPTY: Omit<OrderCosts, "revenue" | "margin" | "legacy"> = {
+const EMPTY_COSTS: Omit<OrderCosts, "revenue" | "margin" | "legacy"> = {
   readyMade: 0,
   materials: 0,
   internalLabour: 0,
   machineLabour: 0,
   supportLabour: 0,
+  supportGrossPaid: 0,
+  supportDeductedFromTailors: 0,
   outsourced: 0,
   packaging: 0,
   delivery: 0,
@@ -102,6 +126,7 @@ const EMPTY: Omit<OrderCosts, "revenue" | "margin" | "legacy"> = {
   totalCost: 0,
   profit: 0,
 };
+void EMPTY_COSTS;
 
 /** Expense categories that describe something the computed cost lines already cover. */
 const SUPERSEDED_MATERIALS = "Materials";
@@ -159,6 +184,8 @@ type CostAccumulator = {
   internalLabour: number;
   machineLabour: number;
   supportLabour: number;
+  supportGrossPaid: number;
+  supportDeductedFromTailors: number;
   outsourced: number;
   packaging: number;
   delivery: number;
@@ -176,6 +203,8 @@ const newAccumulator = (): CostAccumulator => ({
   internalLabour: 0,
   machineLabour: 0,
   supportLabour: 0,
+  supportGrossPaid: 0,
+  supportDeductedFromTailors: 0,
   outsourced: 0,
   packaging: 0,
   delivery: 0,
@@ -210,6 +239,8 @@ function finalise(revenue: number, c: CostAccumulator): OrderCosts {
     internalLabour: round(c.internalLabour),
     machineLabour: round(c.machineLabour),
     supportLabour: round(c.supportLabour),
+    supportGrossPaid: round(c.supportGrossPaid),
+    supportDeductedFromTailors: round(c.supportDeductedFromTailors),
     outsourced: round(c.outsourced),
     packaging: round(c.packaging),
     delivery: round(c.delivery),
@@ -362,9 +393,15 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     const orderId = Number(row.orderId);
     if (!orderId) continue;
     const c = get(orderId);
-    // What the helper earned, less what came back out of the tailor's rate. Cancels to
-    // zero whenever the tailor is paid per piece, which is the point.
-    c.supportLabour += (Number(row.earned) || 0) - (Number(row.deducted) || 0);
+    const earned = Number(row.earned) || 0;
+    const deducted = Number(row.deducted) || 0;
+    // Both sides of one movement of money, reported so the allocation is visible.
+    c.supportGrossPaid += earned;
+    c.supportDeductedFromTailors += deducted;
+    // What the helper earned, less what came back out of the tailor's gross commission.
+    // Cancels to zero whenever the tailor is paid per piece, which is the point: the
+    // garment's labour cost is the piece rate once, however the work was divided.
+    c.supportLabour += earned - deducted;
   }
 
   /* ---- 6. outsourced and vendor processing ---- */
@@ -466,7 +503,7 @@ export const COST_LINES: { key: keyof OrderCosts; label: string }[] = [
   { key: "materials", label: "Raw materials" },
   { key: "internalLabour", label: "Internal labour" },
   { key: "machineLabour", label: "Machine labour" },
-  { key: "supportLabour", label: "Support labour (net)" },
+  { key: "supportLabour", label: "Support labour added (net of the tailor deduction)" },
   { key: "outsourced", label: "Outsourced / vendor" },
   { key: "packaging", label: "Packaging" },
   { key: "delivery", label: "Delivery" },

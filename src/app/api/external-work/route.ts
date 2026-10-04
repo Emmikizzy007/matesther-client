@@ -217,6 +217,24 @@ export async function POST(req: Request) {
     if (totalCost !== null && (!Number.isFinite(totalCost) || totalCost < 0))
       return NextResponse.json({ error: "The total cost must be zero or more." }, { status: 400 });
 
+    // What Matesther will owe the vendor, and when the work was promised back. Both are
+    // recorded AT DISPATCH so a bill still owing and a vendor running late are visible
+    // without anybody having to remember them. Payable defaults to the cost of the work.
+    const amountPayable = body.amountPayable === undefined || body.amountPayable === "" || body.amountPayable === null
+      ? (totalCost === null ? null : Math.round(totalCost))
+      : Number(body.amountPayable);
+    if (amountPayable !== null && (!Number.isSafeInteger(amountPayable) || amountPayable < 0))
+      return NextResponse.json({ error: "The amount payable must be a whole naira amount." }, { status: 400 });
+    if (amountPayable !== null && totalCost !== null && amountPayable > Math.round(totalCost))
+      return NextResponse.json({
+        error: `The vendor cannot be owed more (${amountPayable}) than the work costs (${Math.round(totalCost)}).`,
+      }, { status: 400 });
+    const expectedReturnAt = body.expectedReturnAt === undefined || body.expectedReturnAt === "" || body.expectedReturnAt === null
+      ? null
+      : new Date(String(body.expectedReturnAt));
+    if (body.expectedReturnAt && (!expectedReturnAt || Number.isNaN(expectedReturnAt.getTime())))
+      return NextResponse.json({ error: "Enter the expected return date as a real date." }, { status: 400 });
+
     const actor = { userId: session.id, name: session.name };
 
     const created = await db.transaction(async (tx) => {
@@ -230,6 +248,8 @@ export async function POST(req: Request) {
         quantitySent,
         unitCost,
         totalCost,
+        amountPayable,
+        expectedReturnAt,
         status: "SENT",
         sentBy: session.name,
         notes: body.notes ? String(body.notes).slice(0, 2000) : null,
@@ -343,6 +363,70 @@ export async function PUT(req: Request) {
     if ((rejected > 0 || short > 0) && !String(body.notes ?? dispatch.notes ?? "").trim())
       return NextResponse.json({ error: "Explain what was damaged or did not come back." }, { status: 400 });
 
+    /* ---------- what the vendor is owed, and what has been paid ----------
+     *
+     * A vendor is not a worker. This is an EXTERNAL PRODUCTION COST with its own
+     * payable, its own payments and its own reference - it never enters payroll and
+     * never creates a worker_payments row. Paying a vendor is also not the same event
+     * as accepting the goods back, so the two are recorded separately: work can be
+     * accepted and still unpaid, or paid on account before it returns.
+     */
+    const readMoney = (field: string, current: number | null) => {
+      const raw = body[field];
+      if (raw === undefined || raw === "") return current;
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0)
+        throw Object.assign(new Error(`${field} must be a whole naira amount.`), { status: 400 });
+      return value;
+    };
+    let totalCost: number | null;
+    let amountPayable: number | null;
+    let amountPaid: number | null;
+    let paymentReference: string | null;
+    let paidAt: Date | null;
+    try {
+      totalCost = readMoney("totalCost", dispatch.totalCost);
+      // What is owed defaults to the agreed cost of the work, so a dispatch is never
+      // silently recorded as costing nothing to pay.
+      amountPayable = readMoney("amountPayable", dispatch.amountPayable ?? dispatch.totalCost);
+      amountPaid = readMoney("amountPaid", dispatch.amountPaid);
+      paymentReference = body.paymentReference === undefined
+        ? dispatch.paymentReference
+        : String(body.paymentReference).trim().slice(0, 200) || null;
+      paidAt = dispatch.paidAt;
+    } catch (error: any) {
+      return NextResponse.json({ error: error?.message ?? "Enter whole naira amounts." }, { status: 400 });
+    }
+    if (amountPayable !== null && totalCost !== null && amountPayable > totalCost)
+      return NextResponse.json({
+        error: `The vendor cannot be owed more (${amountPayable}) than the work costs (${totalCost}).`,
+      }, { status: 400 });
+    if (amountPaid !== null && amountPayable !== null && amountPaid > amountPayable)
+      return NextResponse.json({
+        error: `Only ${amountPayable} is owed on this dispatch, so no more than that can be recorded as paid.`,
+      }, { status: 400 });
+    // Money already sent to a vendor is a fact. It can be added to, never quietly
+    // reduced - the same rule that protects an accepted quantity.
+    if (amountPaid !== null && dispatch.amountPaid !== null && amountPaid < dispatch.amountPaid)
+      return NextResponse.json({
+        error: `Already paid ${dispatch.amountPaid} on this dispatch, which cannot be un-paid (${amountPaid}). Record the difference with a reason instead.`,
+      }, { status: 400 });
+    if (amountPaid !== null && amountPaid > (dispatch.amountPaid ?? 0)) {
+      paidAt = dispatch.paidAt ?? new Date();
+      if (!paymentReference && body.paymentReference !== undefined)
+        return NextResponse.json({ error: "A payment needs its bank reference so it can be matched." }, { status: 400 });
+    }
+    /**
+     * Whether the vendor's bill on this dispatch is settled. Reported, never stored, so
+     * it can never disagree with the two amounts it comes from.
+     */
+    const settled = amountPayable !== null && (amountPaid ?? 0) >= amountPayable;
+    const expectedReturnAt = body.expectedReturnAt === undefined || body.expectedReturnAt === "" || body.expectedReturnAt === null
+      ? dispatch.expectedReturnAt
+      : new Date(String(body.expectedReturnAt));
+    if (body.expectedReturnAt && Number.isNaN(expectedReturnAt?.getTime() ?? NaN))
+      return NextResponse.json({ error: "Enter the expected return date as a real date." }, { status: 400 });
+
     const deltas = {
       returned: returned - dispatch.quantityReturned,
       accepted: accepted - dispatch.quantityAccepted,
@@ -375,11 +459,20 @@ export async function PUT(req: Request) {
         quantityAccepted: accepted,
         quantityRejected: rejected,
         quantityShort: short,
+        // `status` keeps its existing meaning - the GARMENTS are fully accounted for.
+        // Paying the vendor is a separate fact with its own field, because work can be
+        // accepted and still unpaid, and closing a dispatch on the goods must not hide
+        // a bill that is still owing.
         status: fullyAccounted ? "CLOSED" : "RETURNED",
         returnedAt: deltas.returned > 0 ? dispatch.returnedAt ?? new Date() : dispatch.returnedAt,
         closedAt: fullyAccounted ? dispatch.closedAt ?? new Date() : null,
         acceptedBy: deltas.accepted + deltas.rejected > 0 ? session.name : dispatch.acceptedBy,
-        totalCost: body.totalCost === undefined ? dispatch.totalCost : Number(body.totalCost) || null,
+        totalCost,
+        amountPayable,
+        amountPaid: amountPaid ?? 0,
+        paymentReference,
+        paidAt,
+        expectedReturnAt,
         notes: body.notes === undefined ? dispatch.notes : String(body.notes).slice(0, 2000) || null,
       }).where(eq(externalWorkOrders.id, dispatch.id)).returning();
 
@@ -399,7 +492,12 @@ export async function PUT(req: Request) {
     await refreshBatchAndOrder(op.productionBatchId);
     const quantities = await deriveQuantities(db, op.id);
     const [shaped] = await enrich([updated]);
-    return NextResponse.json({ ...(shaped ?? updated), stage: quantities });
+    return NextResponse.json({
+      ...(shaped ?? updated),
+      stage: quantities,
+      paymentStatus: settled ? "SETTLED" : (updated.amountPaid ?? 0) > 0 ? "PART_PAID" : "UNPAID",
+      amountOutstanding: Math.max(0, (updated.amountPayable ?? updated.totalCost ?? 0) - (updated.amountPaid ?? 0)),
+    });
   } catch (error) {
     console.error("External return failed", error);
     return NextResponse.json({ error: "Could not record this return." }, { status: 500 });
