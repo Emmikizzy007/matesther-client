@@ -120,8 +120,8 @@ inspection route against the actual data layer.
   | Drop the carry-over of work submitted before a stage was split | `split-allocation` 17 only | all 196 others passed |
   | Let a supervisor inspect a stage they hold a share of | `split-allocation` 14 only | all 196 others passed |
   | Count a split stage twice on the Workers page | `split-allocation` 13 only | all 196 others passed |
-  | Show the stage's nominal worker on every inspection row instead of the one credited | `split-allocation` 14 only | all 197 others passed |
-  | Let a worker see every worker's inspection rows on a shared stage | `split-allocation` 14 only | all 197 others passed |
+  | Show the stage's nominal worker on every inspection row instead of the one credited | `split-allocation` 20 only | all 197 others passed |
+  | Let a worker see every worker's inspection rows on a shared stage | `split-allocation` 20 only | all 197 others passed |
 
   **Three defects the split-allocation tests caught in the implementation before it
   shipped.** Worth recording because all three were silent - every test suite was
