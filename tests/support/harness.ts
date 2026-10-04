@@ -51,6 +51,7 @@ import * as readyMadeRoute from "@/app/api/ready-made/route";
 import * as orderSizesRoute from "@/app/api/order-sizes/route";
 import * as materialPurchasesRoute from "@/app/api/material-purchases/route";
 import * as materialUsageRoute from "@/app/api/material-usage/route";
+import * as allocationsRoute from "@/app/api/allocations/route";
 
 export const HOST = "matesther.test";
 export const ORIGIN = `http://${HOST}`;
@@ -124,6 +125,9 @@ const ROUTES: Record<string, Handler> = {
   "GET /api/material-purchases": materialPurchasesRoute.GET,
   "POST /api/material-purchases": materialPurchasesRoute.POST,
   "GET /api/material-usage": materialUsageRoute.GET,
+  "GET /api/allocations": allocationsRoute.GET,
+  "POST /api/allocations": allocationsRoute.POST,
+  "PUT /api/allocations": allocationsRoute.PUT,
   "POST /api/material-usage": materialUsageRoute.POST,
   "POST /api/ready-made": readyMadeRoute.POST,
   "PUT /api/ready-made": readyMadeRoute.PUT,

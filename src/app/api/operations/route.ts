@@ -8,6 +8,11 @@ import { STAGE_ROLES, isExternalMethod, isPurchasedMethod, methodLabel, variantL
 import { workerHoldsRole, type RoleCache } from "@/lib/worker-roles";
 import { MOVEMENT_EVENTS, applyMovements } from "@/lib/production-ledger";
 import { roleForStage } from "@/lib/production-route";
+import {
+  AllocationError,
+  liveAllocations,
+  submitAgainstAllocation,
+} from "@/lib/production-allocation";
 
 const STATUSES = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD", "CANCELLED"];
 
@@ -233,7 +238,11 @@ export async function PUT(req: Request) {
               : "Record what comes back under External Work & Ready-made; only what Matesther accepts counts."),
         }, { status: 400 });
       const workerId = await getLinkedWorkerId(session);
-      if (!workerId || current.workerId !== workerId)
+      // A stage split across several workers is governed by its allocations: the
+      // worker must hold one. A stage with no allocations keeps the original rule,
+      // which is every stage created before split allocation existed.
+      const stageAllocations = await liveAllocations(db, current.id);
+      if (!stageAllocations.length && (!workerId || current.workerId !== workerId))
         return NextResponse.json({ error: "You can only submit your own assigned jobs." }, { status: 403 });
       if (Object.keys(body).some((key) => !["id", "submitQty"].includes(key)))
         return NextResponse.json({ error: "Only your completed quantity can be submitted for inspection." }, { status: 403 });
@@ -249,8 +258,18 @@ export async function PUT(req: Request) {
       // one transaction: two submissions can no longer read the same
       // `quantity_completed` and lose one of them.
       const submitted = await db.transaction(async (tx) => {
+        // Bounded by THIS WORKER'S SHARE when the stage is split, so one tailor
+        // cannot submit garments allocated to another. Throws to roll the whole
+        // transaction back rather than leaving a half-written submission.
+        if (stageAllocations.length) {
+          const outcome = await submitAgainstAllocation(tx, current, workerId!, qty);
+          if (outcome && "error" in outcome) throw new AllocationError(outcome.error);
+        }
         await applyMovements(tx, current, actor, [{
-          type: MOVEMENT_EVENTS.SUBMISSION, quantity: qty, workerId: current.workerId,
+          // Attributed to the person who actually submitted, not to whoever the
+          // stage's legacy worker_id happens to name. For an unsplit stage those
+          // are the same worker, so nothing about existing behaviour changes.
+          type: MOVEMENT_EVENTS.SUBMISSION, quantity: qty, workerId: workerId ?? current.workerId,
           reason: `${qty} piece(s) submitted for inspection`,
         }]);
         const [row] = await tx.update(productionOperations).set({
@@ -330,6 +349,7 @@ export async function PUT(req: Request) {
     await refreshBatchAndOrder(current.productionBatchId);
     return NextResponse.json(updated);
   } catch (error) {
+    if (error instanceof AllocationError) return NextResponse.json({ error: error.message }, { status: 400 });
     console.error("Production job update failed", error);
     return NextResponse.json({ error: "Could not update this production job." }, { status: 500 });
   }

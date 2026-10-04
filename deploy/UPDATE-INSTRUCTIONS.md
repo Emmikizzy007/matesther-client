@@ -57,6 +57,29 @@ After deploying:
 
 The same change is recorded for the ORM as `drizzle/0005_support_work_and_payroll.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
 
+## Release: production allocations - splitting one stage across several workers
+
+1. **Back up the client database first.**
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-production-allocations.sql` and Run. It is additive and repeatable. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no change to any existing column's type or meaning, and **it writes no data at all** - no backfill and nothing to restate.
+3. Run verification queries **V1** to **V5** at the bottom of the file. V1 and V2 confirm nothing was written and that every historical inspection is still unattributed, which is what makes pay for existing work resolve exactly as it always has. V3 confirms the two `production_operations` uniqueness guarantees from the earlier upgrades are still in place - they are **kept deliberately**, see below.
+4. Only then deploy the new application code. **SQL first, code second.** The new code writes to `production_allocations` and reads `stage_inspections.worker_id`, so deploying it before this file would fail.
+
+### Why nothing had to be dropped
+
+`uniqueIndex(production_operations(production_batch_id, stage))` and `uniqueIndex(production_batch_id, route_position)` are both **kept**. They are what makes a batch's route unambiguous: "the next applicable stage" is found by position, and a duplicate stage row would let one of the two be starved. The limitation they were sometimes blamed for was never theirs - what blocked several workers on one stage was the single `production_operations.worker_id` column, and this release evolves that with a sub-table, the same shape `public.support_assignments` already uses against its parent operation. One stage row, several allocations against it. No competing production system.
+
+### What changes for the people using the system
+
+- A stage can be **split between workers**. 100 navy size-10 polos at SEWING can be 40 to one tailor, 35 to another, 25 to a third - one batch, one variant, one route, three shares. Do it from a production card under Active Production.
+- The shares can never add up to more than the stage holds, and what a stage holds comes from what the previous stage approved, not from anything typed in.
+- Each worker sees **their own share** on their own screen, not the whole stage, and can only submit against it.
+- Work can be **handed over** to another worker. Only work not yet submitted moves: what someone already submitted stays theirs, along with every approval it earns and the pay for it. The closed share is kept with the reason beside the new one.
+- Inspecting a split stage asks **whose work was judged**. That is deliberate: deciding which tailor's pieces were the good ones is a fact only the person at the inspection table knows, so it is asked for rather than guessed. A stage with one worker is inspected exactly as before, with no extra step.
+- Pay follows the person who made each approved garment, at the rate agreed with that person. Rates may differ between workers on the same stage.
+- If a stage is already being worked by one person when it is split, the work they have already submitted is carried into a share of their own first, so it stays attributed to them and counts against the ceiling.
+
+The same change is recorded for the ORM as `drizzle/0008_production_allocations.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
 ## Release: exact garment variants, production routes, methods and external work
 
 1. **Back up the client database first.**

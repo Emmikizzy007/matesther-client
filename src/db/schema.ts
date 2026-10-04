@@ -412,6 +412,23 @@ export const stageInspections = pgTable("stage_inspections", {
   productionOperationId: integer("production_operation_id")
     .references(() => productionOperations.id, { onDelete: "cascade" })
     .notNull(),
+  /**
+   * Which worker these approved pieces belong to.
+   *
+   * NULLABLE ON PURPOSE, AND NULL MEANS SOMETHING. A stage worked by one person
+   * was never attributed per worker, so every inspection recorded before split
+   * allocation has NULL here, and pay for it is still attributed through
+   * `production_operations.worker_id` exactly as before - payroll resolves
+   * `coalesce(stage_inspections.worker_id, production_operations.worker_id)`.
+   * That is why this column needs NO backfill: the fallback reproduces the old
+   * behaviour for every historical row.
+   *
+   * When a stage is split across several workers, one inspection writes ONE ROW
+   * PER WORKER, each carrying that worker's own attributed quantity and their own
+   * agreed rate snapshot. The stage's counters are still the sum of its ledger
+   * events, so the stage total and the per-worker split can never disagree.
+   */
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }),
   inspectedBy: text("inspected_by").notNull(),
   // Snapshot agreed pay per approved piece at inspection time.
   pieceRate: integer("piece_rate"),
@@ -423,7 +440,8 @@ export const stageInspections = pgTable("stage_inspections", {
 },
   (table) => [
     index("stage_inspections_operation_id_idx").on(table.productionOperationId),
-    index("stage_inspections_inspected_at_idx").on(table.inspectedAt)
+    index("stage_inspections_inspected_at_idx").on(table.inspectedAt),
+    index("stage_inspections_worker_id_idx").on(table.workerId)
   ]
 );
 // ---------- External production work ----------
@@ -807,6 +825,95 @@ export const deliveryLines = pgTable("delivery_lines", {
   (table) => [
     index("delivery_lines_delivery_id_idx").on(table.deliveryId),
     index("delivery_lines_order_item_id_idx").on(table.orderItemId)
+  ]
+);
+
+/**
+ * ---------- Production allocations: one exact stage split across workers ----------
+ *
+ * WHY THIS TABLE EXISTS
+ *   `production_operations` holds ONE `worker_id`, so a stage could only ever
+ *   belong to one person. A real order line - 100 navy size-10 polos at SEWING -
+ *   is often split: 40 to one tailor, 35 to another, 25 to a third. The only way
+ *   to express that before was several batches, which fragments the variant, the
+ *   route and the order's own allocation ceiling.
+ *
+ * WHY A SUB-TABLE AND NOT MORE `production_operations` ROWS
+ *   Task 2 added `uniqueIndex(production_operations(production_batch_id, stage))`
+ *   because "the next stage" was found by taking the FIRST row matching a stage
+ *   name - a duplicate would silently starve one of the two. Route progression now
+ *   reads `route_position`, and `uniqueIndex(production_batch_id, route_position)`
+ *   protects it the same way. Both indexes STAY: they are what makes a batch's
+ *   route unambiguous. The constraint that actually blocked several workers was
+ *   the single `worker_id` column, and that is what this table evolves - one stage
+ *   row, several allocations against it.
+ *
+ *   This is also the shape `support_assignments` already uses against its parent
+ *   operation, so it is not a new idea in this codebase.
+ *
+ * INVARIANTS, ALL ENFORCED SERVER-SIDE
+ *   - the allocations on one stage may never sum to more than the stage holds, and
+ *     what a stage holds comes from the movement ledger, not from a typed figure;
+ *   - an allocation may never be reduced below what that worker already submitted;
+ *   - approved quantity stays attributable to the person who earned it, so a
+ *     reassignment moves only the UNWORKED remainder and can never move pay;
+ *   - a stage with no allocation rows behaves exactly as it did before this table
+ *     existed, which is why no historical row needs backfilling.
+ */
+export const productionAllocations = pgTable("production_allocations", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productionOperationId: integer("production_operation_id")
+    .references(() => productionOperations.id, { onDelete: "cascade" })
+    .notNull(),
+  // Denormalised so a batch's or a variant's whole allocation picture is one
+  // indexed lookup.
+  productionBatchId: integer("production_batch_id")
+    .references(() => productionBatches.id, { onDelete: "cascade" })
+    .notNull(),
+  /** Stage identity carried as data, like every production_movements row. */
+  stage: text("stage").notNull(),
+  workerId: integer("worker_id")
+    .references(() => workers.id, { onDelete: "cascade" })
+    .notNull(),
+  /**
+   * The rate agreed with THIS worker for THIS stage, snapshotted when the
+   * allocation was made. Workers on the same stage may legitimately agree
+   * different rates, and a later change to anyone's profile rate must not
+   * restate what was already agreed.
+   */
+  pieceRate: integer("piece_rate"),
+  quantityAllocated: integer("quantity_allocated").notNull().default(0),
+  quantitySubmitted: integer("quantity_submitted").notNull().default(0),
+  quantityApproved: integer("quantity_approved").notNull().default(0),
+  quantityRework: integer("quantity_rework").notNull().default(0),
+  quantityRejected: integer("quantity_rejected").notNull().default(0),
+  status: text("status").notNull().default("ASSIGNED"),
+  assignedAt: timestamp("assigned_at").defaultNow(),
+  assignedByUserId: integer("assigned_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  assignedByName: text("assigned_by_name"),
+  /**
+   * The allocation this one inherited unworked quantity from. Reassignment is a
+   * new row pointing back at the old one rather than an edit of it, so the trail
+   * shows who had the work first, how much they did, and why it moved.
+   */
+  transferredFromId: integer("transferred_from_id"),
+  reason: text("reason"),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("production_allocations_operation_id_idx").on(table.productionOperationId),
+    index("production_allocations_batch_id_idx").on(table.productionBatchId),
+    index("production_allocations_worker_id_idx").on(table.workerId),
+    index("production_allocations_status_idx").on(table.status),
+    // A worker holds ONE live allocation per stage. A transfer closes the old row
+    // (status TRANSFERRED or CANCELLED) and opens a new one, so this partial
+    // uniqueness is what stops the same person being allocated the same stage
+    // twice and double-counting their share.
+    uniqueIndex("production_allocations_live_one_per_worker_unique")
+      .on(table.productionOperationId, table.workerId)
+      .where(sql`${table.status} in ('ASSIGNED', 'ACTIVE')`),
   ]
 );
 

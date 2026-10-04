@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Search, ClipboardCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
+import { StageAllocations } from "@/components/StageAllocations";
 import { fmtDate, methodLabel, stageLabel, STAGES, STAGE_ROLES, personHoldsRole } from "@/lib/format";
 
 // Was a sixth hand-typed copy of the stage -> role map. Now the shared one from
@@ -288,6 +289,15 @@ export default function ProductionPage() {
                 correction, which keeps who changed it, when and why.
               </p>
             </div>
+            {/* One stage, several workers: 100 navy size-10 polos at SEWING split
+                40 / 35 / 25. Every limit here is also enforced server-side against
+                the movement ledger. */}
+            <StageAllocations
+              operation={{ id: selected.id, stage: selected.stage, method: selected.method ?? "INTERNAL", quantityReceived: selected.quantityReceived ?? 0, workerId: selected.workerId ?? null }}
+              workers={workers}
+              requiredRole={STAGE_SPECIALTIES[selected.stage] ?? null}
+              onChanged={load}
+            />
             <Field label="Expected completion"><input type="date" value={selected.expectedCompletionDate || ""} onChange={(e) => setSelected({ ...selected, expectedCompletionDate: e.target.value })} className={inputCls} /></Field>
             <Field label="Notes" className="sm:col-span-2">
               <textarea value={selected.notes || ""} onChange={(e) => setSelected({ ...selected, notes: e.target.value })} className={inputCls} rows={2} />

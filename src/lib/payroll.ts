@@ -8,7 +8,7 @@ import {
   supportAssignments,
   supportInspections,
 } from "@/db/schema";
-import { and, eq, gte, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { inspectionEarnings } from "@/lib/job-pay";
 import { staffCategories } from "@/lib/format";
 import { rolesByWorker, rolesForWorker } from "@/lib/worker-roles";
@@ -110,6 +110,21 @@ export interface WorkerAccrual {
  * `assertSqlMatchesInspectionEarnings()` in the same test file proves the two
  * agree rather than leaving them to drift.
  */
+/**
+ * Who an inspection's approved pieces belong to.
+ *
+ * `stage_inspections.worker_id` is NULL on every inspection recorded before a stage
+ * could be split across workers, and for those the answer is the stage's own
+ * worker - which is exactly what payroll has always done. Where a stage IS split,
+ * each inspection row names the worker it was attributed to, so pay follows the
+ * person who actually made the garment rather than whoever the stage happens to be
+ * nominally assigned to.
+ *
+ * Defining it once here is what keeps the monthly accrual, the twelve-month history
+ * and the Workers page lifetime figure from ever disagreeing about attribution.
+ */
+const PAID_WORKER = sql`coalesce(${stageInspections.workerId}, ${productionOperations.workerId})`;
+
 const PIECEWORK_SUM = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
 const SUPPORT_SUM = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
 
@@ -124,21 +139,21 @@ type SupportRow = { workerId: number; supportPieces: number; supportPiecework: n
 async function stagePiecework(from: Date, to: Date, workerId?: number): Promise<Map<number, PieceworkRow>> {
   const rows = await db
     .select({
-      workerId: productionOperations.workerId,
+      workerId: PAID_WORKER,
       pieces: sql<number>`coalesce(sum(${stageInspections.quantityApproved}), 0)`,
       piecework: PIECEWORK_SUM,
     })
     .from(stageInspections)
     .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
-    .innerJoin(workers, eq(workers.id, productionOperations.workerId))
+    .innerJoin(workers, eq(workers.id, PAID_WORKER))
     .where(
       and(
         gte(stageInspections.inspectedAt, from),
         lt(stageInspections.inspectedAt, to),
-        workerId === undefined ? undefined : eq(productionOperations.workerId, workerId)
+        workerId === undefined ? undefined : eq(PAID_WORKER, workerId)
       )
     )
-    .groupBy(productionOperations.workerId);
+    .groupBy(PAID_WORKER);
   return new Map(
     rows.map((row) => [
       Number(row.workerId),
@@ -396,7 +411,9 @@ export async function workerHistory(workerId: number, month: string) {
       .innerJoin(workers, eq(workers.id, productionOperations.workerId))
       .where(
         and(
-          eq(productionOperations.workerId, workerId),
+          // Their work either names them directly (a split stage) or predates split
+          // allocation and is attributed through the stage's own worker.
+          or(eq(stageInspections.workerId, workerId), and(isNull(stageInspections.workerId), eq(productionOperations.workerId, workerId))),
           gte(stageInspections.inspectedAt, from),
           lt(stageInspections.inspectedAt, to)
         )

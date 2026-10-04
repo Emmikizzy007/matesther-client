@@ -3,6 +3,7 @@ import { db } from "@/db";
 import {
   stageInspections,
   productionOperations,
+  productionAllocations,
   productionBatches,
   orders,
   customers,
@@ -13,6 +14,8 @@ import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE, STAFF } from "@/lib/authz";
 import { MOVEMENT_EVENTS, applyMovements } from "@/lib/production-ledger";
 import { releaseApprovedToNextStage, statusFromQuantities } from "@/lib/production-route";
+import { operationIdsForWorker } from "@/lib/production-allocation";
+import { liveAllocations, validateAttributions, type Allocation } from "@/lib/production-allocation";
 
 /**
  * GET /api/inspections?operationId=&orderId=&limit=
@@ -49,12 +52,11 @@ export async function GET(req: Request) {
     const scopes: number[][] = [];
     if (operationId) scopes.push([operationId]);
     if (__user.role === "WORKER") {
-      // Workers only see inspection history on their own jobs.
-      const own = await db
-        .select({ id: productionOperations.id })
-        .from(productionOperations)
-        .where(eq(productionOperations.workerId, myWorkerId!));
-      scopes.push(own.map((row) => row.id));
+      // A Worker's scope is applied to the inspection ROWS rather than to
+      // operations, because a stage split across workers writes one row per worker
+      // credited and all of them point at the same operation. See
+      // workerInspectionScope below.
+      scopes.push(await ownOperationIds(myWorkerId!));
     }
     if (orderId) {
       const forOrder = await db
@@ -71,7 +73,12 @@ export async function GET(req: Request) {
     const rows = await db
       .select()
       .from(stageInspections)
-      .where(scopeIds === null ? undefined : inArray(stageInspections.productionOperationId, scopeIds))
+      .where(
+        and(
+          scopeIds === null ? undefined : inArray(stageInspections.productionOperationId, scopeIds),
+          __user.role === "WORKER" ? eq(stageInspections.workerId, myWorkerId!) : undefined
+        )
+      )
       .orderBy(desc(stageInspections.inspectedAt), desc(stageInspections.id))
       .limit(limit);
     if (!rows.length) return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
@@ -105,7 +112,10 @@ export async function GET(req: Request) {
       ? await db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
       : [];
     const cMap = new Map(customerRows.map((c) => [c.id, c]));
-    const workerIds = [...new Set(ops.map((o) => o.workerId).filter((v): v is number => !!v))];
+    const workerIds = [...new Set([
+      ...ops.map((o) => o.workerId),
+      ...rows.map((r) => r.workerId),
+    ].filter((v): v is number => !!v))];
     const workerRows = workerIds.length
       ? await db.select({ id: workers.id, name: workers.name }).from(workers).where(inArray(workers.id, workerIds))
       : [];
@@ -122,13 +132,39 @@ export async function GET(req: Request) {
         orderId: order?.id ?? null,
         orderNumber: order?.orderNumber ?? "-",
         customer: cMap.get(order?.customerId ?? -1)?.name ?? "-",
-        workerName: op?.workerId ? wMap.get(op.workerId)?.name ?? null : null,
+        // A split stage writes one row per worker credited, so the name shown has to
+        // come from the row's own attribution. Falling back to the stage's nominal
+        // worker is what keeps every unattributed historical row reading exactly as
+        // it did before.
+        workerName: (() => {
+          const credited = r.workerId ?? op?.workerId ?? null;
+          return credited ? wMap.get(credited)?.name ?? null : null;
+        })(),
       };
     });
     return NextResponse.json(data, { headers: { "Cache-Control": "private, no-store" } });
   } catch (e: any) {
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }
+}
+
+/**
+ * The operations a Worker is the nominal worker on.
+ *
+ * Kept as an operation-id scope so it composes with the `operationId` and `orderId`
+ * filters. Row-level attribution is applied separately, because on a stage split
+ * across workers the operation is shared but the inspection rows are not.
+ */
+async function ownOperationIds(workerId: number): Promise<number[]> {
+  const own = await db
+    .select({ id: productionOperations.id })
+    .from(productionOperations)
+    .where(eq(productionOperations.workerId, workerId));
+  // A worker who holds a share of a stage they are not nominally assigned to must
+  // still see that stage's history - but only the rows credited to them, which the
+  // row-level filter above guarantees.
+  const shared = await operationIdsForWorker(workerId);
+  return [...new Set([...own.map((row) => row.id), ...shared])];
 }
 
 /**
@@ -177,9 +213,14 @@ export async function POST(req: Request) {
       .from(productionOperations)
       .where(eq(productionOperations.id, opId));
     if (!op) return NextResponse.json({ error: "Operation not found." }, { status: 404 });
+    // A stage may now be split across several workers, so "is this my own work?"
+    // has to consider the allocations as well as the stage's legacy worker_id -
+    // otherwise a supervisor could hold a share of a stage and then inspect it.
+    const allocations = await liveAllocations(db, op.id);
     if (inspector.role === "PRODUCTION_MANAGER") {
       const access = await productionAccess(inspector);
-      if (access.workerId && op.workerId === access.workerId)
+      const holdsShare = !!access.workerId && allocations.some((row) => row.workerId === access.workerId);
+      if (access.workerId && (op.workerId === access.workerId || holdsShare))
         return NextResponse.json({
           error: "You cannot inspect your own production work. Ask the Owner or another supervisor to inspect this job.",
         }, { status: 403 });
@@ -194,32 +235,105 @@ export async function POST(req: Request) {
         { status: 400 }
       );
 
+    // A split stage must be attributed per worker. Deciding whose pieces were the
+    // good ones is a fact only the person at the inspection table knows, so it is
+    // asked for rather than invented - see validateAttributions.
+    let shares: { workerId: number | null; allocation: Allocation | null; approved: number; rework: number; rejected: number; rate: number | null }[];
+    if (allocations.length > 1) {
+      const checked = validateAttributions(allocations, b.attributions, { approved, rework, rejected });
+      if (!checked.ok) return NextResponse.json({ error: checked.error }, { status: 400 });
+      const byId = new Map(allocations.map((row) => [row.id, row]));
+      const shareWorkers = await db.select().from(workers).where(inArray(workers.id, checked.rows.map((row) => byId.get(row.allocationId)!.workerId)));
+      const workerById = new Map(shareWorkers.map((person) => [person.id, person]));
+      shares = checked.rows
+        .filter((row) => row.approved + row.rework + row.rejected > 0)
+        .map((row) => {
+          const allocation = byId.get(row.allocationId)!;
+          const person = workerById.get(allocation.workerId);
+          return {
+            workerId: allocation.workerId,
+            allocation,
+            approved: row.approved,
+            rework: row.rework,
+            rejected: row.rejected,
+            // The rate agreed with THIS worker for THIS stage, then the same
+            // fallbacks that have always applied: the job rate, then their profile.
+            rate: allocation.pieceRate ?? (person?.paymentType === "PER_PIECE" ? op.pieceRate ?? person.paymentRate : null),
+          };
+        });
+      if (!shares.length)
+        return NextResponse.json({ error: "Name which worker each judged garment belongs to." }, { status: 400 });
+    } else {
+      // One worker, or none: exactly the single inspection row this route has always
+      // written. `workerId` stays NULL when the stage was never split, which is what
+      // makes payroll fall back to production_operations.worker_id for every
+      // inspection recorded before allocations existed.
+      const only = allocations[0] ?? null;
+      let rate = agreedRate;
+      if (only) {
+        const [person] = await db.select().from(workers).where(eq(workers.id, only.workerId)).limit(1);
+        rate = only.pieceRate ?? (person?.paymentType === "PER_PIECE" ? op.pieceRate ?? person.paymentRate : null);
+      }
+      shares = [{ workerId: only?.workerId ?? null, allocation: only, approved, rework, rejected, rate }];
+    }
+
     const actor = { userId: inspector.id, name: inspector.name };
     const updated = await db.transaction(async (tx) => {
-      // 1. Record the inspection (audit trail) and the ledger rows it implies,
-      //    so the counters and their evidence are written together.
-      const [recorded] = await tx.insert(stageInspections).values({
-        productionOperationId: opId,
-        inspectedBy: inspector.name,
-        pieceRate: agreedRate,
-        quantityApproved: approved,
-        quantityRework: rework,
-        quantityRejected: rejected,
-        notes: b.notes || null,
-      }).returning({ id: stageInspections.id });
+      // 1. One inspection row per worker credited, so the audit trail says who made
+      //    the pieces that were approved - and so pay follows the right person.
+      //    Each row carries that worker's own rate snapshot.
+      const recorded = await Promise.all(
+        shares.map((share) =>
+          tx.insert(stageInspections).values({
+            productionOperationId: opId,
+            workerId: share.workerId,
+            inspectedBy: inspector.name,
+            pieceRate: share.rate,
+            quantityApproved: share.approved,
+            quantityRework: share.rework,
+            quantityRejected: share.rejected,
+            notes: b.notes || null,
+          }).returning({ id: stageInspections.id })
+        )
+      );
 
       // 2. Stage counters are DERIVED from the ledger, not incremented by hand.
-      const derived = await applyMovements(tx, op, actor, [
-        { type: MOVEMENT_EVENTS.INSPECTION_APPROVED, quantity: approved, workerId: op.workerId,
-          referenceType: "STAGE_INSPECTION", referenceId: recorded.id,
-          reason: "Inspection approved these pieces", notes: b.notes || null, occurredAt: new Date() },
-        { type: MOVEMENT_EVENTS.INSPECTION_REWORK, quantity: rework, workerId: op.workerId,
-          referenceType: "STAGE_INSPECTION", referenceId: recorded.id,
-          reason: "Inspection sent these pieces back for rework", notes: b.notes || null, occurredAt: new Date() },
-        { type: MOVEMENT_EVENTS.INSPECTION_REJECTED, quantity: rejected, workerId: op.workerId,
-          referenceType: "STAGE_INSPECTION", referenceId: recorded.id,
-          reason: "Inspection rejected these pieces", notes: b.notes || null, occurredAt: new Date() },
-      ]);
+      //    One event set per worker, each pointing at its own inspection row, so the
+      //    stage total and the per-worker split can never disagree - the stage total
+      //    IS the sum of the splits.
+      const derived = await applyMovements(tx, op, actor, recorded.flatMap(([row], index) => {
+        const share = shares[index];
+        return [
+          { type: MOVEMENT_EVENTS.INSPECTION_APPROVED, quantity: share.approved, workerId: share.workerId,
+            referenceType: "STAGE_INSPECTION", referenceId: row.id,
+            reason: "Inspection approved these pieces", notes: b.notes || null, occurredAt: new Date() },
+          { type: MOVEMENT_EVENTS.INSPECTION_REWORK, quantity: share.rework, workerId: share.workerId,
+            referenceType: "STAGE_INSPECTION", referenceId: row.id,
+            reason: "Inspection sent these pieces back for rework", notes: b.notes || null, occurredAt: new Date() },
+          { type: MOVEMENT_EVENTS.INSPECTION_REJECTED, quantity: share.rejected, workerId: share.workerId,
+            referenceType: "STAGE_INSPECTION", referenceId: row.id,
+            reason: "Inspection rejected these pieces", notes: b.notes || null, occurredAt: new Date() },
+        ];
+      }));
+
+      // Each worker's own allocation is credited with what was judged of THEIR work,
+      // so what they can still submit, and what they are owed, stays per person.
+      for (const share of shares) {
+        if (!share.allocation) continue;
+        const allocation = share.allocation;
+        const nextApproved = allocation.quantityApproved + share.approved;
+        const nextRework = allocation.quantityRework + share.rework;
+        const nextRejected = allocation.quantityRejected + share.rejected;
+        const judged = nextApproved + nextRework + nextRejected;
+        await tx.update(productionAllocations).set({
+          quantityApproved: nextApproved,
+          quantityRework: nextRework,
+          quantityRejected: nextRejected,
+          status: judged >= allocation.quantityAllocated && allocation.quantitySubmitted >= allocation.quantityAllocated
+            ? "COMPLETED"
+            : allocation.status,
+        }).where(eq(productionAllocations.id, allocation.id));
+      }
 
       // 3. Only approved pieces move to the next APPLICABLE ROUTE STAGE.
       //

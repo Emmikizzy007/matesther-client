@@ -59,6 +59,7 @@ const MIGRATIONS = [
   "0005_support_work_and_payroll",
   "0006_production_ledger_and_indexes",
   "0007_variants_routes_and_external_work",
+  "0008_production_allocations",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 
@@ -117,6 +118,11 @@ const REQUIRED_COLUMNS = [
   ["production_batches", "route_id"],
   ["external_work_orders", "quantity_short"],
   ["material_purchases", "order_variant_id"],
+  // Fails loudly if migration 0008 was not applied: splitting one stage across
+  // several workers depends on both of these.
+  ["production_allocations", "quantity_allocated"],
+  ["production_allocations", "transferred_from_id"],
+  ["stage_inspections", "worker_id"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);

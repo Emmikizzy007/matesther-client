@@ -1,4 +1,4 @@
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   workers,
@@ -11,10 +11,12 @@ import {
   stageInspections,
   supportAssignments,
   supportInspections,
+  productionAllocations,
 } from "@/db/schema";
 import { getLinkedWorkerId, type SessionUser } from "@/lib/authz";
 import { inspectionPieceRate } from "@/lib/job-pay";
 import { methodLabel, variantLabel } from "@/lib/format";
+import { LIVE_ALLOC_STATUSES, operationIdsForWorker } from "@/lib/production-allocation";
 
 /** Personal jobs and earnings, also available to a manager for their own factory work. No company-level figures. */
 export async function getWorkerDashboard(user: SessionUser) {
@@ -36,7 +38,43 @@ export async function getWorkerDashboard(user: SessionUser) {
     };
   }
 
+  // Stages this worker holds a share of, because a stage may now be split across
+  // several people and `production_operations.worker_id` alone would hide it.
+  const allocatedOperationIds = await operationIdsForWorker(profile.id);
+  const myAllocations = allocatedOperationIds.length
+    ? await db
+        .select()
+        .from(productionAllocations)
+        .where(
+          and(
+            eq(productionAllocations.workerId, profile.id),
+            inArray(productionAllocations.status, LIVE_ALLOC_STATUSES),
+            inArray(productionAllocations.productionOperationId, allocatedOperationIds)
+          )
+        )
+    : [];
+  const allocationByOperation = new Map(myAllocations.map((row) => [row.productionOperationId, row]));
+  // How many people share each of those stages, so the screen can say "you hold 40
+  // of the 100 at this stage, split between 3 tailors" instead of implying the whole
+  // stage is theirs.
+  const allShares = allocatedOperationIds.length
+    ? await db
+        .select({ operationId: productionAllocations.productionOperationId })
+        .from(productionAllocations)
+        .where(
+          and(
+            inArray(productionAllocations.status, LIVE_ALLOC_STATUSES),
+            inArray(productionAllocations.productionOperationId, allocatedOperationIds)
+          )
+        )
+    : [];
+  const sharesByOperation = new Map<number, number>();
+  for (const row of allShares) sharesByOperation.set(row.operationId, (sharesByOperation.get(row.operationId) ?? 0) + 1);
+
   // Fetch only work assigned to the linked worker, never all company finances.
+  // A stage belongs to them either because it names them (the original single-worker
+  // model, and every stage created before split allocation existed) or because they
+  // hold an allocation on it.
   const rows = await db
     .select({
       operation: productionOperations,
@@ -52,7 +90,11 @@ export async function getWorkerDashboard(user: SessionUser) {
     .leftJoin(customers, eq(orders.customerId, customers.id))
     .leftJoin(orderItems, eq(productionBatches.orderItemId, orderItems.id))
     .leftJoin(products, eq(orderItems.productId, products.id))
-    .where(eq(productionOperations.workerId, profile.id));
+    .where(
+      allocatedOperationIds.length
+        ? or(eq(productionOperations.workerId, profile.id), inArray(productionOperations.id, allocatedOperationIds))
+        : eq(productionOperations.workerId, profile.id)
+    );
 
   // How long each batch's own route is, so a card can say "stage 2 of 3" instead
   // of implying the eight-stage pipeline. One grouped query for this worker's
@@ -67,7 +109,13 @@ export async function getWorkerDashboard(user: SessionUser) {
     : [];
   const routeLengthByBatch = new Map(routeLengthRows.map((row) => [Number(row.batchId), Number(row.stages)]));
 
-  const journal = rows.map(({ operation, batch, order, customer, garment }) => ({
+  const journal = rows.map(({ operation, batch, order, customer, garment }) => {
+    // THEIR SHARE, not the stage's total. On a stage split three ways the worker is
+    // allocated a specific number of a specific garment, and that is what their own
+    // screen must show - the stage total belongs on the supervisor's board.
+    const mine = allocationByOperation.get(operation.id) ?? null;
+    const stagePending = Math.max(0, operation.quantityCompleted - operation.quantityInspected);
+    return {
     ...operation,
     batchNumber: batch.batchNumber,
     batchQuantity: batch.quantity,
@@ -88,9 +136,22 @@ export async function getWorkerDashboard(user: SessionUser) {
     customer: customer?.name ?? "School not recorded",
     garment: garment?.name ?? "Uniform order",
     workerName: profile.name,
-    pendingInspection: Math.max(0, operation.quantityCompleted - operation.quantityInspected),
-    availableToSubmit: Math.max(0, operation.quantityRemaining - Math.max(0, operation.quantityCompleted - operation.quantityInspected)),
-  }));
+    pendingInspection: stagePending,
+    availableToSubmit: mine
+      ? // Bounded by their own allocation: one tailor cannot submit the garments
+        // that were allocated to another.
+        Math.max(0, mine.quantityAllocated - mine.quantitySubmitted)
+      : Math.max(0, operation.quantityRemaining - stagePending),
+    // Their own figures on this stage. On an unsplit stage these are the stage's
+    // figures, so every screen that already reads them keeps working.
+    allocated: mine ? mine.quantityAllocated : operation.quantityReceived,
+    mySubmitted: mine ? mine.quantitySubmitted : operation.quantityCompleted,
+    myApproved: mine ? mine.quantityApproved : operation.quantityApproved,
+    myPieceRate: mine ? mine.pieceRate : operation.pieceRate,
+    myAllocationId: mine?.id ?? null,
+    stageSplitBetween: sharesByOperation.get(operation.id) ?? (mine ? 1 : 0),
+  };
+  });
 
   const opIds = rows.map(({ operation }) => operation.id);
   const inspections = opIds.length
@@ -99,6 +160,12 @@ export async function getWorkerDashboard(user: SessionUser) {
   const jobById = new Map(journal.map((job) => [job.id, job]));
   const perPiece = profile.paymentType === "PER_PIECE";
   const productionEvents = inspections
+    // A split stage has one inspection row PER WORKER credited, all pointing at the
+    // same operation. Without this filter a tailor sharing a stage would see - and
+    // be shown earnings for - every other tailor's approved pieces on it. An
+    // unattributed row belongs to the stage's own worker, which is how every
+    // inspection recorded before split allocation existed is still credited.
+    .filter((check) => check.workerId === profile.id || (check.workerId === null && jobById.get(check.productionOperationId)?.workerId === profile.id))
     .filter((check) => check.quantityApproved > 0 && perPiece)
     .map((check) => {
       const job = jobById.get(check.productionOperationId);

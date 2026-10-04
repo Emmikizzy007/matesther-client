@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 177 tests in about 75 seconds. No server, no `DATABASE_URL`, no network,
+Runs 198 tests in about 80 seconds. No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists
@@ -31,6 +31,7 @@ place and untouched.
 | `multi-role.test.ts` | One person with several roles: no duplicate people, no duplicate roles, role removal keeps the person, legacy single-role workers unchanged, and the cutter-supervisor and self-inspection controls still holding when the role is one of several |
 | `pwa-branding.test.ts` | Installability contract, and the official-logo endpoint: Owner-only upload, the committed official mark served byte-for-byte when none is uploaded, SVG and undersized uploads refused, the stored logo returned **byte-for-byte**, square OS icons, the install button never faked, and the mobile safe-area / tap-target / iOS-zoom fixes |
 | `whatsapp-sharing.test.ts` | WhatsApp deep links: correct `wa.me` number normalisation, refusal to guess an unusable number, no application URL in a shared message, confidentiality handling on the Owner-only payment sheet, and the Owner-only guard still holding on the documents behind the share buttons |
+| `split-allocation.test.ts` | One exact garment at one stage split across several workers (100 navy size-10 polos at SEWING → 40 / 35 / 25): partial shares and per-person remaining figures, over-allocation refused against the ledger's own figure, resizing bounded both ways, reassignment moving only unworked quantity so earned work and its pay stay put, submissions bounded by each worker's own share, per-worker inspection attribution asked for rather than invented, pay following the person who made each approved garment at the rate agreed with them, separation of duties extended to a supervisor who holds a share, carry-over of work submitted before a stage was split, and unsplit stages behaving exactly as before |
 | `route-driven-production.test.ts` | Exact garment variants (item + optional size + optional colour), variant-level allocation ceilings and partial allocation, routes that shorten / start late / end early / skip stages / run in their own order, the route being frozen on the batch, per-stage production methods, the five methods staying distinct, external work keeping sent / returned / accepted / rejected / short as separate figures with only the accepted figure moving on, ready-made purchases staying purchases, and worker dashboards showing the exact garment allocated |
 | `production-integrity.test.ts` | Quantity integrity: every counter derived from the production movement ledger, the four measured free-text quantity attacks refused, audited corrections with a mandatory reason, the upstream-approved ceiling that stops downstream over-allocation, approved quantity never correctable, the ledger append-only, an unmapped event type inert, the delivery stage role gate, the grouped payroll SQL agreeing with the pure pay rule, and order edits committing atomically |
 | `support-payroll.test.ts` | Tailor support work paid on approved pieces only, the ban on approving your own support work (including a supervisor who also does the work), assignment and inspection history preserved, salaried non-production staff, the payroll breakdown and payment status, Owner-only payroll and payment sheet, and duplicate-payment prevention |
@@ -60,7 +61,7 @@ inspection route against the actual data layer.
   suite; their schema is kept identical to the matching `drizzle/` migration,
   which is.
 - **One deliberate migration deviation.** pg-mem has no plpgsql interpreter, so
-  it cannot run `DO $$ ... $$` guard blocks. Migrations `0003` to `0007` each
+  it cannot run `DO $$ ... $$` guard blocks. Migrations `0003` to `0008` each
   wrap their `ADD CONSTRAINT` statements in one purely so the migration is
   re-runnable; because this database is always created empty those guards could
   never fire, so the statements inside run directly. The resulting schema is
@@ -110,6 +111,35 @@ inspection route against the actual data layer.
   | Let a dispatch send out more garments than the stage holds | `route-driven-production` 23 and 24 | all 172 others passed |
   | Let a worker submit pieces against an outsourced or bought-in stage | `route-driven-production` 38 and 40 | all 175 others passed |
   | Treat `MACHINE` as work that leaves the factory | `route-driven-production` 39 only | all 176 others passed |
+  | Let the shares of a stage exceed what the stage holds | `split-allocation` 4, 5 and 6 | all 194 others passed |
+  | Let a transfer move work the original worker already submitted | `split-allocation` 8 and 9 | all 195 others passed |
+  | Let a share be reduced below work already submitted | `split-allocation` 7 only | all 196 others passed |
+  | Inspect a split stage without saying whose work was judged | `split-allocation` 11, 12, 13 and 14 | all 193 others passed |
+  | Show a worker every share of a stage, not just their own | `split-allocation` 13 only | all 196 others passed |
+  | Pay the stage's nominal worker instead of whoever made the pieces | `split-allocation` 13 only | all 196 others passed |
+  | Drop the carry-over of work submitted before a stage was split | `split-allocation` 17 only | all 196 others passed |
+  | Let a supervisor inspect a stage they hold a share of | `split-allocation` 14 only | all 196 others passed |
+  | Count a split stage twice on the Workers page | `split-allocation` 13 only | all 196 others passed |
+  | Show the stage's nominal worker on every inspection row instead of the one credited | `split-allocation` 14 only | all 197 others passed |
+  | Let a worker see every worker's inspection rows on a shared stage | `split-allocation` 14 only | all 197 others passed |
+
+  **Three defects the split-allocation tests caught in the implementation before it
+  shipped.** Worth recording because all three were silent - every test suite was
+  green while they were present:
+
+  1. A worker sharing a stage was shown earnings for *every* share of it, because the
+     worker dashboard fetched inspections by operation and a split stage has one
+     inspection row per worker. Caught by "pay follows the worker who made each
+     approved garment".
+  2. A worker whose share became fully judged *disappeared* from their own dashboard,
+     because visibility used the same live-only filter as authority. Their earnings
+     history and completed-jobs list vanished at the exact moment they finished.
+     Caught by the same test.
+  3. The Workers page counted a split stage twice for its first worker - once through
+     the stage row and again through their allocation. Caught by the same test.
+  4. The inspection trail named the stage's nominal worker on *every* row of a split
+     stage, and a worker reading that trail saw their colleagues' approved pieces and
+     rates. Caught by "the inspection trail names the worker credited".
 
   **A mutation this suite initially SURVIVED, and the fix.** The first version of
   "an unknown ledger event type cannot move a quantity counter" passed even with

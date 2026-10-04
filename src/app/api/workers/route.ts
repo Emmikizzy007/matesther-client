@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { workers, users, productionOperations, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime } from "@/db/schema";
 import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
+import { allocatedTotalsByWorker, operationIdsWithAllocations } from "@/lib/production-allocation";
 import {
   normaliseRoles,
   replaceWorkerRoles,
@@ -20,6 +21,14 @@ import {
  * in the database once per worker: O(workers x all inspections ever).
  */
 const LIFETIME_EARNINGS = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
+
+/**
+ * Who an inspection's approved pieces belong to - the same rule lib/payroll.ts uses.
+ * NULL on every inspection recorded before a stage could be split across workers,
+ * where the answer is the stage's own worker, so this page and the payroll sheet can
+ * never disagree about who earned what.
+ */
+const PAID_WORKER = sql`coalesce(${stageInspections.workerId}, ${productionOperations.workerId})`;
 
 /**
  * `?view=slim` - what a worker DROPDOWN needs and nothing more.
@@ -63,6 +72,10 @@ export async function GET(req: Request) {
     }
 
     const idFilter = query.get("id") ? Number(query.get("id")) : null;
+    // Split stages are counted through their allocations, never through the stage
+    // row, so the two aggregates have to be kept disjoint.
+    const splitStageIds = await operationIdsWithAllocations();
+    const allocationStats = await allocatedTotalsByWorker();
     // Everything below is grouped by worker in SQL, so each table is read ONCE
     // rather than once per person.
     const [people, opStats, earnedRows, payIds, overtimeIds] = await Promise.all([
@@ -70,6 +83,10 @@ export async function GET(req: Request) {
         .select()
         .from(workers)
         .where(idFilter ? eq(workers.id, idFilter) : showArchived ? undefined : eq(workers.status, "ACTIVE")),
+      // Stages that name this worker AND are not split. A split stage still names
+      // one worker on the stage row, so counting it here as well as counting its
+      // allocations would credit that person with the whole stage on top of their
+      // own share. `splitStageIds` is what keeps the two halves from overlapping.
       db
         .select({
           workerId: productionOperations.workerId,
@@ -81,19 +98,24 @@ export async function GET(req: Request) {
           approved: sql<number>`coalesce(sum(${productionOperations.quantityApproved}), 0)`,
         })
         .from(productionOperations)
-        .where(idFilter ? eq(productionOperations.workerId, idFilter) : undefined)
+        .where(
+          and(
+            idFilter ? eq(productionOperations.workerId, idFilter) : undefined,
+            splitStageIds.length ? notInArray(productionOperations.id, splitStageIds) : undefined
+          )
+        )
         .groupBy(productionOperations.workerId),
       // Earnings are only ever shown to the Owner; a Production Manager is
       // already blocked from seeing pay, so the query is skipped entirely.
       isManager
         ? Promise.resolve([] as { workerId: number; earnings: number }[])
         : db
-            .select({ workerId: productionOperations.workerId, earnings: LIFETIME_EARNINGS })
+            .select({ workerId: PAID_WORKER, earnings: LIFETIME_EARNINGS })
             .from(stageInspections)
             .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
-            .innerJoin(workers, eq(workers.id, productionOperations.workerId))
-            .where(idFilter ? eq(productionOperations.workerId, idFilter) : undefined)
-            .groupBy(productionOperations.workerId),
+            .innerJoin(workers, eq(workers.id, PAID_WORKER))
+            .where(idFilter ? eq(PAID_WORKER, idFilter) : undefined)
+            .groupBy(PAID_WORKER),
       db
         .select({ workerId: workerPayments.workerId })
         .from(workerPayments)
@@ -117,6 +139,8 @@ export async function GET(req: Request) {
       : person;
     const expanded = people.map((person) => {
       const stats = statsByWorker.get(person.id);
+      // Their share of any split stage, added to the stages they hold outright.
+      const share = allocationStats.get(person.id);
       // MONTHLY people are shown their salary, exactly as before.
       const earned = person.paymentType === "MONTHLY"
         ? person.paymentRate
@@ -126,12 +150,12 @@ export async function GET(req: Request) {
         // Additive: every person still carries `specialty`; `roles` is the
         // full set, so a Cutter who also sews appears in both filters.
         roles: roleMap.get(person.id) ?? [person.specialty],
-        currentTasks: Number(stats?.currentTasks ?? 0),
-        assigned: Number(stats?.assigned ?? 0),
-        completed: Number(stats?.completed ?? 0),
-        rejected: Number(stats?.rejected ?? 0),
-        approved: Number(stats?.approved ?? 0),
-        hasHistory: Number(stats?.jobs ?? 0) > 0 || hasPay.has(person.id) || hasOvertime.has(person.id),
+        currentTasks: Number(stats?.currentTasks ?? 0) + (share?.activeStages ?? 0),
+        assigned: Number(stats?.assigned ?? 0) + (share?.allocated ?? 0),
+        completed: Number(stats?.completed ?? 0) + (share?.submitted ?? 0),
+        rejected: Number(stats?.rejected ?? 0) + (share?.rejected ?? 0),
+        approved: Number(stats?.approved ?? 0) + (share?.approved ?? 0),
+        hasHistory: Number(stats?.jobs ?? 0) > 0 || !!share || hasPay.has(person.id) || hasOvertime.has(person.id),
         ...(!isManager ? { earnings: earned } : {}),
       };
     });
