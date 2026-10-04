@@ -64,6 +64,13 @@
       "when": 1791065498866,
       "tag": "0008_production_allocations",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1791075691179,
+      "tag": "0009_support_cost_and_material_detail",
+      "breakpoints": true
     }
   ]
 }

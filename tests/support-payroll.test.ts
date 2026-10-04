@@ -505,9 +505,17 @@ test("payroll separates salary, production piecework, support piecework, overtim
   assert.deepEqual(Object.keys(payroll.data.totals).sort(), ["balance", "due", "paid"]);
   assert.deepEqual(
     Object.keys(payroll.data.breakdown).sort(),
-    ["other", "overtime", "piecework", "salary", "supportPiecework"]
+    // `supportDeduction` is the other side of `supportPiecework`: what approved
+    // support work takes back out of the tailors who handed it out. It is its own
+    // line rather than being netted into piecework so the two can be reconciled.
+    ["other", "overtime", "piecework", "salary", "supportDeduction", "supportPiecework"]
   );
   assert.equal(payroll.data.breakdown.supportPiecework >= 5 * 200, true);
+  // This person only ever RECEIVED support work, so nothing is deducted from them.
+  assert.equal(row.supportPiecesDelegated, 0);
+  assert.equal(row.supportDeduction, 0);
+  // The helper's 5 x 200 IS deducted, from the tailor who handed it out.
+  assert.equal(payroll.data.breakdown.supportDeduction >= 5 * 200, true);
 });
 
 test("payment status moves from unpaid to part paid to paid in full", async () => {

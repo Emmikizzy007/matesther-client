@@ -494,6 +494,21 @@ export const externalWorkOrders = pgTable("external_work_orders", {
   quantityShort: integer("quantity_short").notNull().default(0),
   unitCost: integer("unit_cost"),
   totalCost: integer("total_cost"),
+  /** When the work was due back. Overdue dispatches are what a control view needs. */
+  expectedReturnAt: timestamp("expected_return_at"),
+  /**
+   * What Matesther owes for this dispatch, what has been paid, and the reference.
+   *
+   * Recorded ON the dispatch rather than in a new payments system: `payments` is
+   * money received from a school and `worker_payments` is payroll, and a vendor is
+   * deliberately neither. Whether vendors later get a full payment lifecycle of
+   * their own is an open decision; until then this is where the state of THIS
+   * dispatch lives, and it is additive.
+   */
+  amountPayable: integer("amount_payable"),
+  amountPaid: integer("amount_paid").notNull().default(0),
+  paymentReference: text("payment_reference"),
+  paidAt: timestamp("paid_at"),
   status: text("status").notNull().default("SENT"),
   sentAt: timestamp("sent_at").defaultNow(),
   returnedAt: timestamp("returned_at"),
@@ -532,7 +547,32 @@ export const supportAssignments = pgTable("support_assignments", {
     () => productionOperations.id,
     { onDelete: "set null" }
   ),
+  /**
+   * The exact SHARE of that stage the helper is supporting.
+   *
+   * `productionOperationId` alone says "the sewing stage of this batch", which on a
+   * stage split three ways does not say whose 40 pieces the helper is taping. This
+   * does - and it is what makes the deduction land on the right tailor, because an
+   * allocation names the worker it belongs to.
+   *
+   * Nullable: support work recorded before split allocation existed has no share to
+   * point at, and its deduction still resolves through `assignedByWorkerId`.
+   */
+  productionAllocationId: integer("production_allocation_id").references(
+    () => productionAllocations.id,
+    { onDelete: "set null" }
+  ),
   orderId: integer("order_id").references(() => orders.id, { onDelete: "set null" }),
+  /**
+   * The exact garment the support work is on, inherited from the allocation or the
+   * stage's batch - never chosen from scratch. A helper cannot be handed "some
+   * school's order"; they are handed this item, this size, this colour, from this
+   * stage, in this quantity.
+   */
+  orderItemId: integer("order_item_id").references(() => orderItems.id, { onDelete: "set null" }),
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
+  /** The production stage inherited from the parent job, e.g. "SEWING". */
+  stage: text("stage"),
   // The supporting operation itself, e.g. "Weaving" or "Taping".
   operation: text("operation").notNull(),
   pieceRate: integer("piece_rate").notNull().default(0),
@@ -555,7 +595,10 @@ export const supportAssignments = pgTable("support_assignments", {
     index("support_assignments_worker_id_idx").on(table.workerId),
     index("support_assignments_assigned_by_idx").on(table.assignedByWorkerId),
     index("support_assignments_operation_id_idx").on(table.productionOperationId),
-    index("support_assignments_order_id_idx").on(table.orderId)
+    index("support_assignments_order_id_idx").on(table.orderId),
+    index("support_assignments_allocation_id_idx").on(table.productionAllocationId),
+    index("support_assignments_order_variant_id_idx").on(table.orderVariantId),
+    index("support_assignments_order_item_id_idx").on(table.orderItemId)
   ]
 );
 
@@ -644,6 +687,24 @@ export const materialUsage = pgTable("material_usage", {
     .references(() => materials.id)
     .notNull(),
   quantityUsed: integer("quantity_used").notNull().default(0),
+  /**
+   * Issued / returned / wasted, around the `quantity_used` figure that has always
+   * driven cost.
+   *
+   * `quantityUsed` stays the number cost is calculated from, so no existing record
+   * changes meaning: a row written before these columns existed reads as issued 0,
+   * returned 0, wasted 0, used N - and new records are checked so that
+   * issued = used + returned + wasted. Nothing here is a second inventory system;
+   * `materials.current_stock` is still adjusted exactly as it always was.
+   */
+  quantityIssued: integer("quantity_issued").notNull().default(0),
+  quantityReturned: integer("quantity_returned").notNull().default(0),
+  quantityWasted: integer("quantity_wasted").notNull().default(0),
+  /** Who the material was issued to, or which process consumed it. */
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }),
+  /** The exact variant the material was consumed on, where it is known. */
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
+  notes: text("notes"),
   unitCost: integer("unit_cost").notNull().default(0),
   totalCost: integer("total_cost").notNull().default(0),
   usedAt: timestamp("used_at").defaultNow(),
@@ -651,7 +712,9 @@ export const materialUsage = pgTable("material_usage", {
   (table) => [
     index("material_usage_order_id_idx").on(table.orderId),
     index("material_usage_material_id_idx").on(table.materialId),
-    index("material_usage_operation_id_idx").on(table.productionOperationId)
+    index("material_usage_operation_id_idx").on(table.productionOperationId),
+    index("material_usage_worker_id_idx").on(table.workerId),
+    index("material_usage_order_variant_id_idx").on(table.orderVariantId)
   ]
 );
 

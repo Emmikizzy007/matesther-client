@@ -86,6 +86,17 @@ export interface WorkerAccrual {
   /** Tailor support piecework, on approved support work only. */
   supportPieces: number;
   supportPiecework: number;
+  /**
+   * Approved pieces this worker HANDED OUT to a helper, and the money that came
+   * back out of their own rate because of it.
+   *
+   * Matesther's rule: the tailor's full piece rate belongs to the garment. Doing
+   * it themselves keeps all of it; handing a piece to a helper at an agreed rate
+   * has that rate DEDUCTED, never added on top. A shirt at 300 with a helper
+   * agreed at 30 pays the helper 30 and leaves the tailor 270.
+   */
+  supportPiecesDelegated: number;
+  supportDeduction: number;
   salary: number;
   overtime: number;
   /** Other approved earnings recorded for the month (allowance, bonus). */
@@ -132,7 +143,30 @@ const SUPPORT_SUM = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIE
 const PIECEWORK_ROW = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end`;
 const SUPPORT_ROW = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end`;
 
+/**
+ * The DEDUCTION side of support work.
+ *
+ * Same expression as `SUPPORT_SUM` and deliberately so: one movement of money has
+ * two sides, and the amount the helper earns on an approved piece is exactly the
+ * amount that leaves the tailor's rate for that piece. Reusing the expression is
+ * what stops the two sides from ever drifting apart - if the helper's rule
+ * changes, the deduction changes with it.
+ *
+ * The `workers` join stays on the HELPER (`supportAssignments.workerId`) because
+ * it is the helper's rate and payment type that set the amount. Only the grouping
+ * key differs: this one groups by `assignedByWorkerId`, the tailor who handed the
+ * work out. That tailor is always a real worker - a login with no worker record
+ * cannot create a support assignment at all - so the deduction always has somebody
+ * to land on.
+ *
+ * Only APPROVED pieces move money on either side, at the rate snapshotted on the
+ * inspection, so a later rate change cannot rewrite pay already earned.
+ */
+
+const DEDUCTION_SUM = SUPPORT_SUM;
+
 type PieceworkRow = { workerId: number; pieces: number; piecework: number };
+type DeductionRow = { workerId: number; supportPiecesDelegated: number; supportDeduction: number };
 type SupportRow = { workerId: number; supportPieces: number; supportPiecework: number };
 
 /** Stage piecework per worker for a month, in ONE grouped query. */
@@ -188,6 +222,37 @@ async function supportPiecework(from: Date, to: Date, workerId?: number): Promis
         workerId: Number(row.workerId),
         supportPieces: Number(row.supportPieces) || 0,
         supportPiecework: Number(row.supportPiecework) || 0,
+      },
+    ])
+  );
+}
+
+/** What approved support work takes back from each tailor who handed it out. */
+async function supportDeductions(from: Date, to: Date, workerId?: number): Promise<Map<number, DeductionRow>> {
+  const rows = await db
+    .select({
+      workerId: supportAssignments.assignedByWorkerId,
+      supportPiecesDelegated: sql<number>`coalesce(sum(${supportInspections.quantityApproved}), 0)`,
+      supportDeduction: DEDUCTION_SUM,
+    })
+    .from(supportInspections)
+    .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
+    .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
+    .where(
+      and(
+        gte(supportInspections.inspectedAt, from),
+        lt(supportInspections.inspectedAt, to),
+        workerId === undefined ? undefined : eq(supportAssignments.assignedByWorkerId, workerId)
+      )
+    )
+    .groupBy(supportAssignments.assignedByWorkerId);
+  return new Map(
+    rows.map((row) => [
+      Number(row.workerId),
+      {
+        workerId: Number(row.workerId),
+        supportPiecesDelegated: Number(row.supportPiecesDelegated) || 0,
+        supportDeduction: Number(row.supportDeduction) || 0,
       },
     ])
   );
@@ -273,15 +338,18 @@ function assemble(
   stage: PieceworkRow | undefined,
   support: SupportRow | undefined,
   paid: number,
-  extra: ExtraRow | undefined
+  extra: ExtraRow | undefined,
+  delegated?: DeductionRow
 ): WorkerAccrual {
   const rate = w.paymentRate ?? 0;
   const piecework = stage?.piecework ?? 0;
   const supportEarned = support?.supportPiecework ?? 0;
+  const supportDeduction = delegated?.supportDeduction ?? 0;
   const salary = salaryFor(w, month);
   const overtime = extra?.overtime ?? 0;
   const other = extra?.other ?? 0;
-  const due = piecework + supportEarned + salary + overtime + other;
+  // The helper's rate comes OUT of the tailor's, so the two never both count.
+  const due = piecework + supportEarned + salary + overtime + other - supportDeduction;
   return {
     month,
     workerId: w.id,
@@ -298,6 +366,8 @@ function assemble(
     piecework,
     supportPieces: support?.supportPieces ?? 0,
     supportPiecework: supportEarned,
+    supportPiecesDelegated: delegated?.supportPiecesDelegated ?? 0,
+    supportDeduction,
     salary,
     overtime,
     other,
@@ -320,14 +390,18 @@ export async function accrualForWorker(workerId: number, month: string): Promise
   const [w] = await db.select().from(workers).where(eq(workers.id, workerId));
   if (!w) return null;
   const { from, to } = monthBounds(month);
-  const [stage, support, paid, extra, roles] = await Promise.all([
+  const [stage, support, delegated, paid, extra, roles] = await Promise.all([
     stagePiecework(from, to, workerId),
     supportPiecework(from, to, workerId),
+    supportDeductions(from, to, workerId),
     paidByWorker([month], workerId),
     extrasByWorker([month], workerId),
     rolesForWorker(workerId),
   ]);
-  return assemble(w, month, roles, stage.get(workerId), support.get(workerId), paid.get(workerId) ?? 0, extra.get(workerId));
+  return assemble(
+    w, month, roles, stage.get(workerId), support.get(workerId),
+    paid.get(workerId) ?? 0, extra.get(workerId), delegated.get(workerId)
+  );
 }
 
 /**
@@ -341,11 +415,12 @@ export async function accrualForWorker(workerId: number, month: string): Promise
  */
 export async function workerAccruals(month: string) {
   const { from, to } = monthBounds(month);
-  const [people, roleMap, stage, support, paid, extra] = await Promise.all([
+  const [people, roleMap, stage, support, delegated, paid, extra] = await Promise.all([
     db.select().from(workers),
     rolesByWorker(),
     stagePiecework(from, to),
     supportPiecework(from, to),
+    supportDeductions(from, to),
     paidByWorker([month]),
     extrasByWorker([month]),
   ]);
@@ -353,7 +428,7 @@ export async function workerAccruals(month: string) {
     .map((w) =>
       assemble(
         w, month, roleMap.get(w.id) ?? [], stage.get(w.id), support.get(w.id),
-        paid.get(w.id) ?? 0, extra.get(w.id)
+        paid.get(w.id) ?? 0, extra.get(w.id), delegated.get(w.id)
       )
     )
     .sort((a, b) => b.due - a.due);
@@ -371,11 +446,12 @@ export async function workerAccruals(month: string) {
     (t, r) => ({
       piecework: t.piecework + r.piecework,
       supportPiecework: t.supportPiecework + r.supportPiecework,
+      supportDeduction: t.supportDeduction + r.supportDeduction,
       salary: t.salary + r.salary,
       overtime: t.overtime + r.overtime,
       other: t.other + r.other,
     }),
-    { piecework: 0, supportPiecework: 0, salary: 0, overtime: 0, other: 0 }
+    { piecework: 0, supportPiecework: 0, supportDeduction: 0, salary: 0, overtime: 0, other: 0 }
   );
   return { workers: rows, totals, breakdown };
 }
@@ -399,7 +475,7 @@ export async function workerHistory(workerId: number, month: string) {
   // One worker over twelve months is a small set, so the inspection rows are
   // fetched individually and bucketed in JS - the same `monthKey()` the
   // single-month path uses, which keeps the two paths from ever disagreeing.
-  const [stageRows, supportRows, extraRows, paymentRows, roles] = await Promise.all([
+  const [stageRows, supportRows, delegatedRows, extraRows, paymentRows, roles] = await Promise.all([
     db
       .select({
         inspectedAt: stageInspections.inspectedAt,
@@ -434,6 +510,24 @@ export async function workerHistory(workerId: number, month: string) {
           lt(supportInspections.inspectedAt, to)
         )
       ),
+    // The other side of support work: pieces this worker handed out, and what
+    // their approval took back out of this worker's own rate.
+    db
+      .select({
+        inspectedAt: supportInspections.inspectedAt,
+        quantityApproved: supportInspections.quantityApproved,
+        deduction: SUPPORT_ROW,
+      })
+      .from(supportInspections)
+      .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
+      .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
+      .where(
+        and(
+          eq(supportAssignments.assignedByWorkerId, workerId),
+          gte(supportInspections.inspectedAt, from),
+          lt(supportInspections.inspectedAt, to)
+        )
+      ),
     db
       .select()
       .from(workerOvertime)
@@ -452,11 +546,20 @@ export async function workerHistory(workerId: number, month: string) {
     rolesForWorker(workerId),
   ]);
 
-  const bucket = new Map<string, { pieces: number; piecework: number; supportPieces: number; supportPiecework: number; overtime: number; other: number; paid: number }>();
+  type HistoryBucket = {
+    pieces: number; piecework: number; supportPieces: number; supportPiecework: number;
+    supportPiecesDelegated: number; supportDeduction: number;
+    overtime: number; other: number; paid: number;
+  };
+  const emptyBucket = (): HistoryBucket => ({
+    pieces: 0, piecework: 0, supportPieces: 0, supportPiecework: 0,
+    supportPiecesDelegated: 0, supportDeduction: 0, overtime: 0, other: 0, paid: 0,
+  });
+  const bucket = new Map<string, HistoryBucket>();
   const ensure = (key: string) => {
     const found = bucket.get(key);
     if (found) return found;
-    const fresh = { pieces: 0, piecework: 0, supportPieces: 0, supportPiecework: 0, overtime: 0, other: 0, paid: 0 };
+    const fresh = emptyBucket();
     bucket.set(key, fresh);
     return fresh;
   };
@@ -470,6 +573,11 @@ export async function workerHistory(workerId: number, month: string) {
     entry.supportPieces += row.quantityApproved ?? 0;
     entry.supportPiecework += Number(row.earnings) || 0;
   }
+  for (const row of delegatedRows) {
+    const entry = ensure(monthKey(row.inspectedAt));
+    entry.supportPiecesDelegated += row.quantityApproved ?? 0;
+    entry.supportDeduction += Number(row.deduction) || 0;
+  }
   for (const row of extraRows) {
     const entry = ensure(monthKey(row.workedOn));
     if ((row.category ?? "OVERTIME") === "OTHER") entry.other += row.amount ?? 0;
@@ -479,9 +587,10 @@ export async function workerHistory(workerId: number, month: string) {
 
   const history: WorkerAccrual[] = [];
   for (const m of months) {
-    const entry = bucket.get(m) ?? { pieces: 0, piecework: 0, supportPieces: 0, supportPiecework: 0, overtime: 0, other: 0, paid: 0 };
+    const entry = bucket.get(m) ?? emptyBucket();
     const salary = salaryFor(w, m);
-    const due = entry.piecework + entry.supportPiecework + salary + entry.overtime + entry.other;
+    const due =
+      entry.piecework + entry.supportPiecework + salary + entry.overtime + entry.other - entry.supportDeduction;
     history.push({
       month: m,
       workerId: w.id,
@@ -498,6 +607,8 @@ export async function workerHistory(workerId: number, month: string) {
       piecework: entry.piecework,
       supportPieces: entry.supportPieces,
       supportPiecework: entry.supportPiecework,
+      supportPiecesDelegated: entry.supportPiecesDelegated,
+      supportDeduction: entry.supportDeduction,
       salary,
       overtime: entry.overtime,
       other: entry.other,

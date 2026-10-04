@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   supportAssignments,
@@ -11,11 +11,18 @@ import {
   productionBatches,
   orderItems,
   products,
+  productionAllocations,
 } from "@/db/schema";
 import { guard, getSessionUser, getLinkedWorkerId, ANYONE } from "@/lib/authz";
 import { SUPPORT_OPERATIONS, SUPPORT_ROLE, sameRole } from "@/lib/format";
 import { workerHoldsRole } from "@/lib/worker-roles";
-import { supportPending, supportInspectionEarnings, supportInspectionRate } from "@/lib/support-work";
+import {
+  supportPending,
+  supportInspectionEarnings,
+  supportInspectionRate,
+  supportInspectionDeduction,
+  supportHeadroom,
+} from "@/lib/support-work";
 
 export const dynamic = "force-dynamic";
 
@@ -219,29 +226,135 @@ export async function POST(req: Request) {
         { status: 400 }
       );
 
+    /* ---------- the exact work being supported, inherited not re-chosen ----------
+     *
+     * A helper is never handed "some school's order". They are handed THIS tailor's
+     * share of THIS stage, on THIS item, THIS size and THIS colour, in a quantity
+     * that cannot exceed the share. Where a share exists it is named; otherwise the
+     * stage job is, and the order, item, variant and stage are all read off it.
+     */
+    const allocationId = body.productionAllocationId ? Number(body.productionAllocationId) : null;
+    if (allocationId !== null && (!Number.isSafeInteger(allocationId) || allocationId < 1))
+      return NextResponse.json({ error: "Choose a valid production share." }, { status: 400 });
     const parentOperationId = body.productionOperationId ? Number(body.productionOperationId) : null;
     if (parentOperationId !== null && !Number.isSafeInteger(parentOperationId))
       return NextResponse.json({ error: "Choose a valid production job." }, { status: 400 });
-    const parent = parentOperationId
-      ? await db.select().from(productionOperations).where(eq(productionOperations.id, parentOperationId)).limit(1)
-      : [];
-    if (parentOperationId !== null && !parent[0])
+    if (allocationId !== null && parentOperationId !== null)
+      return NextResponse.json(
+        { error: "Choose either the tailor's share of the stage or the stage itself, not both." },
+        { status: 400 }
+      );
+
+    const share = allocationId
+      ? (await db.select().from(productionAllocations).where(eq(productionAllocations.id, allocationId)).limit(1))[0] ?? null
+      : null;
+    if (allocationId !== null && !share)
+      return NextResponse.json({ error: "That production share could not be found." }, { status: 404 });
+
+    // A share names its own stage job; never let a request disagree with it.
+    const resolvedOperationId = share ? share.productionOperationId : parentOperationId;
+    const parent = resolvedOperationId
+      ? (await db.select().from(productionOperations).where(eq(productionOperations.id, resolvedOperationId)).limit(1))[0] ?? null
+      : null;
+    if (resolvedOperationId !== null && !parent)
       return NextResponse.json({ error: "That production job could not be found." }, { status: 404 });
 
-    const orderId = parent[0]
-      ? (await db.select().from(productionBatches).where(eq(productionBatches.id, parent[0].productionBatchId)).limit(1))[0]?.orderId ?? null
-      : body.orderId
-        ? Number(body.orderId)
+    const batch = parent
+      ? (await db.select().from(productionBatches).where(eq(productionBatches.id, parent.productionBatchId)).limit(1))[0] ?? null
+      : null;
+
+    /* ---------- only the holder of the work may hand it out ---------- */
+    const holderId = share ? share.workerId : parent?.workerId ?? null;
+    let effectiveAssignerId = assignerId;
+    if (holderId !== null && holderId !== assignerId) {
+      const isSupervisor = session.role === "OWNER" || session.role === "PRODUCTION_MANAGER";
+      if (!isSupervisor)
+        return NextResponse.json(
+          { error: "You can only hand out support work on pieces you hold yourself." },
+          { status: 403 }
+        );
+      // A supervisor recording a hand-over on somebody's behalf: the work still came
+      // from the worker holding the pieces, so inspection authority AND the pay
+      // deduction both land on them rather than on whoever typed it in.
+      effectiveAssignerId = holderId;
+    }
+    if (effectiveAssignerId !== assignerId) {
+      const [holder] = await db.select().from(workers).where(eq(workers.id, effectiveAssignerId)).limit(1);
+      if (!holder || holder.status !== "ACTIVE" || holder.organizationId !== session.organizationId)
+        return NextResponse.json(
+          { error: "The worker holding this share must be an active Matesther worker." },
+          { status: 400 }
+        );
+      if (holder.id === workerId)
+        return NextResponse.json(
+          { error: "The worker holding this share cannot also be the support worker on it." },
+          { status: 400 }
+        );
+    }
+
+    /* ---------- how much may be handed out ----------
+     *
+     * The helper's pieces are a subset of the pieces the tailor holds. The ceiling
+     * is per supporting operation: 40 garments can take 40 weaves AND 40 tapes, but
+     * never 60 weaves, because there would be nothing for the extra 20 to be on.
+     */
+    const holding = share
+      ? share.quantityAllocated
+      : parent
+        ? batch?.quantity ?? 0
         : null;
+    if (holding !== null) {
+      const [handedOut] = await db
+        .select({ total: sql<number>`coalesce(sum(${supportAssignments.quantityAssigned}), 0)` })
+        .from(supportAssignments)
+        .where(and(
+          share
+            ? eq(supportAssignments.productionAllocationId, share.id)
+            : and(
+                eq(supportAssignments.productionOperationId, parent!.id),
+                isNull(supportAssignments.productionAllocationId)
+              ),
+          sql`lower(${supportAssignments.operation}) = lower(${operation})`,
+          sql`${supportAssignments.status} <> 'CANCELLED'`
+        ));
+      const headroom = supportHeadroom(holding, Number(handedOut?.total) || 0);
+      if (quantity > headroom)
+        return NextResponse.json(
+          {
+            error: headroom === 0
+              ? `All ${holding} piece${holding === 1 ? "" : "s"} of ${operation} on this work have already been handed out.`
+              : `Only ${headroom} piece${headroom === 1 ? "" : "s"} of ${operation} are left to hand out on this work.`,
+          },
+          { status: 400 }
+        );
+    }
+
+    const requestedOrderId = body.orderId ? Number(body.orderId) : null;
+    if (requestedOrderId !== null && !Number.isSafeInteger(requestedOrderId))
+      return NextResponse.json({ error: "Choose a valid order." }, { status: 400 });
+    // The order, item, variant and stage come from the production work. A caller
+    // may not attach support work to an order it has nothing to do with.
+    const orderId = parent ? batch?.orderId ?? null : requestedOrderId;
+    if (!parent && requestedOrderId !== null) {
+      const [order] = await db.select().from(orders).where(eq(orders.id, requestedOrderId)).limit(1);
+      if (!order || order.organizationId !== session.organizationId)
+        return NextResponse.json({ error: "That order could not be found." }, { status: 404 });
+    }
 
     const [created] = await db
       .insert(supportAssignments)
       .values({
         organizationId: session.organizationId,
-        assignedByWorkerId: assignerId,
+        assignedByWorkerId: effectiveAssignerId,
         workerId,
-        productionOperationId: parentOperationId,
+        productionOperationId: resolvedOperationId,
+        productionAllocationId: share?.id ?? null,
         orderId,
+        // Inherited so the helper's dashboard and the order's cost all see the same
+        // exact garment - item, size, colour and stage - without re-typing any of it.
+        orderItemId: parent ? batch?.orderItemId ?? null : null,
+        orderVariantId: parent ? batch?.orderVariantId ?? null : null,
+        stage: parent ? parent.stage : null,
         operation,
         pieceRate: rate,
         quantityAssigned: quantity,
@@ -384,6 +497,15 @@ export async function PUT(req: Request) {
             ? supportInspectionEarnings(inspection, assignment, person)
             : 0,
           pieceRatePaid: person ? supportInspectionRate(inspection, assignment, person) : assignment.pieceRate,
+          /**
+           * The other side of the same money: what this approval takes back from the
+           * tailor who handed the work out. Shown here so nobody can read the
+           * helper's pay as an extra cost on top of the tailor's.
+           */
+          deductedFromTailor: person
+            ? supportInspectionDeduction(inspection, assignment, person)
+            : 0,
+          deductedFromWorkerId: updated.assignedByWorkerId,
         },
         { status: 201 }
       );

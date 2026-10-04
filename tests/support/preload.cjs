@@ -60,6 +60,7 @@ const MIGRATIONS = [
   "0006_production_ledger_and_indexes",
   "0007_variants_routes_and_external_work",
   "0008_production_allocations",
+  "0009_support_cost_and_material_detail",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 
@@ -123,6 +124,19 @@ const REQUIRED_COLUMNS = [
   ["production_allocations", "quantity_allocated"],
   ["production_allocations", "transferred_from_id"],
   ["stage_inspections", "worker_id"],
+  // Fails loudly if migration 0009 was not applied: exact support-work inheritance,
+  // external-work payment detail and material issue detail all depend on these.
+  ["support_assignments", "production_allocation_id"],
+  ["support_assignments", "order_variant_id"],
+  ["support_assignments", "order_item_id"],
+  ["support_assignments", "stage"],
+  ["external_work_orders", "expected_return_at"],
+  ["external_work_orders", "amount_payable"],
+  ["external_work_orders", "amount_paid"],
+  ["material_usage", "quantity_issued"],
+  ["material_usage", "quantity_returned"],
+  ["material_usage", "quantity_wasted"],
+  ["material_usage", "worker_id"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);
