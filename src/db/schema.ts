@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   serial,
@@ -8,6 +9,8 @@ import {
   date,
   varchar,
   unique,
+  index,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 // ---------- Organizations ----------
@@ -37,7 +40,11 @@ export const users = pgTable("users", {
   phone: text("phone"),
   status: text("status").notNull().default("ACTIVE"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("users_organization_id_idx").on(table.organizationId)
+  ]
+);
 
 // ---------- Sessions (signed-in staff) ----------
 export const sessions = pgTable("sessions", {
@@ -47,7 +54,12 @@ export const sessions = pgTable("sessions", {
     .notNull(),
   createdAt: timestamp("created_at").defaultNow(),
   expiresAt: timestamp("expires_at").notNull(),
-});
+},
+  (table) => [
+    index("sessions_user_id_idx").on(table.userId),
+    index("sessions_expires_at_idx").on(table.expiresAt)
+  ]
+);
 
 // ---------- Customers (Schools / Companies) ----------
 export const customers = pgTable("customers", {
@@ -87,7 +99,14 @@ export const orders = pgTable("orders", {
   balance: integer("balance").notNull().default(0),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("orders_customer_id_idx").on(table.customerId),
+    index("orders_status_idx").on(table.status),
+    index("orders_due_date_idx").on(table.dueDate),
+    index("orders_created_at_idx").on(table.createdAt)
+  ]
+);
 
 // ---------- Order items ----------
 export const orderItems = pgTable("order_items", {
@@ -100,7 +119,11 @@ export const orderItems = pgTable("order_items", {
   unitPrice: integer("unit_price").notNull().default(0),
   totalPrice: integer("total_price").notNull().default(0),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("order_items_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Workers ----------
 export const workers = pgTable("workers", {
@@ -121,7 +144,12 @@ export const workers = pgTable("workers", {
   status: text("status").notNull().default("ACTIVE"),
   archivedAt: timestamp("archived_at"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("workers_organization_id_idx").on(table.organizationId),
+    index("workers_status_idx").on(table.status)
+  ]
+);
 
 // ---------- Worker roles (one person, many production roles) ----------
 // A single person may legitimately be a Cutter AND a Tailor AND an Inspection
@@ -144,16 +172,134 @@ export const workerRoles = pgTable(
   (table) => [unique("worker_roles_worker_id_role_unique").on(table.workerId, table.role)]
 );
 
-// ---------- Size breakdown per order item ----------
+/**
+ * ---------- The exact garment VARIANTS on an order line ----------
+ *
+ * This table began life as an order-item SIZE breakdown. It is now the order's
+ * VARIANT table: one row per exact garment the school actually ordered,
+ * identified by item + size + colour + quantity.
+ *
+ * The table name is unchanged on purpose. Renaming it would be a destructive
+ * migration against a live database for no functional gain, and everything that
+ * already reads it - the order Sizes tab, POST /api/batches and the assign screen
+ * - keeps working. What changed is that a variant may now have:
+ *   - a colour as well as a size (`color`, new and nullable);
+ *   - neither (`size` is no longer NOT NULL), so both "10 navy blazers, no size
+ *     run" and "6 house-red polos in M" are expressible.
+ *
+ * Both are widenings: every existing row keeps its meaning, and a row written
+ * before this change is simply a variant with no colour.
+ *
+ * `completed` is retained but is no longer the figure to trust - it is derived
+ * from the production ledger now (see lib/production-route.ts). It stays so
+ * historical rows and anything already reading it keep working.
+ */
 export const orderItemSizes = pgTable("order_item_sizes", {
   id: serial("id").primaryKey(),
   orderItemId: integer("order_item_id")
     .references(() => orderItems.id, { onDelete: "cascade" })
     .notNull(),
-  size: text("size").notNull(),
+  size: text("size"),
+  color: text("color"),
   quantity: integer("quantity").notNull().default(0),
   completed: integer("completed").notNull().default(0),
-});
+},
+  (table) => [
+    index("order_item_sizes_order_item_id_idx").on(table.orderItemId),
+    index("order_item_sizes_color_idx").on(table.color),
+    /**
+     * One row per exact variant.
+     *
+     * This REPLACES the old unique `(order_item_id, size)` index, which is now
+     * wrong rather than merely incomplete: it would reject "size M navy" and
+     * "size M black" as duplicates of each other. Dropping an index destroys no
+     * data - it is the one DROP in migration 0007, and variants cannot exist
+     * without it.
+     *
+     * The `coalesce(..., '')` form is deliberate. Postgres treats NULLs as
+     * distinct in a unique index, so a plain `(item, size, colour)` index would
+     * allow unlimited rows for a variant with neither. The expression form makes
+     * NULL compare equal to NULL, works on every Postgres version (unlike
+     * `NULLS NOT DISTINCT`, which needs 15+), and the test database enforces it
+     * identically.
+     */
+    uniqueIndex("order_item_sizes_variant_unique").on(
+      table.orderItemId,
+      sql`coalesce(${table.size}, '')`,
+      sql`coalesce(${table.color}, '')`
+    )
+  ]
+);
+
+// ---------- Production routes ----------
+/**
+ * A route is the ordered list of stages ONE garment actually passes through.
+ *
+ * WHY THIS EXISTS
+ *   The eight-stage list was hardcoded in five independent places and every batch
+ *   was forced through all eight, up front, whether the garment needed them or
+ *   not. A polo that is bought in cut-and-sew form has no CUTTING stage. A
+ *   ready-made cardigan has no SEWING stage. Forcing them into the pipeline
+ *   created rows that could never be worked - and worse, the progress and
+ *   bottleneck views then reported those garments as "stuck at CUTTING" or
+ *   "waiting for SEWING" when no such stage existed for them.
+ *
+ *   A route is therefore a SUBSET of the existing stages, in an order that suits
+ *   the garment. It may include all eight, skip stages, start later or end
+ *   earlier. It never invents a stage: `stage` values still come from
+ *   lib/format.ts, so roles, labels, inspection and payroll all keep working.
+ *
+ * `product_id` NULL means the organization's generic default route. A product may
+ * have its own; `is_default` picks which one a new batch starts from. The route
+ * can still be overridden per batch, and once a batch is created its own route is
+ * frozen as its production_operations rows - see production_operations.route_position.
+ */
+export const productionRoutes = pgTable("production_routes", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productId: integer("product_id").references(() => products.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  isDefault: boolean("is_default").notNull().default(false),
+  isActive: boolean("is_active").notNull().default(true),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("production_routes_product_id_idx").on(table.productId),
+    index("production_routes_organization_id_idx").on(table.organizationId)
+  ]
+);
+
+/**
+ * The stages of one route, in order.
+ *
+ * `method` is where the production-method axis lives: a route can say that this
+ * garment's MONOGRAMMING is outsourced while its SEWING is internal, without any
+ * other stage knowing about it.
+ *
+ * `role_required` is optional and overrides the generic STAGE_ROLES mapping when
+ * set, so a route can demand a specific role at a stage the default map does not
+ * cover (notably DELIVERY, which the default map only gained in Task 2).
+ */
+export const productionRouteStages = pgTable("production_route_stages", {
+  id: serial("id").primaryKey(),
+  routeId: integer("route_id")
+    .references(() => productionRoutes.id, { onDelete: "cascade" })
+    .notNull(),
+  position: integer("position").notNull(),
+  stage: text("stage").notNull(),
+  method: text("method").notNull().default("INTERNAL"),
+  roleRequired: text("role_required"),
+  notes: text("notes"),
+},
+  (table) => [
+    index("production_route_stages_route_id_idx").on(table.routeId),
+    uniqueIndex("production_route_stages_route_position_unique").on(table.routeId, table.position),
+    // A route may not list the same stage twice: that would create two rows
+    // competing to be "the" monogramming stage for one batch.
+    uniqueIndex("production_route_stages_route_stage_unique").on(table.routeId, table.stage)
+  ]
+);
 
 // ---------- Production batches ----------
 export const productionBatches = pgTable("production_batches", {
@@ -166,9 +312,31 @@ export const productionBatches = pgTable("production_batches", {
   quantity: integer("quantity").notNull().default(0),
   size: text("size"),
   color: text("color"),
+  /**
+   * The exact variant this batch produces, when it was allocated from one.
+   *
+   * `size` and `color` above stay as the batch's own snapshot - they are what
+   * every existing screen, delivery line and printed document already reads, and
+   * a snapshot must survive later edits to the order. This id is the authoritative
+   * link used for variant-level allocation ceilings.
+   */
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
+  /**
+   * The route this batch was built from - reference only. The batch's OWN frozen
+   * route is its set of production_operations rows in route_position order, so
+   * editing a product's route later can never rewrite history.
+   */
+  routeId: integer("route_id").references(() => productionRoutes.id, { onDelete: "set null" }),
   status: text("status").notNull().default("PENDING"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("production_batches_order_id_idx").on(table.orderId),
+    index("production_batches_order_item_id_idx").on(table.orderItemId),
+    index("production_batches_order_variant_id_idx").on(table.orderVariantId),
+    index("production_batches_route_id_idx").on(table.routeId)
+  ]
+);
 
 // ---------- Production operations (one row per stage per batch) ----------
 export const productionOperations = pgTable("production_operations", {
@@ -177,6 +345,28 @@ export const productionOperations = pgTable("production_operations", {
     .references(() => productionBatches.id, { onDelete: "cascade" })
     .notNull(),
   stage: text("stage").notNull(),
+  /**
+   * Where this stage sits in THIS BATCH's route - the frozen route.
+   *
+   * "The next applicable stage" is the operation with the next higher position in
+   * the same batch, not `STAGES[STAGES.indexOf(stage) + 1]`, which assumed every
+   * garment walks the same eight stages in the same order. A polo whose route
+   * skips CUTTING, or a ready-made cardigan whose route starts at PACKING, is
+   * expressed purely by which rows exist and what their positions are.
+   *
+   * NULL on rows created before routes existed; those batches fall back to the
+   * eight-stage order, so no historical batch changes behaviour.
+   */
+  routePosition: integer("route_position"),
+  /** The route stage definition this row came from. Reference only. */
+  routeStageId: integer("route_stage_id").references(() => productionRouteStages.id, { onDelete: "set null" }),
+  /**
+   * How this stage is produced: INTERNAL, MACHINE, OUTSOURCED, READY_MADE or
+   * VENDOR_PROCESSING. A second axis, orthogonal to `stage`. Defaults to
+   * INTERNAL, which is exactly what every existing row is, so no historical job
+   * changes meaning.
+   */
+  method: text("method").notNull().default("INTERNAL"),
   workerId: integer("worker_id").references(() => workers.id),
   // Agreed price for THIS job/stage, not the worker's general profile.
   // Null on historical records falls back to their legacy rate.
@@ -196,7 +386,25 @@ export const productionOperations = pgTable("production_operations", {
   inspectedAt: timestamp("inspected_at"),
   completedAt: timestamp("completed_at"),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("production_operations_batch_id_idx").on(table.productionBatchId),
+    index("production_operations_worker_id_idx").on(table.workerId),
+    index("production_operations_stage_idx").on(table.stage),
+    index("production_operations_status_idx").on(table.status),
+    index("production_operations_method_idx").on(table.method),
+    index("production_operations_route_stage_id_idx").on(table.routeStageId),
+    // The frozen route is read as "this batch's operations in position order",
+    // so two rows may never claim the same position. NULL positions (pre-route
+    // batches) do not collide: Postgres treats NULLs as distinct here, which is
+    // exactly what legacy rows need.
+    uniqueIndex("production_operations_batch_position_unique").on(table.productionBatchId, table.routePosition),
+    // One row per stage per batch. Nothing enforced this before, and the,
+    // "next stage" lookup in POST /api/inspections takes the first match, so,
+    // a duplicate row would silently starve one of the two.
+    uniqueIndex("production_operations_batch_stage_unique").on(table.productionBatchId, table.stage)
+  ]
+);
 
 // ---------- Stage inspections (audit trail - never overwritten) ----------
 export const stageInspections = pgTable("stage_inspections", {
@@ -204,6 +412,23 @@ export const stageInspections = pgTable("stage_inspections", {
   productionOperationId: integer("production_operation_id")
     .references(() => productionOperations.id, { onDelete: "cascade" })
     .notNull(),
+  /**
+   * Which worker these approved pieces belong to.
+   *
+   * NULLABLE ON PURPOSE, AND NULL MEANS SOMETHING. A stage worked by one person
+   * was never attributed per worker, so every inspection recorded before split
+   * allocation has NULL here, and pay for it is still attributed through
+   * `production_operations.worker_id` exactly as before - payroll resolves
+   * `coalesce(stage_inspections.worker_id, production_operations.worker_id)`.
+   * That is why this column needs NO backfill: the fallback reproduces the old
+   * behaviour for every historical row.
+   *
+   * When a stage is split across several workers, one inspection writes ONE ROW
+   * PER WORKER, each carrying that worker's own attributed quantity and their own
+   * agreed rate snapshot. The stage's counters are still the sum of its ledger
+   * events, so the stage total and the per-worker split can never disagree.
+   */
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }),
   inspectedBy: text("inspected_by").notNull(),
   // Snapshot agreed pay per approved piece at inspection time.
   pieceRate: integer("piece_rate"),
@@ -212,7 +437,95 @@ export const stageInspections = pgTable("stage_inspections", {
   quantityRejected: integer("quantity_rejected").notNull().default(0),
   notes: text("notes"),
   inspectedAt: timestamp("inspected_at").defaultNow(),
-});
+},
+  (table) => [
+    index("stage_inspections_operation_id_idx").on(table.productionOperationId),
+    index("stage_inspections_inspected_at_idx").on(table.inspectedAt),
+    index("stage_inspections_worker_id_idx").on(table.workerId)
+  ]
+);
+// ---------- External production work ----------
+/**
+ * One dispatch of work OUT of the factory and back again.
+ *
+ * A stage whose `method` is OUTSOURCED, VENDOR_PROCESSING or MACHINE is still an
+ * ordinary `production_operations` row - it has the same counters, the same
+ * inspection/acceptance gate and the same place in the route. This table records
+ * the shipments behind it, because one stage can be sent out more than once and
+ * each dispatch has its own outcome.
+ *
+ * THE QUANTITY RULE THIS EXISTS TO ENFORCE
+ *   Quantity sent is NOT quantity returned, and quantity returned is NOT quantity
+ *   accepted. 100 sent / 96 returned / 2 rejected-damaged / 2 short is a normal
+ *   outcome and all four figures are kept separately. Only the ACCEPTED figure
+ *   becomes available to the next route stage, and it does so through the
+ *   production movement ledger - never by editing a counter.
+ *
+ * `vendor_name` is free text, matching the existing `material_purchases.supplier`
+ * convention. Vendors are deliberately NOT `workers` rows: payroll iterates every
+ * worker, so a vendor placed there would accrue phantom piecework. Whether the
+ * business wants a vendor master with payment terms is an open decision flagged
+ * for Task 4; this table does not pre-empt it, and adding a `vendor_id` later is
+ * additive.
+ *
+ * `unit_cost` / `total_cost` are recorded but not yet classified into the
+ * profitability cost categories - that is Task 4. They are nullable so a dispatch
+ * can be tracked before anyone knows the price.
+ */
+export const externalWorkOrders = pgTable("external_work_orders", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productionOperationId: integer("production_operation_id")
+    .references(() => productionOperations.id, { onDelete: "cascade" })
+    .notNull(),
+  productionBatchId: integer("production_batch_id")
+    .references(() => productionBatches.id, { onDelete: "cascade" })
+    .notNull(),
+  /** Stage identity carried as data, like every production_movements row. */
+  stage: text("stage").notNull(),
+  method: text("method").notNull(),
+  vendorName: text("vendor_name").notNull(),
+  quantitySent: integer("quantity_sent").notNull().default(0),
+  quantityReturned: integer("quantity_returned").notNull().default(0),
+  quantityAccepted: integer("quantity_accepted").notNull().default(0),
+  /** Rejected or damaged on return. */
+  quantityRejected: integer("quantity_rejected").notNull().default(0),
+  /** Never came back. Distinct from rejected: nothing arrived to judge. */
+  quantityShort: integer("quantity_short").notNull().default(0),
+  unitCost: integer("unit_cost"),
+  totalCost: integer("total_cost"),
+  /** When the work was due back. Overdue dispatches are what a control view needs. */
+  expectedReturnAt: timestamp("expected_return_at"),
+  /**
+   * What Matesther owes for this dispatch, what has been paid, and the reference.
+   *
+   * Recorded ON the dispatch rather than in a new payments system: `payments` is
+   * money received from a school and `worker_payments` is payroll, and a vendor is
+   * deliberately neither. Whether vendors later get a full payment lifecycle of
+   * their own is an open decision; until then this is where the state of THIS
+   * dispatch lives, and it is additive.
+   */
+  amountPayable: integer("amount_payable"),
+  amountPaid: integer("amount_paid").notNull().default(0),
+  paymentReference: text("payment_reference"),
+  paidAt: timestamp("paid_at"),
+  status: text("status").notNull().default("SENT"),
+  sentAt: timestamp("sent_at").defaultNow(),
+  returnedAt: timestamp("returned_at"),
+  closedAt: timestamp("closed_at"),
+  sentBy: text("sent_by"),
+  acceptedBy: text("accepted_by"),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("external_work_orders_operation_id_idx").on(table.productionOperationId),
+    index("external_work_orders_batch_id_idx").on(table.productionBatchId),
+    index("external_work_orders_status_idx").on(table.status),
+    index("external_work_orders_method_idx").on(table.method)
+  ]
+);
+
 
 // ---------- Tailor support work (weaving, taping, other supporting work) ----
 // A tailor hands part of their garment work to a support worker. The parent
@@ -234,7 +547,32 @@ export const supportAssignments = pgTable("support_assignments", {
     () => productionOperations.id,
     { onDelete: "set null" }
   ),
+  /**
+   * The exact SHARE of that stage the helper is supporting.
+   *
+   * `productionOperationId` alone says "the sewing stage of this batch", which on a
+   * stage split three ways does not say whose 40 pieces the helper is taping. This
+   * does - and it is what makes the deduction land on the right tailor, because an
+   * allocation names the worker it belongs to.
+   *
+   * Nullable: support work recorded before split allocation existed has no share to
+   * point at, and its deduction still resolves through `assignedByWorkerId`.
+   */
+  productionAllocationId: integer("production_allocation_id").references(
+    () => productionAllocations.id,
+    { onDelete: "set null" }
+  ),
   orderId: integer("order_id").references(() => orders.id, { onDelete: "set null" }),
+  /**
+   * The exact garment the support work is on, inherited from the allocation or the
+   * stage's batch - never chosen from scratch. A helper cannot be handed "some
+   * school's order"; they are handed this item, this size, this colour, from this
+   * stage, in this quantity.
+   */
+  orderItemId: integer("order_item_id").references(() => orderItems.id, { onDelete: "set null" }),
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
+  /** The production stage inherited from the parent job, e.g. "SEWING". */
+  stage: text("stage"),
   // The supporting operation itself, e.g. "Weaving" or "Taping".
   operation: text("operation").notNull(),
   pieceRate: integer("piece_rate").notNull().default(0),
@@ -252,7 +590,17 @@ export const supportAssignments = pgTable("support_assignments", {
   }),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("support_assignments_worker_id_idx").on(table.workerId),
+    index("support_assignments_assigned_by_idx").on(table.assignedByWorkerId),
+    index("support_assignments_operation_id_idx").on(table.productionOperationId),
+    index("support_assignments_order_id_idx").on(table.orderId),
+    index("support_assignments_allocation_id_idx").on(table.productionAllocationId),
+    index("support_assignments_order_variant_id_idx").on(table.orderVariantId),
+    index("support_assignments_order_item_id_idx").on(table.orderItemId)
+  ]
+);
 
 // ---------- Support-work inspections (append-only audit trail) ----------
 // Mirrors stage_inspections: every pass is a new row, so rework and rejection
@@ -270,7 +618,12 @@ export const supportInspections = pgTable("support_inspections", {
   quantityRejected: integer("quantity_rejected").notNull().default(0),
   notes: text("notes"),
   inspectedAt: timestamp("inspected_at").defaultNow(),
-});
+},
+  (table) => [
+    index("support_inspections_assignment_id_idx").on(table.supportAssignmentId),
+    index("support_inspections_inspected_at_idx").on(table.inspectedAt)
+  ]
+);
 
 // ---------- Materials ----------
 export const materials = pgTable("materials", {
@@ -298,8 +651,30 @@ export const materialPurchases = pgTable("material_purchases", {
   totalCost: integer("total_cost").notNull().default(0),
   purchaseDate: date("purchase_date").notNull(),
   orderId: integer("order_id").references(() => orders.id),
+  /**
+   * READY-MADE linkage.
+   *
+   * Buying a finished garment is a PURCHASE, not labour: it stays in this table
+   * with its own cost and is never recorded as tailor piecework. These two links
+   * tie a purchased finished good to the exact variant and to the route stage it
+   * satisfies, so accepting it can release quantity downstream.
+   *
+   * `material_id` is NOT NULL, so a ready-made garment is a `materials` row - use
+   * `materials.category` = 'Ready-made garment'. That needs no new table and no
+   * change to stock keeping, and it is what keeps a ready-made purchase visibly
+   * distinct from outsourced production (which lives in external_work_orders).
+   */
+  productionOperationId: integer("production_operation_id").references(() => productionOperations.id, { onDelete: "set null" }),
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("material_purchases_material_id_idx").on(table.materialId),
+    index("material_purchases_order_id_idx").on(table.orderId),
+    index("material_purchases_operation_id_idx").on(table.productionOperationId),
+    index("material_purchases_order_variant_id_idx").on(table.orderVariantId)
+  ]
+);
 
 // ---------- Material usage ----------
 export const materialUsage = pgTable("material_usage", {
@@ -312,10 +687,40 @@ export const materialUsage = pgTable("material_usage", {
     .references(() => materials.id)
     .notNull(),
   quantityUsed: integer("quantity_used").notNull().default(0),
+  /**
+   * Issued / returned / wasted, around the `quantity_used` figure that has always
+   * been there.
+   *
+   * `quantityIssued` is NULLABLE on purpose: NULL means "this record predates issue
+   * tracking, or nobody separated the two", which reads as issued = used. A zero would
+   * claim nothing at all was handed out, which is a different statement. Returned and
+   * wasted default to 0, so every row written before these columns existed keeps the
+   * meaning it already had and no historical figure is restated.
+   *
+   * New records are checked so that used + returned + wasted never exceeds issued.
+   * Nothing here is a second inventory system: `materials.current_stock` is still the
+   * one stock figure, adjusted by what leaves the store and what comes back to it.
+   */
+  quantityIssued: integer("quantity_issued"),
+  quantityReturned: integer("quantity_returned").notNull().default(0),
+  quantityWasted: integer("quantity_wasted").notNull().default(0),
+  /** Who the material was issued to, or which process consumed it. */
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }),
+  /** The exact variant the material was consumed on, where it is known. */
+  orderVariantId: integer("order_variant_id").references(() => orderItemSizes.id, { onDelete: "set null" }),
+  notes: text("notes"),
   unitCost: integer("unit_cost").notNull().default(0),
   totalCost: integer("total_cost").notNull().default(0),
   usedAt: timestamp("used_at").defaultNow(),
-});
+},
+  (table) => [
+    index("material_usage_order_id_idx").on(table.orderId),
+    index("material_usage_material_id_idx").on(table.materialId),
+    index("material_usage_operation_id_idx").on(table.productionOperationId),
+    index("material_usage_worker_id_idx").on(table.workerId),
+    index("material_usage_order_variant_id_idx").on(table.orderVariantId)
+  ]
+);
 
 // ---------- Expenses ----------
 export const expenses = pgTable("expenses", {
@@ -327,7 +732,11 @@ export const expenses = pgTable("expenses", {
   amount: integer("amount").notNull().default(0),
   expenseDate: date("expense_date").notNull(),
   notes: text("notes"),
-});
+},
+  (table) => [
+    index("expenses_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Payments ----------
 export const payments = pgTable("payments", {
@@ -340,7 +749,23 @@ export const payments = pgTable("payments", {
   paymentMethod: text("payment_method").notNull().default("Bank Transfer"),
   reference: text("reference"),
   notes: text("notes"),
-});
+  /**
+   * WHO recorded this, derived from the authenticated session - never from the request body.
+   *
+   * Same actor pattern as `production_movements.actor_user_id` / `actor_name`, and the same
+   * server-side derivation as `worker_payments.paid_by` and `stage_inspections.inspected_by`,
+   * so this is the existing audit mechanism reaching three tables that had none - not a second
+   * system. Both columns are nullable and NOTHING is backfilled: a row recorded before this
+   * existed has no actor, which is the truth, rather than an invented one. The id is `set null`
+   * if the user is ever deleted, so the name still reads as the record of who it was.
+   */
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name"),
+},
+  (table) => [
+    index("payments_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Quality checks ----------
 export const qualityChecks = pgTable("quality_checks", {
@@ -353,7 +778,11 @@ export const qualityChecks = pgTable("quality_checks", {
   quantityFailed: integer("quantity_failed").notNull().default(0),
   notes: text("notes"),
   checkedAt: timestamp("checked_at").defaultNow(),
-});
+},
+  (table) => [
+    index("quality_checks_operation_id_idx").on(table.productionOperationId)
+  ]
+);
 
 // ---------- Rework records ----------
 export const reworkRecords = pgTable("rework_records", {
@@ -365,7 +794,11 @@ export const reworkRecords = pgTable("rework_records", {
   reason: text("reason"),
   status: text("status").notNull().default("PENDING"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("rework_records_operation_id_idx").on(table.productionOperationId)
+  ]
+);
 
 // ---------- Packing records ----------
 export const packingRecords = pgTable("packing_records", {
@@ -377,7 +810,23 @@ export const packingRecords = pgTable("packing_records", {
   packageCount: integer("package_count").notNull().default(0),
   packedAt: timestamp("packed_at").defaultNow(),
   notes: text("notes"),
-});
+  /**
+   * WHO recorded this, derived from the authenticated session - never from the request body.
+   *
+   * Same actor pattern as `production_movements.actor_user_id` / `actor_name`, and the same
+   * server-side derivation as `worker_payments.paid_by` and `stage_inspections.inspected_by`,
+   * so this is the existing audit mechanism reaching three tables that had none - not a second
+   * system. Both columns are nullable and NOTHING is backfilled: a row recorded before this
+   * existed has no actor, which is the truth, rather than an invented one. The id is `set null`
+   * if the user is ever deleted, so the name still reads as the record of who it was.
+   */
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name"),
+},
+  (table) => [
+    index("packing_records_order_id_idx").on(table.orderId)
+  ]
+);
 
 // ---------- Worker payments (payroll records) ----------
 export const workerPayments = pgTable(
@@ -408,7 +857,11 @@ export const workerPayments = pgTable(
     notes: text("notes"),
     createdAt: timestamp("created_at").defaultNow(),
   },
-  (table) => [unique("worker_payments_idempotency_key_unique").on(table.idempotencyKey)]
+  (table) => [
+    unique("worker_payments_idempotency_key_unique").on(table.idempotencyKey),
+    index("worker_payments_worker_id_idx").on(table.workerId),
+    index("worker_payments_period_month_idx").on(table.periodMonth),
+  ]
 );
 
 // ---------- Worker overtime ----------
@@ -425,7 +878,12 @@ export const workerOvertime = pgTable("worker_overtime", {
   category: text("category").notNull().default("OVERTIME"),
   notes: text("notes"),
   createdAt: timestamp("created_at").defaultNow(),
-});
+},
+  (table) => [
+    index("worker_overtime_worker_id_idx").on(table.workerId),
+    index("worker_overtime_worked_on_idx").on(table.workedOn)
+  ]
+);
 
 // ---------- Deliveries ----------
 export const deliveries = pgTable("deliveries", {
@@ -439,7 +897,23 @@ export const deliveries = pgTable("deliveries", {
   deliveryAddress: text("delivery_address"),
   status: text("status").notNull().default("PENDING"),
   notes: text("notes"),
-});
+  /**
+   * WHO recorded this, derived from the authenticated session - never from the request body.
+   *
+   * Same actor pattern as `production_movements.actor_user_id` / `actor_name`, and the same
+   * server-side derivation as `worker_payments.paid_by` and `stage_inspections.inspected_by`,
+   * so this is the existing audit mechanism reaching three tables that had none - not a second
+   * system. Both columns are nullable and NOTHING is backfilled: a row recorded before this
+   * existed has no actor, which is the truth, rather than an invented one. The id is `set null`
+   * if the user is ever deleted, so the name still reads as the record of who it was.
+   */
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name"),
+},
+  (table) => [
+    index("deliveries_order_id_idx").on(table.orderId)
+  ]
+);
 
 // Snapshot the exact garment and size contents of each shipment. Keeping the
 // description here means a historical delivery sheet survives product edits.
@@ -450,4 +924,158 @@ export const deliveryLines = pgTable("delivery_lines", {
   description: text("description").notNull(),
   size: text("size"),
   quantity: integer("quantity").notNull(),
-});
+},
+  (table) => [
+    index("delivery_lines_delivery_id_idx").on(table.deliveryId),
+    index("delivery_lines_order_item_id_idx").on(table.orderItemId)
+  ]
+);
+
+/**
+ * ---------- Production allocations: one exact stage split across workers ----------
+ *
+ * WHY THIS TABLE EXISTS
+ *   `production_operations` holds ONE `worker_id`, so a stage could only ever
+ *   belong to one person. A real order line - 100 navy size-10 polos at SEWING -
+ *   is often split: 40 to one tailor, 35 to another, 25 to a third. The only way
+ *   to express that before was several batches, which fragments the variant, the
+ *   route and the order's own allocation ceiling.
+ *
+ * WHY A SUB-TABLE AND NOT MORE `production_operations` ROWS
+ *   Task 2 added `uniqueIndex(production_operations(production_batch_id, stage))`
+ *   because "the next stage" was found by taking the FIRST row matching a stage
+ *   name - a duplicate would silently starve one of the two. Route progression now
+ *   reads `route_position`, and `uniqueIndex(production_batch_id, route_position)`
+ *   protects it the same way. Both indexes STAY: they are what makes a batch's
+ *   route unambiguous. The constraint that actually blocked several workers was
+ *   the single `worker_id` column, and that is what this table evolves - one stage
+ *   row, several allocations against it.
+ *
+ *   This is also the shape `support_assignments` already uses against its parent
+ *   operation, so it is not a new idea in this codebase.
+ *
+ * INVARIANTS, ALL ENFORCED SERVER-SIDE
+ *   - the allocations on one stage may never sum to more than the stage holds, and
+ *     what a stage holds comes from the movement ledger, not from a typed figure;
+ *   - an allocation may never be reduced below what that worker already submitted;
+ *   - approved quantity stays attributable to the person who earned it, so a
+ *     reassignment moves only the UNWORKED remainder and can never move pay;
+ *   - a stage with no allocation rows behaves exactly as it did before this table
+ *     existed, which is why no historical row needs backfilling.
+ */
+export const productionAllocations = pgTable("production_allocations", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productionOperationId: integer("production_operation_id")
+    .references(() => productionOperations.id, { onDelete: "cascade" })
+    .notNull(),
+  // Denormalised so a batch's or a variant's whole allocation picture is one
+  // indexed lookup.
+  productionBatchId: integer("production_batch_id")
+    .references(() => productionBatches.id, { onDelete: "cascade" })
+    .notNull(),
+  /** Stage identity carried as data, like every production_movements row. */
+  stage: text("stage").notNull(),
+  workerId: integer("worker_id")
+    .references(() => workers.id, { onDelete: "cascade" })
+    .notNull(),
+  /**
+   * The rate agreed with THIS worker for THIS stage, snapshotted when the
+   * allocation was made. Workers on the same stage may legitimately agree
+   * different rates, and a later change to anyone's profile rate must not
+   * restate what was already agreed.
+   */
+  pieceRate: integer("piece_rate"),
+  quantityAllocated: integer("quantity_allocated").notNull().default(0),
+  quantitySubmitted: integer("quantity_submitted").notNull().default(0),
+  quantityApproved: integer("quantity_approved").notNull().default(0),
+  quantityRework: integer("quantity_rework").notNull().default(0),
+  quantityRejected: integer("quantity_rejected").notNull().default(0),
+  status: text("status").notNull().default("ASSIGNED"),
+  assignedAt: timestamp("assigned_at").defaultNow(),
+  assignedByUserId: integer("assigned_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  assignedByName: text("assigned_by_name"),
+  /**
+   * The allocation this one inherited unworked quantity from. Reassignment is a
+   * new row pointing back at the old one rather than an edit of it, so the trail
+   * shows who had the work first, how much they did, and why it moved.
+   */
+  transferredFromId: integer("transferred_from_id"),
+  reason: text("reason"),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("production_allocations_operation_id_idx").on(table.productionOperationId),
+    index("production_allocations_batch_id_idx").on(table.productionBatchId),
+    index("production_allocations_worker_id_idx").on(table.workerId),
+    index("production_allocations_status_idx").on(table.status),
+    // A worker holds ONE live allocation per stage. A transfer closes the old row
+    // (status TRANSFERRED or CANCELLED) and opens a new one, so this partial
+    // uniqueness is what stops the same person being allocated the same stage
+    // twice and double-counting their share.
+    uniqueIndex("production_allocations_live_one_per_worker_unique")
+      .on(table.productionOperationId, table.workerId)
+      .where(sql`${table.status} in ('ASSIGNED', 'ACTIVE')`),
+  ]
+);
+
+// ---------- Production movement ledger ----------
+/**
+ * Append-only record of every event that changes a production quantity.
+ *
+ * WHY THIS EXISTS
+ *   `production_operations` stores seven counters that two different routes used
+ *   to be able to write directly, so a counter could be moved without any record
+ *   of who moved it, when, or why - and could even be moved below the figure its
+ *   own inspection history proves. The counters are now a derived cache of this
+ *   ledger (see src/lib/production-ledger.ts): every quantity is the sum of the
+ *   events that produced it, and a correction is itself an event with a reason.
+ *
+ * TWO DELIBERATE DESIGN CHOICES FOR TASK 3
+ *   1. `event_type` is DATA, not a closed enum in code. Task 3 adds
+ *      SENT_EXTERNAL / RETURNED_EXTERNAL / ACCEPTED_RETURN / RECEIVED_READYMADE /
+ *      MATERIAL_ISSUED to the same table instead of building a second ledger.
+ *   2. `stage` is stored on every row. Stage identity therefore never depends on
+ *      a row's position in a global eight-element array, which is what lets a
+ *      route position replace that array index when garments stop following the
+ *      same eight stages.
+ *
+ * Rows are never updated and never deleted. `source` distinguishes events
+ * recorded as they happened ('LIVE') from rows reconstructed by the 0006
+ * backfill for production that predates the ledger ('INFERRED').
+ */
+export const productionMovements = pgTable("production_movements", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  productionOperationId: integer("production_operation_id")
+    .references(() => productionOperations.id, { onDelete: "cascade" })
+    .notNull(),
+  // Denormalised so a whole batch's history is one indexed lookup.
+  productionBatchId: integer("production_batch_id")
+    .references(() => productionBatches.id, { onDelete: "cascade" })
+    .notNull(),
+  stage: text("stage").notNull(),
+  eventType: text("event_type").notNull(),
+  /** Signed where a correction can reduce a quantity; never null. */
+  quantity: integer("quantity").notNull().default(0),
+  workerId: integer("worker_id").references(() => workers.id, { onDelete: "set null" }),
+  actorUserId: integer("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  actorName: text("actor_name").notNull(),
+  source: text("source").notNull().default("LIVE"),
+  /** The row that caused this event, e.g. referenceType 'STAGE_INSPECTION'. */
+  referenceType: text("reference_type"),
+  referenceId: integer("reference_id"),
+  /** Required for corrections and reassignments: the human reason. */
+  reason: text("reason"),
+  notes: text("notes"),
+  occurredAt: timestamp("occurred_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("production_movements_operation_id_idx").on(table.productionOperationId),
+    index("production_movements_batch_id_idx").on(table.productionBatchId),
+    index("production_movements_event_type_idx").on(table.eventType),
+    index("production_movements_occurred_at_idx").on(table.occurredAt),
+  ]
+);

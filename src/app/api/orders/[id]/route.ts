@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
+import { orderFulfilment } from "@/lib/production-control";
 import {
   orders,
   customers,
@@ -18,8 +19,9 @@ import {
   qualityChecks,
   reworkRecords,
 } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { refreshOrderMoney, batchProgress } from "@/lib/server";
+import { orderCosts, emptyOrderCosts, COST_LINES } from "@/lib/order-cost";
 import { guard, OWNER } from "@/lib/authz";
 
 export async function GET(
@@ -36,7 +38,11 @@ export async function GET(
 
     const [customerRows, itemRows, productRows, batchRows, workerRows, materialRows] =
       await Promise.all([
-        db.select().from(customers),
+        // One customer, not the whole customer book. `customerId` is nullable, so an order
+        // without one simply has no customer row to fetch.
+        order.customerId !== null
+          ? db.select().from(customers).where(eq(customers.id, order.customerId)).limit(1)
+          : Promise.resolve([] as typeof customers.$inferSelect[]),
         db.select().from(orderItems).where(eq(orderItems.orderId, orderId)),
         db.select().from(products),
         db.select().from(productionBatches).where(eq(productionBatches.orderId, orderId)),
@@ -44,9 +50,18 @@ export async function GET(
         db.select().from(materials),
       ]);
     const batchIds = batchRows.map((b) => b.id);
-    const [allOps, usageRows, expenseRows, paymentRows, purchaseRows, packRows, delRows] =
+    const [ops, usageRows, expenseRows, paymentRows, purchaseRows, packRows, delRows] =
       await Promise.all([
-        db.select().from(productionOperations),
+        /**
+         * Only this order's stages. This used to select every production operation in the
+         * book and then filter it in JavaScript, so opening one order downloaded the whole
+         * factory floor - and the same was true of the quality and rework reads below. All
+         * three grow with every stage of every batch ever made, while the rows this page
+         * needs grow only with this order.
+         */
+        batchIds.length
+          ? db.select().from(productionOperations).where(inArray(productionOperations.productionBatchId, batchIds))
+          : Promise.resolve([] as typeof productionOperations.$inferSelect[]),
         db.select().from(materialUsage).where(eq(materialUsage.orderId, orderId)),
         db.select().from(expenses).where(eq(expenses.orderId, orderId)),
         db.select().from(payments).where(eq(payments.orderId, orderId)),
@@ -54,14 +69,15 @@ export async function GET(
         db.select().from(packingRecords).where(eq(packingRecords.orderId, orderId)),
         db.select().from(deliveries).where(eq(deliveries.orderId, orderId)),
       ]);
-    const ops = allOps.filter((o) => batchIds.includes(o.productionBatchId));
     const opIds = ops.map((o) => o.id);
-    const [qcRows, rwRows] = await Promise.all([
-      db.select().from(qualityChecks),
-      db.select().from(reworkRecords),
+    const [quality, rework] = await Promise.all([
+      opIds.length
+        ? db.select().from(qualityChecks).where(inArray(qualityChecks.productionOperationId, opIds))
+        : Promise.resolve([] as typeof qualityChecks.$inferSelect[]),
+      opIds.length
+        ? db.select().from(reworkRecords).where(inArray(reworkRecords.productionOperationId, opIds))
+        : Promise.resolve([] as typeof reworkRecords.$inferSelect[]),
     ]);
-    const quality = qcRows.filter((q) => opIds.includes(q.productionOperationId));
-    const rework = rwRows.filter((r) => opIds.includes(r.productionOperationId));
 
     const pMap = new Map(productRows.map((p) => [p.id, p]));
     const wMap = new Map(workerRows.map((w) => [w.id, w]));
@@ -104,10 +120,24 @@ export async function GET(
       expByCat.set(e.category, (expByCat.get(e.category) ?? 0) + (e.amount ?? 0));
     const materialCost = usageRows.reduce((s, u) => s + (u.totalCost ?? 0), 0);
     const expenseCost = expenseRows.reduce((s, e) => s + (e.amount ?? 0), 0);
-    const totalCost = materialCost + expenseCost;
+
+    /**
+     * What this order really cost, in the nine categories Matesther runs on, computed
+     * server-side from records the system already keeps. See `lib/order-cost.ts`.
+     *
+     * `materialCost` and `expenseCost` above are the two raw record totals and are
+     * still reported, because they describe what was TYPED IN. Everything below is
+     * what was actually spent: ready-made buying, materials, internal and machine
+     * labour, support labour net of the deduction it caused, vendor work, packaging,
+     * delivery and other expenses.
+     */
+    const costOrderId = Number(id);
+    const costed =
+      (await orderCosts([costOrderId])).get(costOrderId) ?? emptyOrderCosts(order.totalAmount ?? 0);
+    const totalCost = costed.totalCost;
     const revenue = order.totalAmount ?? 0;
-    const profit = revenue - totalCost;
-    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
+    const profit = costed.profit;
+    const margin = costed.margin;
 
       const progressBatches = batches.filter(
         (b: any) =>
@@ -123,7 +153,17 @@ export async function GET(
           )
         : 0;
 
+    /**
+     * Where this order actually is, end to end, derived from the ledger and from the packing
+     * and delivery records that already exist - not from the status column and not from
+     * anything anybody can type. `fulfilment.complete` and `fulfilment.statusSaysComplete`
+     * sit beside each other so a status that was changed by hand without the production to
+     * back it is visible instead of trusted.
+     */
+    const fulfilment = await orderFulfilment(orderId);
+
     return NextResponse.json({
+      fulfilment,
       order: {
         ...order,
         customer: customerRows.find((c) => c.id === order.customerId) ?? null,
@@ -148,15 +188,57 @@ export async function GET(
         stage: ops.find((o) => o.id === r.productionOperationId)?.stage ?? "-",
       })),
       costs: {
+        // Raw record totals, unchanged - these describe what was entered, not what
+        // the order cost.
         materialCost,
         expenseCost,
         usageByCategory: [...usageByCat.entries()].map(([category, amount]) => ({ category, amount })),
         expensesByCategory: [...expByCat.entries()].map(([category, amount]) => ({ category, amount })),
+        purchaseTotal: purchaseRows.reduce((s, p) => s + (p.totalCost ?? 0), 0),
+
+        // The restated figure. `totalCost`, `profit` and `margin` now mean the full
+        // nine-category cost, so every screen that already reads them shows the
+        // correct number without being changed.
         totalCost,
         revenue,
         profit,
-        margin: Math.round(margin * 10) / 10,
-        purchaseTotal: purchaseRows.reduce((s, p) => s + (p.totalCost ?? 0), 0),
+        margin,
+        // Each category on its own, so a screen can read one line without walking the
+        // array, and so the nine categories are named rather than implied.
+        readyMade: costed.readyMade,
+        materials: costed.materials,
+        internalLabour: costed.internalLabour,
+        machineLabour: costed.machineLabour,
+        supportLabour: costed.supportLabour,
+        outsourced: costed.outsourced,
+        packaging: costed.packaging,
+        delivery: costed.delivery,
+        otherExpenses: costed.other,
+        /**
+         * Both sides of support pay, shown because it is an internal allocation of ONE
+         * labour cost and not a second cost: Matesther really pays the support worker,
+         * and that same money really comes back out of the tailor's gross commission for
+         * the same approved pieces. `supportLabour` is what it adds to this order, which
+         * is zero whenever the tailor is paid per piece.
+         */
+        supportGrossPaid: costed.supportGrossPaid,
+        supportDeductedFromTailors: costed.supportDeductedFromTailors,
+        supportAllocation: {
+          grossPaidToSupportWorkers: costed.supportGrossPaid,
+          deductedFromTailorCommission: costed.supportDeductedFromTailors,
+          addedToOrderCost: costed.supportLabour,
+        },
+        lines: COST_LINES.map(({ key, label }) => ({ key, label, amount: costed[key] as number })),
+        // Hand-entered expenses in these two categories describe material and labour
+        // that the computed lines already cover, so they are reported but NOT added
+        // into totalCost. Nothing is deleted and nothing is hidden.
+        superseded: {
+          materials: costed.supersededMaterials,
+          labour: costed.supersededLabour,
+        },
+        // The old formula's answer, kept side by side so a previously reported profit
+        // is never silently overwritten.
+        legacy: costed.legacy,
       },
       progress: overallProgress,
       totalQuantity: itemRows.reduce((s, i) => s + (i.quantity ?? 0), 0),
@@ -175,76 +257,114 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
     const { id } = await params;
     const orderId = Number(id);
     const b = await req.json();
-    // Update items in place - items linked to production batches keep their id
+    // Update items in place - items linked to production batches keep their id.
+    //
+    // The whole edit runs in ONE transaction. It used to be a sequence of
+    // independent writes, so a failure part-way through left an order with its
+    // items changed, its total recalculated, and an error returned to the client -
+    // a committed change nobody knew had happened. Now it either all applies or
+    // none of it does.
     if (b.items) {
-      const existingItems = await db
-        .select()
-        .from(orderItems)
-        .where(eq(orderItems.orderId, orderId));
-      const linkedItemIds = new Set(
-        (
-          await db
-            .select()
-            .from(productionBatches)
-            .where(eq(productionBatches.orderId, orderId))
-        )
-          .filter((bb) => bb.orderItemId)
-          .map((bb) => bb.orderItemId)
-      );
-      const usedExisting = new Set<number>();
-
-      for (const it of b.items) {
-        const qty = Number(it.quantity) || 0;
-        const price = Number(it.unitPrice) || 0;
-        const match = existingItems.find(
-          (e) => !usedExisting.has(e.id) && e.productId === Number(it.productId)
+      await db.transaction(async (tx) => {
+        const existingItems = await tx
+          .select()
+          .from(orderItems)
+          .where(eq(orderItems.orderId, orderId));
+        const linkedItemIds = new Set(
+          (
+            await tx
+              .select()
+              .from(productionBatches)
+              .where(eq(productionBatches.orderId, orderId))
+          )
+            .filter((bb) => bb.orderItemId)
+            .map((bb) => bb.orderItemId)
         );
-        if (match) {
-          usedExisting.add(match.id);
-          await db
-            .update(orderItems)
-            .set({ quantity: qty, unitPrice: price, totalPrice: qty * price, notes: it.notes || null })
-            .where(eq(orderItems.id, match.id));
-        } else {
-          await db.insert(orderItems).values({
-            orderId,
-            productId: Number(it.productId),
-            quantity: qty,
-            unitPrice: price,
-            totalPrice: qty * price,
-            notes: it.notes || null,
-          });
-        }
-      }
+        const usedExisting = new Set<number>();
 
-      // Only remove old items that have NO production batch attached
-      for (const e of existingItems) {
-        if (!usedExisting.has(e.id) && !linkedItemIds.has(e.id)) {
-          await db.delete(orderItems).where(eq(orderItems.id, e.id));
+        // How much of each line is already committed to production. Cutting an
+        // order line below this used to be accepted silently, which left a batch
+        // in production for more garments than the order now says were ordered -
+        // i.e. over-allocation created after the fact, with no audit row. This is
+        // the same ceiling POST /api/batches enforces when a batch is created.
+        const allocatedByItem = new Map<number, number>();
+        for (const batch of await tx
+          .select()
+          .from(productionBatches)
+          .where(eq(productionBatches.orderId, orderId))) {
+          if (!batch.orderItemId || batch.status === "CANCELLED") continue;
+          allocatedByItem.set(batch.orderItemId, (allocatedByItem.get(batch.orderItemId) ?? 0) + batch.quantity);
         }
-      }
 
-      const items = await db
-        .select()
-        .from(orderItems)
-        .where(eq(orderItems.orderId, orderId));
-      const total = items.reduce((s, i) => s + (i.totalPrice ?? 0), 0);
-      await db.update(orders).set({ totalAmount: total }).where(eq(orders.id, orderId));
+        for (const it of b.items) {
+          const qty = Number(it.quantity) || 0;
+          const price = Number(it.unitPrice) || 0;
+          const match = existingItems.find(
+            (e) => !usedExisting.has(e.id) && e.productId === Number(it.productId)
+          );
+          if (match) {
+            const allocated = allocatedByItem.get(match.id) ?? 0;
+            if (qty < allocated)
+              throw new Error(
+                `ALLOCATED:${match.quantity}:${allocated}:${qty}`
+              );
+            usedExisting.add(match.id);
+            await tx
+              .update(orderItems)
+              .set({ quantity: qty, unitPrice: price, totalPrice: qty * price, notes: it.notes || null })
+              .where(eq(orderItems.id, match.id));
+          } else {
+            await tx.insert(orderItems).values({
+              orderId,
+              productId: Number(it.productId),
+              quantity: qty,
+              unitPrice: price,
+              totalPrice: qty * price,
+              notes: it.notes || null,
+            });
+          }
+        }
+
+        // Only remove old items that have NO production batch attached
+        for (const e of existingItems) {
+          if (!usedExisting.has(e.id) && !linkedItemIds.has(e.id)) {
+            await tx.delete(orderItems).where(eq(orderItems.id, e.id));
+          }
+        }
+
+        const items = await tx
+          .select()
+          .from(orderItems)
+          .where(eq(orderItems.orderId, orderId));
+        const total = items.reduce((s, i) => s + (i.totalPrice ?? 0), 0);
+        await tx.update(orders).set({ totalAmount: total }).where(eq(orders.id, orderId));
+      });
     }
-    const [row] = await db
-      .update(orders)
-      .set({
-        customerId: b.customerId ? Number(b.customerId) : undefined,
-        orderDate: b.orderDate || undefined,
-        dueDate: b.dueDate === "" ? null : b.dueDate || undefined,
-        status: b.status || undefined,
-        notes: b.notes !== undefined ? b.notes : undefined,
-      })
-      .where(eq(orders.id, orderId))
-      .returning();
+    // Only the fields actually present. Passing an object whose every value is
+    // `undefined` makes Drizzle throw "No values to set" - which is how a request
+    // carrying only `items` used to return HTTP 500 *after* the item edits and the
+    // recalculated order total had already been committed. The client saw a
+    // failure and the database had changed.
+    const changes: Partial<typeof orders.$inferInsert> = {};
+    if (b.customerId) changes.customerId = Number(b.customerId);
+    if (b.orderDate) changes.orderDate = b.orderDate;
+    if (b.dueDate !== undefined) changes.dueDate = b.dueDate === "" ? null : b.dueDate || null;
+    if (b.status) changes.status = b.status;
+    if (b.notes !== undefined) changes.notes = b.notes;
+    const [row] = Object.keys(changes).length
+      ? await db.update(orders).set(changes).where(eq(orders.id, orderId)).returning()
+      : await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
     await refreshOrderMoney(orderId);
     return NextResponse.json(row);
   } catch (e: any) {
+    // Raised inside the transaction, so nothing was written: the order keeps its
+    // old quantity and the client is told exactly why.
+    const allocated = typeof e?.message === "string" && e.message.startsWith("ALLOCATED:") ? e.message.split(":") : null;
+    if (allocated)
+      return NextResponse.json({
+        error: `${allocated[2]} of these garments are already in production batches, so this line cannot be reduced below that. `
+          + `Cancel or reduce the batches first. (Ordered ${allocated[1]}, requested ${allocated[3]}.)`,
+      }, { status: 400 });
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }
 }

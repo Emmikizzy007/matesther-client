@@ -23,7 +23,7 @@ import {
   inputCls,
   Btn,
 } from "@/components/ui";
-import { naira, fmtDate, stageLabel, EXPENSE_CATEGORIES, PAYMENT_METHODS, STAGES, personHoldsRole } from "@/lib/format";
+import { naira, fmtDate, stageLabel, EXPENSE_CATEGORIES, PAYMENT_METHODS, STAGES, STAGE_ROLES, personHoldsRole } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 
 const STAGE_ORDER = STAGES as readonly string[];
@@ -81,7 +81,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
     setLoading(true);
     Promise.all([
       fetch(`/api/orders/${id}`, { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers", { cache: "no-store" }).then((r) => r.json()),
+      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/materials", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/products", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/customers", { cache: "no-store" }).then((r) => r.json()),
@@ -122,17 +122,32 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
       const res = await fetch(`/api/order-sizes?itemId=${it.id}`, { cache: "no-store" }).then((r) => r.json());
       setSizeRows(
         res.sizes && res.sizes.length
-          ? res.sizes.map((s: any) => ({ size: s.size, quantity: String(s.quantity), completed: String(s.completed) }))
-          : ["S", "M", "L", "XL"].map((s) => ({ size: s, quantity: "", completed: "0" }))
+          ? res.sizes.map((s: any) => ({
+              size: s.size ?? "", color: s.color ?? "", quantity: String(s.quantity),
+              // `completedRecorded` is carried through untouched and sent back, so
+              // saving the variants can never zero a figure someone recorded.
+              completed: String(s.completedRecorded ?? 0),
+              // What is shown: derived from the production ledger, not typed. The API
+              // decides which figure is authoritative - it knows whether this variant has any
+              // production behind it - so the screen no longer re-implements that rule.
+              completedFromProduction: Number(s.completedFromProduction ?? 0),
+              completedShown: Number(s.completed ?? 0),
+              produced: Boolean(s.produced),
+            }))
+          : ["S", "M", "L", "XL"].map((s) => ({ size: s, color: "", quantity: "", completed: "0", completedFromProduction: 0 }))
       );
     } catch {
-      setSizeRows(["S", "M", "L", "XL"].map((s) => ({ size: s, quantity: "", completed: "0" })));
+      setSizeRows(["S", "M", "L", "XL"].map((s) => ({ size: s, color: "", quantity: "", completed: "0", completedFromProduction: 0 })));
     }
   }
 
   async function saveSizes(e: React.FormEvent) {
     e.preventDefault();
-    const clean = sizeRows.filter((r) => r.size && Number(r.quantity) > 0);
+    // A variant needs a size OR a colour: "10 navy blazers, no size run" is a real
+    // order line, and requiring a size is what made it impossible to record.
+    const clean = sizeRows
+      .filter((r) => (r.size || r.color) && Number(r.quantity) > 0)
+      .map((r) => ({ size: r.size, color: r.color, quantity: Number(r.quantity), completed: Number(r.completed) || 0 }));
     const res = await fetch("/api/order-sizes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -165,12 +180,14 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
   if (err || !data) return <p className="text-sm text-red-700">Failed to load order: {err}</p>;
 
   const { order, items, batches, usage, purchases, expenses, payments, packing, deliveries, quality, rework, costs, progress, totalQuantity, packedQuantity, deliveredQuantity } = data;
-  const expectedSpecialty: Record<string, string> = { CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole", BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer", DELIVERY: "Packer" };
+  // Was another hand-typed copy of the stage -> role map; now the shared one, so
+  // this page and the server's assignment gate cannot disagree.
+  const expectedSpecialty = STAGE_ROLES;
   const marginColor = costs.margin >= 20 ? "text-emerald-700" : costs.margin >= 0 ? "text-amber-700" : "text-red-700";
 
   const tabs = [
     { k: "production", label: "Production Timeline" },
-    { k: "sizes", label: "Sizes" },
+    { k: "sizes", label: "Variants" },
     { k: "materials", label: `Materials (${purchases.length + usage.length})` },
     { k: "expenses", label: `Expenses (${expenses.length})` },
     { k: "payments", label: `Payments (${payments.length})` },
@@ -226,31 +243,96 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
 
       {/* Profitability panel */}
       <Card className="mb-4">
-        <CardHeader title="Revenue → Costs → Profit" subtitle="Updates automatically as materials, labour and expenses are recorded" />
+        <CardHeader
+          title="Revenue → Costs → Profit"
+          subtitle="Every cost category this order actually carries, derived from the records behind it"
+        />
         <div className="p-5 grid lg:grid-cols-3 gap-5">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Cost breakdown</p>
+            {/*
+              The nine categories, which are what TOTAL COST is actually made of, so the
+              lines on this screen add up to the figure beneath them. This used to list the
+              raw material-usage and expense records and then print a total that included
+              labour the list never mentioned - the numbers did not add up, and there was
+              no way to see why from the screen.
+            */}
             <div className="space-y-1.5 text-sm">
-              {costs.usageByCategory.map((c: any) => (
-                <div key={c.category} className="flex justify-between">
-                  <span className="text-slate-600">{c.category} (materials used)</span>
-                  <span className="font-semibold">{naira(c.amount)}</span>
+              {(costs.lines ?? []).map((line: any) => (
+                <div key={line.key} className="flex justify-between">
+                  <span className={line.amount ? "text-slate-600" : "text-slate-400"}>{line.label}</span>
+                  <span className={line.amount ? "font-semibold" : "text-slate-400"}>{naira(line.amount)}</span>
                 </div>
               ))}
-              {costs.expensesByCategory.map((c: any) => (
-                <div key={c.category} className="flex justify-between">
-                  <span className="text-slate-600">{c.category}</span>
-                  <span className="font-semibold">{naira(c.amount)}</span>
-                </div>
-              ))}
-              {costs.usageByCategory.length + costs.expensesByCategory.length === 0 && (
-                <p className="text-slate-400">No costs recorded yet.</p>
-              )}
+              {(costs.lines ?? []).length === 0 && <p className="text-slate-400">No costs recorded yet.</p>}
             </div>
             <div className="flex justify-between border-t border-slate-200 mt-3 pt-2 text-sm font-bold">
               <span>TOTAL COST</span>
               <span>{naira(costs.totalCost)}</span>
             </div>
+
+            {/* Support labour is the same money as internal labour, moved between two
+                people, so it is shown as an allocation rather than as a second cost. */}
+            {!!costs.supportAllocation && (costs.supportAllocation.grossPaidToSupportWorkers > 0 || costs.supportAllocation.deductedFromTailorCommission > 0) && (
+              <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+                Support workers were paid{" "}
+                <span className="font-semibold">{naira(costs.supportAllocation.grossPaidToSupportWorkers)}</span> for
+                delegated pieces, and{" "}
+                <span className="font-semibold">{naira(costs.supportAllocation.deductedFromTailorCommission)}</span> of
+                the tailors&rsquo; commission was deducted for the same pieces, so this order carries{" "}
+                <span className="font-semibold">{naira(costs.supportAllocation.addedToOrderCost)}</span> of extra
+                labour cost. The labour is counted once.
+              </p>
+            )}
+
+            {/* Hand-entered expenses that the computed categories already cover. They are
+                set aside rather than deleted, and named here so whoever typed them can
+                see that they were seen. */}
+            {!!costs.superseded && (costs.superseded.materials > 0 || costs.superseded.labour > 0) && (
+              <p className="text-[11px] text-amber-700 mt-2 leading-relaxed">
+                Set aside to avoid counting twice: {naira(costs.superseded.materials)} of hand-entered
+                Materials and {naira(costs.superseded.labour)} of hand-entered Labour expenses. The
+                material records and the approved piecework above already cover them.
+              </p>
+            )}
+
+            {/* The old formula's answer, beside the restated one rather than replaced by
+                it, so a figure somebody has already reported can still be recognised. */}
+            {!!costs.legacy && costs.legacy.totalCost !== costs.totalCost && (
+              <div className="mt-3 rounded-lg bg-slate-50 border border-slate-200 p-3 text-[11px] text-slate-600">
+                <p className="font-semibold uppercase tracking-wide text-slate-500 mb-1">Previously reported</p>
+                <p>
+                  Cost {naira(costs.legacy.totalCost)} · Profit {naira(costs.legacy.profit)} · Margin {costs.legacy.margin}%
+                </p>
+                <p className="mt-1 text-slate-500">
+                  The old figure counted materials and hand-entered expenses only, and no labour at all.
+                  This order has been restated on the full model; the old answer is kept here, not overwritten.
+                </p>
+              </div>
+            )}
+
+            <details className="mt-3 text-xs">
+              <summary className="cursor-pointer font-semibold text-slate-500 hover:text-slate-700">
+                The records behind these figures
+              </summary>
+              <div className="space-y-1.5 mt-2">
+                {costs.usageByCategory.map((c: any) => (
+                  <div key={c.category} className="flex justify-between">
+                    <span className="text-slate-600">{c.category} (materials used)</span>
+                    <span className="font-semibold">{naira(c.amount)}</span>
+                  </div>
+                ))}
+                {costs.expensesByCategory.map((c: any) => (
+                  <div key={c.category} className="flex justify-between">
+                    <span className="text-slate-600">{c.category} (expense record)</span>
+                    <span className="font-semibold">{naira(c.amount)}</span>
+                  </div>
+                ))}
+                {costs.usageByCategory.length + costs.expensesByCategory.length === 0 && (
+                  <p className="text-slate-400">No material or expense records on this order.</p>
+                )}
+              </div>
+            </details>
           </div>
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Products in this order</p>
@@ -546,10 +628,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
                   title={`${it.productName} - ${it.quantity} pcs ordered`}
                   subtitle={
                     sz.length
-                      ? `${totalDone}/${totalOrdered} finished • ${outstanding.length ? "Outstanding: " + outstanding.map((r: any) => `${r.size} (${r.quantity - r.completed} left)`).join(", ") : "All sizes finished ✓"}`
-                      : "No size breakdown set yet - set it to track which sizes are finished"
+                      ? `${totalDone}/${totalOrdered} finished • ${outstanding.length ? "Outstanding: " + outstanding.map((r: any) => `${r.variant || r.size} (${r.quantity - r.completed} left)`).join(", ") : "All variants finished ✓"}`
+                      : "No variants recorded yet - set them to track which exact garments are finished"
                   }
-                  action={<Btn variant="secondary" onClick={() => openSizes(it)}>{sz.length ? "Edit sizes" : "Set sizes"}</Btn>}
+                  action={<Btn variant="secondary" onClick={() => openSizes(it)}>{sz.length ? "Edit variants" : "Set variants"}</Btn>}
                 />
                 {sz.length > 0 && (
                   <div className="p-5 flex flex-wrap gap-2">
@@ -557,7 +639,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
                       const done = (r.completed ?? 0) >= (r.quantity ?? 0);
                       return (
                         <div key={r.id} className={`rounded-lg border px-4 py-2.5 text-center min-w-[88px] ${done ? "border-emerald-300 bg-emerald-50" : "border-amber-200 bg-amber-50/40"}`}>
-                          <p className="text-[11px] font-bold text-slate-500">{r.size}</p>
+                          {/* The exact garment, not just a size: colour is what makes
+                              "navy size 8" and "black size 8" two different tiles. */}
+                          <p className="text-[11px] font-bold text-slate-500">{r.color || "No colour"}</p>
+                          <p className="text-[11px] font-semibold text-slate-600">{r.size ? `Size ${r.size}` : "No size"}</p>
                           <p className="text-lg font-extrabold text-slate-900">{r.completed}<span className="text-xs font-semibold text-slate-400">/{r.quantity}</span></p>
                           <p className={`text-[10px] font-bold ${done ? "text-emerald-700" : "text-amber-700"}`}>{done ? "FINISHED" : `${r.quantity - r.completed} LEFT`}</p>
                         </div>
@@ -569,7 +654,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
             );
           })}
           <p className="text-xs text-slate-500">
-            Hand sizes to tailors as pieces are cut - update each size's finished count here, and the
+            Hand exact garments to tailors as pieces are cut - the finished count here is derived from
             “Outstanding” line always shows what is still on the floor.
           </p>
         </div>
@@ -630,11 +715,22 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
           <form
             onSubmit={async (e) => {
               e.preventDefault();
-              const body: any = { ...opModal, id: opModal.id };
+              // Only the fields this modal may change. It used to post the whole
+              // job object back, quantities included. Quantities are derived from
+              // what was allocated, submitted and inspected, so they are no longer
+              // editable here at all - the server refuses them.
+              const body: any = {
+                id: opModal.id,
+                workerId: opModal.workerId ?? null,
+                pieceRate: opModal.pieceRate,
+                expectedCompletionDate: opModal.expectedCompletionDate || null,
+                notes: opModal.notes ?? "",
+              };
               if (submitVal && Number(submitVal) > 0) {
+                // A submission is an event of its own, and cannot carry an edit.
                 body.submitQty = Number(submitVal);
-                delete body.quantityCompleted;
-                delete body.status;
+              } else {
+                body.status = opModal.status;
               }
               const r = await post("/api/operations", body, "PUT");
               if (r) { setOpModal(null); setSubmitVal(""); load(); }
@@ -664,9 +760,22 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
             <Field label="Submit more pieces for inspection (optional)">
               <input type="number" min="0" value={submitVal} onChange={(e) => setSubmitVal(e.target.value)} placeholder="e.g. 25" className={inputCls} />
             </Field>
-            <Field label="Qty received"><input type="number" min="0" value={opModal.quantityReceived ?? 0} onChange={(e) => setOpModal({ ...opModal, quantityReceived: Number(e.target.value) })} className={inputCls} /></Field>
-            <Field label="Qty submitted"><input type="number" min="0" value={opModal.quantityCompleted ?? 0} onChange={(e) => setOpModal({ ...opModal, quantityCompleted: Number(e.target.value) })} className={inputCls} /></Field>
-            <Field label="Qty rejected"><input type="number" min="0" value={opModal.quantityRejected ?? 0} onChange={(e) => setOpModal({ ...opModal, quantityRejected: Number(e.target.value) })} className={inputCls} /></Field>
+            {/* Derived quantities: shown, never typed. */}
+            <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-600 mb-2">Quantities - derived from the production trail</p>
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Received <strong>{opModal.quantityReceived ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Submitted <strong>{opModal.quantityCompleted ?? 0}</strong></span>
+                <span className="bg-white border border-emerald-200 rounded px-2 py-0.5">Approved <strong className="text-emerald-700">{opModal.quantityApproved ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Rework <strong>{opModal.quantityRework ?? 0}</strong></span>
+                <span className="bg-white border border-red-200 rounded px-2 py-0.5">Rejected <strong className="text-red-700">{opModal.quantityRejected ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Outstanding <strong>{opModal.quantityRemaining ?? 0}</strong></span>
+              </div>
+              <p className="mt-2 text-[11px] text-slate-500">
+                A stage receives only what the previous stage approved. To fix a genuine mis-count the Owner records an
+                audited correction, which keeps who changed it, when and why.
+              </p>
+            </div>
             <Field label="Expected completion"><input type="date" value={opModal.expectedCompletionDate || ""} onChange={(e) => setOpModal({ ...opModal, expectedCompletionDate: e.target.value })} className={inputCls} /></Field>
             <Field label="Notes" className="sm:col-span-2">
               <textarea value={opModal.notes || ""} onChange={(e) => setOpModal({ ...opModal, notes: e.target.value })} className={inputCls} rows={2} />
@@ -925,29 +1034,37 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
         </form>
       </Modal>
 
-      {/* Sizes manager */}
-      <Modal open={!!sizesItem} onClose={() => setSizesItem(null)} title={`Size breakdown - ${sizesItem?.productName || ""}`}>
+      {/* Exact garment variants */}
+      <Modal open={!!sizesItem} onClose={() => setSizesItem(null)} title={`Exact garments ordered - ${sizesItem?.productName || ""}`} wide>
         <form onSubmit={saveSizes} className="space-y-3">
           <p className="text-xs text-slate-500">
-            How many of each size were ordered (should total the item quantity), and how many of
-            each are finished so far.
+            One line per exact garment: size, colour and how many were ordered. Production is allocated
+            against these lines, so Navy in size 8 and Black in size 8 are two different things, and
+            each can only be allocated as many times as it was ordered.
           </p>
           <div className="text-[10px] font-bold uppercase text-slate-400 grid grid-cols-12 gap-2">
-            <span className="col-span-4">Size</span>
-            <span className="col-span-3">Ordered</span>
-            <span className="col-span-3">Finished</span>
+            <span className="col-span-3">Size</span>
+            <span className="col-span-3">Colour</span>
+            <span className="col-span-2">Ordered</span>
+            <span className="col-span-2">Finished</span>
             <span className="col-span-2" />
           </div>
           {sizeRows.map((r, i) => (
             <div key={i} className="grid grid-cols-12 gap-2 items-center">
-              <input value={r.size} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, size: e.target.value }; setSizeRows(n); }} placeholder="Size (S, M, 4-5…)" className={`${inputCls} col-span-4`} />
-              <input type="number" min="0" value={r.quantity} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, quantity: e.target.value }; setSizeRows(n); }} placeholder="Ordered" className={`${inputCls} col-span-3`} />
-              <input type="number" min="0" value={r.completed} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, completed: e.target.value }; setSizeRows(n); }} placeholder="Finished" className={`${inputCls} col-span-3`} />
+              <input value={r.size} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, size: e.target.value }; setSizeRows(n); }} placeholder="S, M, 4-5…" className={`${inputCls} col-span-3`} />
+              <input value={r.color ?? ""} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, color: e.target.value }; setSizeRows(n); }} placeholder="Navy, House Red…" className={`${inputCls} col-span-3`} />
+              <input type="number" min="0" value={r.quantity} onChange={(e) => { const n = [...sizeRows]; n[i] = { ...r, quantity: e.target.value }; setSizeRows(n); }} placeholder="Ordered" className={`${inputCls} col-span-2`} />
+              {/* Not editable. It is derived from what production actually got
+                  approved at the last stage of each batch for this variant. */}
+              <span className="col-span-2 text-sm font-semibold text-emerald-700" title="Derived from the production trail - approved at the final stage of each batch for this exact garment">
+                {r.completedShown ?? (Number(r.completed) || 0)}
+                {r.produced && <span className="ml-1 text-[10px] font-normal text-slate-400">from production</span>}
+              </span>
               <button type="button" onClick={() => setSizeRows(sizeRows.filter((_, x) => x !== i))} className="col-span-2 text-red-600 text-xs font-semibold text-center">Remove</button>
             </div>
           ))}
-          <button type="button" onClick={() => setSizeRows([...sizeRows, { size: "", quantity: "", completed: "0" }])} className="text-xs font-semibold text-matesther-700 hover:underline">
-            + Add size
+          <button type="button" onClick={() => setSizeRows([...sizeRows, { size: "", color: "", quantity: "", completed: "0", completedFromProduction: 0 }])} className="text-xs font-semibold text-matesther-700 hover:underline">
+            + Add a size / colour
           </button>
           <div className="flex justify-end gap-2 pt-2">
             <Btn variant="secondary" onClick={() => setSizesItem(null)}>Cancel</Btn>

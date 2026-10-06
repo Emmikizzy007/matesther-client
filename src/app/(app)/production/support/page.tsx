@@ -20,7 +20,16 @@ export default function SupportWorkPage() {
 
   const [rows, setRows] = useState<any[]>([]);
   const [workers, setWorkers] = useState<any[]>([]);
-  const [jobs, setJobs] = useState<any[]>([]);
+  /**
+   * The shares that can be handed out from, not a list of production jobs.
+   *
+   * Handing out support work used to offer a dropdown of every active production job in
+   * the system, which let a helper be attached to a school nobody chose deliberately. A
+   * tailor now offers a part of THEIR OWN share of one exact variant at one exact stage,
+   * and the garment, stage and quantity behind it come with it. For a Worker this returns
+   * only their own shares - the endpoint scopes itself to the login.
+   */
+  const [shares, setShares] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [formErr, setFormErr] = useState("");
@@ -32,9 +41,9 @@ export default function SupportWorkPage() {
     operation: string;
     quantityAssigned: string;
     pieceRate: string;
-    productionOperationId: string;
+    productionAllocationId: string;
     notes: string;
-  }>({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", productionOperationId: "", notes: "" });
+  }>({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", productionAllocationId: "", notes: "" });
   const [submitFor, setSubmitFor] = useState<any>(null);
   const [submitQty, setSubmitQty] = useState("");
   const [inspectFor, setInspectFor] = useState<any>(null);
@@ -45,16 +54,18 @@ export default function SupportWorkPage() {
   function fetchAll() {
     return Promise.all([
       fetch("/api/support-work", { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
-      fetch("/api/operations", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
+      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
+      // Only shares that can still be worked are offered, and the endpoint is bounded,
+      // so this never downloads the whole allocation history to fill a <select>.
+      fetch("/api/allocations?live=1&limit=500", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
     ]);
   }
 
-  function apply([support, people, operations]: [any, any, any]) {
+  function apply([support, people, allocations]: [any, any, any]) {
     if (support && support.error) setErr(support.error);
     else setRows(Array.isArray(support) ? support : []);
     setWorkers(Array.isArray(people) ? people : []);
-    setJobs(Array.isArray(operations) ? operations : []);
+    setShares(Array.isArray(allocations) ? allocations.filter((share: any) => share.live) : []);
   }
 
   function load() {
@@ -88,7 +99,10 @@ export default function SupportWorkPage() {
           workerId: Number(form.workerId),
           quantityAssigned: Number(form.quantityAssigned),
           pieceRate: Number(form.pieceRate) || 0,
-          productionOperationId: form.productionOperationId ? Number(form.productionOperationId) : null,
+          // The share, not the stage job: the server inherits the order, item, variant,
+          // size, colour and stage from it and attributes the work to the tailor who
+          // actually holds it.
+          productionAllocationId: form.productionAllocationId ? Number(form.productionAllocationId) : null,
         }),
       });
       const data = await response.json();
@@ -160,7 +174,7 @@ export default function SupportWorkPage() {
         subtitle="Weaving, taping and other supporting work a tailor hands to a helper. Payable on approved pieces only."
         action={
           !isWorker && (
-            <Btn onClick={() => { setFormErr(""); setForm({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", productionOperationId: "", notes: "" }); setAssignOpen(true); }}>
+            <Btn onClick={() => { setFormErr(""); setForm({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", productionAllocationId: "", notes: "" }); setAssignOpen(true); }}>
               <Plus className="w-4 h-4" /> Hand Out Support Work
             </Btn>
           )
@@ -186,7 +200,7 @@ export default function SupportWorkPage() {
                   <th className="px-5 py-3">Support worker</th>
                   <th className="px-3 py-3">Operation</th>
                   <th className="px-3 py-3">From</th>
-                  <th className="px-3 py-3">Order</th>
+                  <th className="px-3 py-3">Order &amp; exact garment</th>
                   <th className="px-3 py-3 text-right">Given</th>
                   <th className="px-3 py-3 text-right">Returned</th>
                   <th className="px-3 py-3 text-right">Approved</th>
@@ -210,7 +224,29 @@ export default function SupportWorkPage() {
                     <td className="px-3 py-3 text-xs">
                       {row.orderNumber}
                       {row.customer !== "-" && <span className="block text-slate-500">{row.customer}</span>}
-                      {row.batchNumber && <span className="block text-slate-400">{row.batchNumber}{row.size ? ` • ${row.size}` : ""}</span>}
+                      {/* The exact garment: item, size and colour, and the stage it belongs
+                          to. A helper is never shown a whole order's quantity in place of
+                          the specific variant they were handed. */}
+                      {row.garment && (
+                        <span className="block font-medium text-slate-700">
+                          {row.garment}
+                          {row.variant ? ` • ${row.variant}` : ""}
+                        </span>
+                      )}
+                      {row.stage && (
+                        <span className="block text-slate-600">{String(row.stage).replaceAll("_", " ")}</span>
+                      )}
+                      {row.allocation && (
+                        <span className="block text-slate-500">
+                          {row.allocation.holder}&apos;s share of {row.allocation.quantityAllocated} pcs
+                        </span>
+                      )}
+                      {row.batchNumber && (
+                        <span className="block text-slate-400">
+                          {row.batchNumber}
+                          {!row.variant && row.size ? ` • ${row.size}` : ""}
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-3 text-right">{row.quantityAssigned}</td>
                     <td className="px-3 py-3 text-right">{row.quantitySubmitted}</td>
@@ -262,15 +298,25 @@ export default function SupportWorkPage() {
           </Field>
           <Field label="Pieces handed over *"><input required type="number" min="1" value={form.quantityAssigned} onChange={(e) => setForm({ ...form, quantityAssigned: e.target.value })} className={inputCls} /></Field>
           <Field label="Agreed rate per piece (₦)"><input type="number" min="0" value={form.pieceRate} onChange={(e) => setForm({ ...form, pieceRate: e.target.value })} className={inputCls} /></Field>
-          <Field label="From production job (optional)" className="sm:col-span-2">
-            <select value={form.productionOperationId} onChange={(e) => setForm({ ...form, productionOperationId: e.target.value })} className={inputCls}>
-              <option value="">Not linked to one job</option>
-              {jobs
-                .filter((job) => ["IN_PROGRESS", "SUBMITTED", "PENDING"].includes(job.status))
-                .map((job) => (
-                  <option key={job.id} value={job.id}>{job.batchNumber} - {job.stage.replaceAll("_", " ")} ({job.quantityRemaining} remaining)</option>
-                ))}
+          <Field label="From which of your shares (optional)" className="sm:col-span-2">
+            <select value={form.productionAllocationId} onChange={(e) => setForm({ ...form, productionAllocationId: e.target.value })} className={inputCls}>
+              <option value="">General support work, not part of a specific share</option>
+              {shares.map((share) => (
+                <option key={share.id} value={share.id}>
+                  {[
+                    isWorker ? null : share.workerName,
+                    share.batchNumber && share.batchNumber !== "-" ? share.batchNumber : null,
+                    share.stage ? String(share.stage).replaceAll("_", " ") : null,
+                    [share.size, share.color].filter(Boolean).join(" / ") || null,
+                  ].filter(Boolean).join(" • ")} ({share.outstanding} of your {share.quantityAllocated} still open)
+                </option>
+              ))}
             </select>
+            <p className="mt-1 text-xs text-slate-500">
+              Picking a share names the school, garment, size, colour and stage for you, and the
+              work is recorded against the tailor who holds it - the helper never picks a school
+              from scratch, and the pieces handed over can never exceed what is still open.
+            </p>
           </Field>
           <Field label="Notes" className="sm:col-span-2"><input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className={inputCls} placeholder="e.g. Taping for the navy blazers" /></Field>
           {formErr && <p className="sm:col-span-2 text-sm text-red-600">{formErr}</p>}

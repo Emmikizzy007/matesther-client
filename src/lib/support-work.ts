@@ -35,6 +35,49 @@ export function supportInspectionRate(
   return inspectionPieceRate(check, assignment, worker);
 }
 
+/**
+ * What one approved support inspection TAKES BACK from the tailor who handed the
+ * work out.
+ *
+ * Matesther's rule: a tailor's full piece rate belongs to the garment. If they
+ * sew it themselves they keep all of it. If they hand a piece to a helper, the
+ * helper's agreed rate is DEDUCTED from the tailor's rate - it is never added on
+ * top as a second cost. A shirt at 300 with a helper agreed at 30 pays the helper
+ * 30 and leaves the tailor 270 on that piece.
+ *
+ * So the deduction is numerically the helper's earnings for the same inspection:
+ * one movement of money, two sides of it. Both sides settle on APPROVED pieces
+ * only, at the rate snapshotted on the inspection, so approving nothing moves
+ * nothing and a later rate change cannot rewrite what was already paid.
+ *
+ * The cutter's pay does NOT use this model, and neither does an outsourced
+ * vendor: this is only for support work handed from one Matesther worker to
+ * another on work the first one already holds.
+ */
+export function supportInspectionDeduction(
+  check: SupportRateInspection,
+  assignment: SupportRateJob,
+  worker: SupportRateWorker
+): number {
+  return supportInspectionEarnings(check, assignment, worker);
+}
+
+/**
+ * The most a tailor may hand out for one supporting operation on one share of a
+ * stage, given what they have already handed out.
+ *
+ * A tailor holding 40 pieces may legitimately hand out 40 weaves AND 40 tapes -
+ * two different supporting operations on the same garments. What they can never
+ * do is hand out 60 weaves on 40 garments, because there is nothing for the extra
+ * 20 to be on. So the ceiling is per (share, operation), not per share.
+ */
+export function supportHeadroom(
+  holding: number,
+  alreadyHandedOut: number
+): number {
+  return Math.max(0, holding - Math.max(0, alreadyHandedOut));
+}
+
 /** All inspections for one support assignment, oldest first. */
 export async function supportInspectionsFor(assignmentId: number) {
   return db

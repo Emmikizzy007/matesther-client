@@ -67,7 +67,7 @@ export default function InspectionQueuePage() {
         }
       }
       // Workers list is optional supporting context; it must not block the queue.
-      fetch("/api/workers", { cache: "no-store" })
+      fetch("/api/workers?view=slim", { cache: "no-store" })
         .then((res) => res.ok ? res.json() : [])
         .then((rows) => setInspectors(Array.isArray(rows) ? rows.filter((person) => person.status === "ACTIVE" && (person.isInspector || personHoldsRole(person, "Inspection Officer"))) : []))
         .catch(() => setInspectors([]));

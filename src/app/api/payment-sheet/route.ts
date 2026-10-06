@@ -26,7 +26,7 @@ export async function GET(req: Request) {
       ? (requested as string)
       : new Date().toISOString().slice(0, 7);
 
-    const { workers: rows, totals, breakdown } = await workerAccruals(month);
+    const { workers: rows, breakdown } = await workerAccruals(month);
     const [orgRows, payRows] = await Promise.all([
       db
         .select({
@@ -48,7 +48,31 @@ export async function GET(req: Request) {
       if (payment.reference) referenceByWorker.set(payment.workerId, payment.reference);
     }
 
+    // A bank sheet lists people to PAY, so a worker with nothing due is not on it.
     const payable = rows.filter((row) => row.due > 0 || row.paid > 0);
+
+    /**
+     * The sheet's totals describe the SHEET, not the whole payroll.
+     *
+     * A tailor who hands work out has their helper's rate deducted from their own,
+     * and in a month where they approved no pieces themselves that deduction has
+     * nothing to come out of yet. Those workers are not payees, so they are not
+     * rows here - and a sheet whose total quietly included people it does not list
+     * would not reconcile against the transfers actually made. What is left out is
+     * reported as `notListed` instead, so the difference between this sheet and the
+     * payroll screen is visible rather than mysterious.
+     */
+    const totals = payable.reduce(
+      (t, row) => ({ due: t.due + row.due, paid: t.paid + row.paid, balance: t.balance + row.balance }),
+      { due: 0, paid: 0, balance: 0 }
+    );
+    const omitted = rows.filter((row) => row.due <= 0 && row.paid <= 0);
+    const notListed = {
+      count: omitted.length,
+      due: omitted.reduce((sum, row) => sum + row.due, 0),
+      // Held back to be recovered from these workers' later piece-rate earnings.
+      supportDeductionOwed: omitted.reduce((sum, row) => sum + row.supportDeductionOwed, 0),
+    };
 
     return NextResponse.json(
       {
@@ -69,6 +93,12 @@ export async function GET(req: Request) {
           piecework: row.piecework,
           supportPieces: row.supportPieces,
           supportPiecework: row.supportPiecework,
+          // Pieces handed out to a helper, and what that took back out of this
+          // person's own rate. Itemised so the bank figure can be explained.
+          supportPiecesDelegated: row.supportPiecesDelegated,
+          supportDeduction: row.supportDeduction,
+          supportDeductionArising: row.supportDeductionArising,
+          supportDeductionOwed: row.supportDeductionOwed,
           salary: row.salary,
           overtime: row.overtime,
           other: row.other,
@@ -80,6 +110,7 @@ export async function GET(req: Request) {
         })),
         totals,
         breakdown,
+        notListed,
         payableCount: payable.length,
         settledCount: payable.filter((row) => row.paymentStatus === "PAID").length,
       },

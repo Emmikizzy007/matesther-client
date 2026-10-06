@@ -17,7 +17,7 @@
  *
  * ONE DELIBERATE DEVIATION, DOCUMENTED
  *   pg-mem has no plpgsql interpreter, so it cannot execute `DO $$ ... $$`
- *   guard blocks. Migrations 0003, 0004 and 0005 each wrap their ADD CONSTRAINT
+ *   guard blocks. Migrations 0003, 0004, 0005 and 0006 each wrap their ADD CONSTRAINT
  *   statements in such a block purely so the migration is re-runnable. Because
  *   this database is always created empty, those guards could never fire, so the
  *   statements inside are executed directly. The resulting schema is identical.
@@ -57,6 +57,11 @@ const MIGRATIONS = [
   "0003_catchup_live_schema",
   "0004_worker_roles",
   "0005_support_work_and_payroll",
+  "0006_production_ledger_and_indexes",
+  "0007_variants_routes_and_external_work",
+  "0008_production_allocations",
+  "0009_support_cost_and_material_detail",
+  "0010_actor_audit",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 
@@ -98,6 +103,41 @@ const REQUIRED_COLUMNS = [
   ["worker_overtime", "category"],
   ["worker_payments", "idempotency_key"],
   ["workers", "department"],
+  // Fails loudly if migration 0006 was not applied: the production movement
+  // ledger is the source of truth for every derived quantity counter.
+  ["production_movements", "event_type"],
+  ["production_movements", "source"],
+  ["production_movements", "stage"],
+  // Fails loudly if migration 0007 was not applied: variants, routes, the
+  // production-method axis and external work all depend on these.
+  ["order_item_sizes", "color"],
+  ["production_routes", "is_default"],
+  ["production_route_stages", "position"],
+  ["production_route_stages", "method"],
+  ["production_operations", "route_position"],
+  ["production_operations", "method"],
+  ["production_batches", "order_variant_id"],
+  ["production_batches", "route_id"],
+  ["external_work_orders", "quantity_short"],
+  ["material_purchases", "order_variant_id"],
+  // Fails loudly if migration 0008 was not applied: splitting one stage across
+  // several workers depends on both of these.
+  ["production_allocations", "quantity_allocated"],
+  ["production_allocations", "transferred_from_id"],
+  ["stage_inspections", "worker_id"],
+  // Fails loudly if migration 0009 was not applied: exact support-work inheritance,
+  // external-work payment detail and material issue detail all depend on these.
+  ["support_assignments", "production_allocation_id"],
+  ["support_assignments", "order_variant_id"],
+  ["support_assignments", "order_item_id"],
+  ["support_assignments", "stage"],
+  ["external_work_orders", "expected_return_at"],
+  ["external_work_orders", "amount_payable"],
+  ["external_work_orders", "amount_paid"],
+  ["material_usage", "quantity_issued"],
+  ["material_usage", "quantity_returned"],
+  ["material_usage", "quantity_wasted"],
+  ["material_usage", "worker_id"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);

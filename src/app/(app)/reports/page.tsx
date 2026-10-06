@@ -122,8 +122,72 @@ export default function ReportsPage() {
       </Card>
 
       {/* Profitability */}
+      {/*
+        Where the money actually went, book-wide, in the same nine categories each order
+        is costed in. Summed here from the per-order lines the API already returns, so
+        this cannot disagree with the table below it.
+      */}
+      {!!r.costLines && (
+        <Card className="mb-4">
+          <CardHeader
+            title="Cost by category"
+            subtitle="What the whole order book carries, and what no single order can"
+          />
+          <div className="p-5 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-1.5 text-sm">
+            {r.costLines.map((line: any) => {
+              const total = (r.profitability ?? []).reduce(
+                (sum: number, row: any) => sum + ((row.lines ?? []).find((l: any) => l.key === line.key)?.amount ?? 0), 0
+              );
+              return (
+                <div key={line.key} className="flex justify-between border-b border-slate-50 py-1">
+                  <span className={total ? "text-slate-600" : "text-slate-400"}>{line.label}</span>
+                  <span className={total ? "font-semibold" : "text-slate-400"}>{naira(total)}</span>
+                </div>
+              );
+            })}
+          </div>
+          {/*
+            An order's margin is a DIRECT-cost margin. Salaries and business-wide expenses
+            are real costs that belong to no single order, and Matesther has no rule for
+            spreading them - so none is invented here; they are shown beside it instead.
+          */}
+          {!!r.businessCosts && (
+            <div className="px-5 pb-5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">
+                Costs no single order carries
+              </p>
+              {/* Rendered field by field on purpose: `salariedStaff` is a headcount, not
+                  money, and looping the object would have printed it as naira. */}
+              <div className="grid sm:grid-cols-3 gap-4 text-sm">
+                <div className="rounded-lg bg-slate-50 p-3">
+                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Monthly salaries</p>
+                  <p className="font-bold">{naira(r.businessCosts.monthlySalaries ?? 0)}</p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">One month of the salaried commitment</p>
+                </div>
+                <div className="rounded-lg bg-slate-50 p-3">
+                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Salaried staff</p>
+                  <p className="font-bold">{r.businessCosts.salariedStaff ?? 0} <span className="text-xs font-normal text-slate-500">people</span></p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">Active workers paid monthly</p>
+                </div>
+                <div className="rounded-lg bg-slate-50 p-3">
+                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Business expenses</p>
+                  <p className="font-bold">{naira(r.businessCosts.unattributedExpenses ?? 0)}</p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">Recorded against the business, not an order</p>
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-500 mt-2">
+                An order&rsquo;s margin above is a direct-cost margin: it does not carry these.
+              </p>
+            </div>
+          )}
+        </Card>
+      )}
+
       <Card className="mb-4">
-        <CardHeader title="Order Profitability" subtitle="Revenue − true cost (materials used + order expenses) = profit" />
+        <CardHeader
+          title="Order Profitability"
+          subtitle="Revenue − the nine cost categories = profit. Hand-entered Materials and Labour expenses are set aside, not counted twice."
+        />
         <div className="overflow-x-auto slim-scroll">
           <table className="w-full text-sm min-w-[860px]">
             <thead>

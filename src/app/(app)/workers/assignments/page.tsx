@@ -31,10 +31,17 @@ export default function WorkerAssignmentsPage() {
   async function load() {
     setLoading(true); setError("");
     try {
-      const response = await fetch("/api/operations", { cache: "no-store" });
+      // The status filter is applied by the database now: this page only ever
+      // shows active jobs, so downloading every completed and cancelled job in
+      // the system to throw them away here was pure waste.
+      // Both filters are applied by the database: this page lists jobs that can
+      // still be worked on, so completed and cancelled jobs - and the seven empty
+      // future stages on every batch - were being downloaded only to be thrown
+      // away here.
+      const response = await fetch("/api/operations?status=PENDING,IN_PROGRESS,SUBMITTED,ON_HOLD&hasReceived=1", { cache: "no-store" });
       const data = await response.json();
       if (!response.ok || !Array.isArray(data)) throw new Error(data.error || "Assignments could not be loaded.");
-      setJobs(data.filter((job: Job) => job.orderId && job.quantityReceived > 0 && ["PENDING", "IN_PROGRESS", "SUBMITTED", "ON_HOLD"].includes(job.status)));
+      setJobs(data.filter((job: Job) => job.orderId));
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Assignments could not be loaded."); }
     finally { setLoading(false); }
   }

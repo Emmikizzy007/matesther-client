@@ -72,7 +72,7 @@ export default function DashboardPage() {
   if (view === "pm") return <ProductionDashboard d={d} />;
   if (view === "worker") return d.linked === false || !d.profile
     ? <div><h1 className="mb-5 text-2xl font-bold text-slate-900">Welcome, {user?.name}</h1><WorkerLinkNotice name={user?.name} /></div>
-    : <WorkerDashboard d={d} userName={user?.name || ""} />;
+    : <WorkerDashboard d={d} userName={user?.name || ""} refresh={() => setRetry((n) => n + 1)} />;
   return <OwnerDashboard d={d} userName={user?.name || ""} />;
 }
 
@@ -110,7 +110,16 @@ function OwnerDashboard({ d }: any) {
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-5">
         <StatCard label="Total Revenue" value={naira(k.revenue)} icon={<Banknote className="w-5 h-5" />} sub="All orders" href="/profitability" />
         <StatCard label="Total Expenses" value={naira(k.expenseTotal)} icon={<Wallet className="w-5 h-5" />} tone="red" sub="All records" href="/expenses" />
-        <StatCard label="Est. Profit" value={naira(k.profit)} icon={<TrendingUp className="w-5 h-5" />} tone="green" sub={`Costs ${naira(k.totalCost)}`} href="/profitability" />
+        <StatCard
+          label="Profit"
+          value={naira(k.profit)}
+          icon={<TrendingUp className="w-5 h-5" />}
+          tone={k.profit >= 0 ? "green" : "red"}
+          sub={`Costs ${naira(k.totalCost)}, labour included${
+            k.legacy && k.legacy.profit !== k.profit ? ` • previously reported ${naira(k.legacy.profit)}` : ""
+          }`}
+          href="/profitability"
+        />
         <StatCard label="Owed by Customers" value={naira(k.outstanding)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub="Outstanding balances" href="/payments" />
         <StatCard label={`Payroll Due (${payrollLabel})`} value={naira(d.payroll?.due ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`Paid ${naira(d.payroll?.paid ?? 0)} • ${naira(d.payroll?.balance ?? 0)} left`} href="/payroll" />
         <StatCard label="Material Purchases" value={naira(k.materialCost)} icon={<Boxes className="w-5 h-5" />} tone="slate" sub="Purchase records" href="/materials/purchases" />
@@ -248,8 +257,16 @@ function OwnerDashboard({ d }: any) {
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-semibold truncate">{o.orderNumber} <span className="font-normal text-slate-500">• {o.customer}</span></p>
                   <div className="flex items-center gap-2 mt-1">
-                    <ProgressBar pct={o.progress} className="max-w-[120px]" />
-                    <span className="text-[11px] text-slate-500">{o.progress}%</span>
+                    {/* The bar measures APPROVED work, because that is the only
+                        quantity that has actually been made and signed off. The
+                        submitted figure stays visible beside it, so a batch whose
+                        work is all awaiting inspection reads as such instead of
+                        looking finished. */}
+                    <ProgressBar pct={o.approvedProgress ?? o.progress} className="max-w-[120px]" />
+                    <span className="text-[11px] text-slate-500">{o.approvedProgress ?? o.progress}% approved</span>
+                    {o.progress > (o.approvedProgress ?? 0) && (
+                      <span className="text-[11px] text-violet-700">{o.progress}% submitted</span>
+                    )}
                   </div>
                 </div>
                 <div className="text-right shrink-0">
@@ -448,7 +465,7 @@ function ProductionDashboard({ d }: any) {
 }
 
 /* ================= WORKER DASHBOARD (personal work journal) ================= */
-function WorkerDashboard({ d, userName }: any) {
+function WorkerDashboard({ d, userName, refresh }: any) {
   const [submit, setSubmit] = useState<any>(null);
   const [qty, setQty] = useState("");
   const [busy, setBusy] = useState(false);
@@ -467,7 +484,11 @@ function WorkerDashboard({ d, userName }: any) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed");
       setSubmit(null);
-      window.location.reload();
+      setQty("");
+      // Refetch the dashboard payload instead of reloading the whole page: a
+      // reload re-downloads the app shell and re-authenticates just to show one
+      // changed quantity.
+      refresh?.();
     } catch (e: any) {
       setErr(e.message);
     } finally {

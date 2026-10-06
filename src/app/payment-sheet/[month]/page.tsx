@@ -38,6 +38,13 @@ type PaymentSheet = {
   breakdown: { piecework: number; supportPiecework: number; salary: number; overtime: number; other: number };
   payableCount: number;
   settledCount: number;
+  /**
+   * Workers this sheet does not list, and what they are still owed. A tailor who handed work
+   * out and approved no pieces themselves has a deduction with nothing to come out of yet, so
+   * they are not a payee this month - and a sheet whose total silently excluded people would
+   * not reconcile against the payroll screen or the transfers actually made.
+   */
+  notListed: { count: number; due: number; supportDeductionOwed: number };
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -193,6 +200,17 @@ export default function PaymentSheetPage({ params }: { params: Promise<{ month: 
               </tr>
             </tfoot>
           </table>
+        )}
+
+        {sheet.notListed.count > 0 && (
+          <p className="mt-3 border-l-2 border-[#c9c3b2] pl-3 text-[11px] leading-relaxed text-[#6b6250]">
+            {sheet.notListed.count} worker{sheet.notListed.count === 1 ? "" : "s"} not listed on this
+            sheet{sheet.notListed.supportDeductionOwed > 0
+              ? `: a support deduction of ${naira(sheet.notListed.supportDeductionOwed)} arose against work they did not themselves approve this month, so there is no piece-rate earning to deduct it from yet`
+              : ""}.
+            It is carried forward against their later piece-rate earnings, never written off, and
+            is why this sheet&apos;s total differs from the payroll screen.
+          </p>
         )}
 
         <div className="mt-8 grid gap-6 sm:grid-cols-2">

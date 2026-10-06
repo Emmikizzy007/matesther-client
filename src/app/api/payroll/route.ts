@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { guard, OWNER } from "@/lib/authz";
+import { guard, getSessionUser, OWNER } from "@/lib/authz";
 import { db } from "@/db";
 import { workerPayments, workerOvertime, workers } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -63,6 +63,7 @@ export async function GET(req: Request) {
  */
 export async function POST(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
+  const session = await getSessionUser(req);
   try {
     const b = await req.json();
     if (b.kind === "overtime" || b.kind === "other") {
@@ -130,7 +131,18 @@ export async function POST(req: Request) {
         otherAmount: part("otherAmount"),
         amount,
         method: b.method || "Cash",
-        paidBy: b.paidBy || null,
+        /**
+         * WHO recorded this payment comes from the session, never from the request.
+         *
+         * `paidBy` was the only actor in the entire API taken from the body: the payroll
+         * screen sent `user?.name`, so an honest client wrote the truth and any other caller
+         * could write anyone - or nobody - into the payroll history. Every sibling route
+         * already derives its actor server-side (`inspections.inspectedBy`, support
+         * approvals, `production-corrections`), and a payment is the one record where "who
+         * paid this person" is the whole audit. The column is unchanged and the honest
+         * client's value is unchanged; only where it is trusted from has moved.
+         */
+        paidBy: session?.name || null,
         reference: b.reference ? String(b.reference).slice(0, 200) : null,
         idempotencyKey,
         notes: b.notes || null,

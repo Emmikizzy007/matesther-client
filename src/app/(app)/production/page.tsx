@@ -4,10 +4,16 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Search, ClipboardCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
-import { fmtDate, stageLabel, STAGES, personHoldsRole } from "@/lib/format";
+import { StageAllocations } from "@/components/StageAllocations";
+import { fmtDate, methodLabel, stageLabel, STAGES, STAGE_ROLES, personHoldsRole } from "@/lib/format";
 
-const STAGE_SPECIALTIES: Record<string, string> = { CUTTING: "Cutter", SEWING: "Tailor", MONOGRAMMING: "Monogrammer", BUTTONHOLE: "Buttonhole", BUTTON_TACKING: "Button Tacking", IRONING: "Ironer", PACKING: "Packer", DELIVERY: "Packer" };
+// Was a sixth hand-typed copy of the stage -> role map. Now the shared one from
+// lib/format, so the board's worker dropdowns and the server's assignment gate can
+// never disagree about which role a stage needs.
+const STAGE_SPECIALTIES = STAGE_ROLES;
 const COLS = ["PENDING", "IN_PROGRESS", "SUBMITTED", "COMPLETED", "ON_HOLD"];
+/** One page of the production board. The server caps a request at 1000. */
+const PAGE_SIZE = 200;
 const COL_LABEL: Record<string, string> = {
   PENDING: "Pending",
   IN_PROGRESS: "In Progress",
@@ -28,37 +34,74 @@ export default function ProductionPage() {
     return new URLSearchParams(window.location.search).get("stage") || "";
   });
   const [selected, setSelected] = useState<any>(null);
+  const [total, setTotal] = useState(0);
   const [err, setErr] = useState("");
   const [saving, setSaving] = useState(false);
 
+  /**
+   * Jobs are paged and filtered SERVER-SIDE.
+   *
+   * This board used to download every production job in the database - measured
+   * at 11 MB and 14,560 rows at a realistic scale - and then filter them in the
+   * browser. It now asks for one page at a time, with the stage filter applied by
+   * the database, and reads the unpaginated total from X-Total-Count so the
+   * "showing N of M" line needs no second request.
+   */
+  async function loadJobs(append: boolean) {
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: append ? String(ops.length) : "0" });
+    if (stage) params.set("stage", stage);
+    const response = await fetch(`/api/operations?${params.toString()}`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok || !Array.isArray(data)) throw new Error(data?.error || "Unable to load production.");
+    setTotal(Number(response.headers.get("X-Total-Count") ?? data.length));
+    setOps((current) => (append ? [...current, ...data] : data));
+  }
+
+  async function loadContext() {
+    const [people, access] = await Promise.all([
+      fetch("/api/workers?view=slim", { cache: "no-store" }),
+      fetch("/api/production-access", { cache: "no-store" }),
+    ]);
+    const [w, rights] = await Promise.all([people.json(), access.json()]);
+    if (!people.ok || !access.ok) throw new Error(w.error || rights.error || "Unable to load production.");
+    setWorkers(Array.isArray(w) ? w : []);
+    setCanAssignCutting(rights.canAssignCutting === true);
+  }
+
   function load() {
     setLoading(true);
-    Promise.all([
-      fetch("/api/operations", { cache: "no-store" }),
-      fetch("/api/workers", { cache: "no-store" }),
-      fetch("/api/production-access", { cache: "no-store" }),
-    ])
-      .then(async ([jobs, people, access]) => {
-        const [o, w, rights] = await Promise.all([jobs.json(), people.json(), access.json()]);
-        if (!jobs.ok || !people.ok || !access.ok) throw new Error(o.error || w.error || rights.error || "Unable to load production.");
-        setOps(Array.isArray(o) ? o : []);
-        setWorkers(Array.isArray(w) ? w : []);
-        setCanAssignCutting(rights.canAssignCutting === true);
-      })
+    Promise.all([loadJobs(false), loadContext()])
       .catch((cause) => setErr(cause instanceof Error ? cause.message : "Unable to load production."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  // Changing the stage filter re-queries the database rather than re-filtering a
+  // download of everything.
+  useEffect(load, [stage]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function loadMore() {
+    setErr("");
+    loadJobs(true).catch((cause) => setErr(cause instanceof Error ? cause.message : "Unable to load more jobs."));
+  }
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
     setErr("");
     try {
+      // Only the fields this modal may actually change. It used to post the whole
+      // job object back, quantities included - which is how a quantity could be
+      // edited by accident as well as on purpose.
       const res = await fetch("/api/operations", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(selected),
+        body: JSON.stringify({
+          id: selected.id,
+          workerId: selected.workerId ?? null,
+          pieceRate: selected.pieceRate,
+          status: selected.status,
+          expectedCompletionDate: selected.expectedCompletionDate || null,
+          notes: selected.notes ?? "",
+        }),
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || "Failed to save");
@@ -104,6 +147,21 @@ export default function ProductionPage() {
         </Link>
       </Card>
 
+      {!loading && total > ops.length && (
+        <Card className="mb-4 flex flex-wrap items-center justify-between gap-3 p-3">
+          <p className="text-xs text-slate-600">
+            Showing <strong>{ops.length}</strong> of <strong>{total}</strong> production jobs
+            {stage ? ` at ${stageLabel(stage)}` : ""}.
+          </p>
+          <Btn variant="secondary" onClick={loadMore}>Load {Math.min(PAGE_SIZE, total - ops.length)} more</Btn>
+        </Card>
+      )}
+      {!loading && total <= ops.length && total > 0 && (
+        <p className="mb-4 text-xs text-slate-500">
+          Showing all <strong>{total}</strong> production jobs{stage ? ` at ${stageLabel(stage)}` : ""}.
+        </p>
+      )}
+
       {loading ? (
         <Card><Loading /></Card>
       ) : (
@@ -143,7 +201,14 @@ export default function ProductionPage() {
                       </div>
                       <p className="text-sm font-semibold mt-1 text-matesther-800">{o.orderNumber}</p>
                       <p className="text-xs text-slate-500 truncate">{o.customer}</p>
-                      <p className="mt-1 text-[11px] font-semibold text-slate-700">{o.garment}{o.size ? ` • Size ${o.size}` : ""}{o.color ? ` • ${o.color}` : ""}</p>
+                      {/* The EXACT garment, and this stage's place in THIS batch's
+                          route - so a polo on a three-stage route is never read as
+                          "stuck" at a stage it does not have. */}
+                      <p className="mt-1 text-[11px] font-semibold text-slate-700">{o.garment} • {o.variant}</p>
+                      <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[10px]">
+                        {o.routePosition && o.routeLength ? <span className="rounded bg-slate-100 px-1.5 py-0.5 font-semibold text-slate-600">Stage {o.routePosition} of {o.routeLength}</span> : null}
+                        {o.method && o.method !== "INTERNAL" ? <span className="rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800">{methodLabel(o.method)}</span> : null}
+                      </p>
                       <p className="text-xs mt-1.5">
                         <span className="text-slate-500">Worker: </span>
                         <span className="font-medium">{o.workerName || <span className="text-amber-600">Unassigned</span>}</span>
@@ -204,9 +269,35 @@ export default function ProductionPage() {
                 disabled={selected.quantityCompleted > 0 || selected.quantityInspected > 0} value={selected.pieceRate ?? ""}
                 onChange={(e) => setSelected({ ...selected, pieceRate: e.target.value === "" ? null : Number(e.target.value) })} className={inputCls} />
             </Field>}
-            <Field label="Qty received"><input type="number" min="0" value={selected.quantityReceived ?? 0} onChange={(e) => setSelected({ ...selected, quantityReceived: Number(e.target.value) })} className={inputCls} /></Field>
-            <Field label="Qty submitted"><input type="number" min="0" value={selected.quantityCompleted ?? 0} onChange={(e) => setSelected({ ...selected, quantityCompleted: Number(e.target.value) })} className={inputCls} /></Field>
-            <Field label="Qty rejected"><input type="number" min="0" value={selected.quantityRejected ?? 0} onChange={(e) => setSelected({ ...selected, quantityRejected: Number(e.target.value) })} className={inputCls} /></Field>
+            {/* Quantities are DERIVED, so they are shown, not typed. Each one is
+                the sum of the events that produced it: what the batch allocated,
+                what the worker submitted, what an inspection approved. */}
+            <div className="sm:col-span-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-600 mb-2">Quantities - derived from the production trail</p>
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Received <strong>{selected.quantityReceived ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Submitted <strong>{selected.quantityCompleted ?? 0}</strong></span>
+                <span className="bg-white border border-emerald-200 rounded px-2 py-0.5">Approved <strong className="text-emerald-700">{selected.quantityApproved ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Rework <strong>{selected.quantityRework ?? 0}</strong></span>
+                <span className="bg-white border border-red-200 rounded px-2 py-0.5">Rejected <strong className="text-red-700">{selected.quantityRejected ?? 0}</strong></span>
+                <span className="bg-white border border-slate-200 rounded px-2 py-0.5">Outstanding <strong>{selected.quantityRemaining ?? 0}</strong></span>
+                <span className="bg-white border border-violet-200 rounded px-2 py-0.5">Awaiting inspection <strong className="text-violet-700">{selected.pendingInspection ?? 0}</strong></span>
+              </div>
+              <p className="mt-2 text-[11px] text-slate-500">
+                These cannot be typed over. A stage receives only what the stage before it approved, and work only becomes
+                inspectable when the assigned worker submits it. If a genuine mis-count needs fixing, the Owner records a
+                correction, which keeps who changed it, when and why.
+              </p>
+            </div>
+            {/* One stage, several workers: 100 navy size-10 polos at SEWING split
+                40 / 35 / 25. Every limit here is also enforced server-side against
+                the movement ledger. */}
+            <StageAllocations
+              operation={{ id: selected.id, stage: selected.stage, method: selected.method ?? "INTERNAL", quantityReceived: selected.quantityReceived ?? 0, workerId: selected.workerId ?? null }}
+              workers={workers}
+              requiredRole={STAGE_SPECIALTIES[selected.stage] ?? null}
+              onChanged={load}
+            />
             <Field label="Expected completion"><input type="date" value={selected.expectedCompletionDate || ""} onChange={(e) => setSelected({ ...selected, expectedCompletionDate: e.target.value })} className={inputCls} /></Field>
             <Field label="Notes" className="sm:col-span-2">
               <textarea value={selected.notes || ""} onChange={(e) => setSelected({ ...selected, notes: e.target.value })} className={inputCls} rows={2} />

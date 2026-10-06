@@ -84,7 +84,12 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed");
       setSubmit(null);
-      window.location.reload();
+      // Refetch this worker's data instead of reloading the whole page. A full
+      // reload re-downloads and re-parses the app shell, re-runs authentication
+      // and throws away every other component's state, to show one changed
+      // quantity. `retry` already drives the loader above.
+      setQty("");
+      setRetry((n) => n + 1);
     } catch (e: any) {
       setSubmitErr(e.message);
     } finally {

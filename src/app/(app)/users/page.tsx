@@ -32,7 +32,7 @@ export default function UsersPage() {
     try {
       const [response, workersResponse] = await Promise.all([
         fetch("/api/users", { cache: "no-store" }),
-        fetch("/api/workers", { cache: "no-store" }),
+        fetch("/api/workers?view=slim", { cache: "no-store" }),
       ]);
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Unable to load staff accounts.");

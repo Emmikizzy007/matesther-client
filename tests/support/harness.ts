@@ -41,9 +41,20 @@ import * as productionOrdersRoute from "@/app/api/production-orders/route";
 import * as paymentsRoute from "@/app/api/payments/route";
 import * as receiptsRoute from "@/app/api/receipts/route";
 import * as deliveriesRoute from "@/app/api/deliveries/route";
+import * as packingRoute from "@/app/api/packing/route";
 import * as expensesRoute from "@/app/api/expenses/route";
 import * as materialsRoute from "@/app/api/materials/route";
 import * as healthRoute from "@/app/api/health/route";
+import * as productionCorrectionsRoute from "@/app/api/production-corrections/route";
+import * as routesRoute from "@/app/api/routes/route";
+import * as externalWorkRoute from "@/app/api/external-work/route";
+import * as attentionRoute from "@/app/api/attention/route";
+import * as productionControlRoute from "@/app/api/production-control/route";
+import * as readyMadeRoute from "@/app/api/ready-made/route";
+import * as orderSizesRoute from "@/app/api/order-sizes/route";
+import * as materialPurchasesRoute from "@/app/api/material-purchases/route";
+import * as materialUsageRoute from "@/app/api/material-usage/route";
+import * as allocationsRoute from "@/app/api/allocations/route";
 
 export const HOST = "matesther.test";
 export const ORIGIN = `http://${HOST}`;
@@ -93,11 +104,45 @@ const ROUTES: Record<string, Handler> = {
   "GET /api/payments": paymentsRoute.GET,
   "POST /api/payments": paymentsRoute.POST,
   "GET /api/receipts": receiptsRoute.GET,
+  "GET /api/packing": packingRoute.GET,
+  "POST /api/packing": packingRoute.POST,
   "GET /api/deliveries": deliveriesRoute.GET,
   "POST /api/deliveries": deliveriesRoute.POST,
   "GET /api/expenses": expensesRoute.GET,
+  "POST /api/expenses": expensesRoute.POST,
   "GET /api/materials": materialsRoute.GET,
+  "POST /api/materials": materialsRoute.POST,
+  "PUT /api/materials": materialsRoute.PUT,
   "GET /api/health": healthRoute.GET,
+  "GET /api/production-corrections": productionCorrectionsRoute.GET,
+  "POST /api/production-corrections": productionCorrectionsRoute.POST,
+  "GET /api/routes": routesRoute.GET,
+  "POST /api/routes": routesRoute.POST,
+  "PUT /api/routes": routesRoute.PUT,
+  "DELETE /api/routes": routesRoute.DELETE,
+  "GET /api/external-work": externalWorkRoute.GET,
+  // The route-aware production control board: read-only, every figure derived.
+  "GET /api/attention": attentionRoute.GET,
+  "GET /api/production-control": productionControlRoute.GET,
+  "POST /api/external-work": externalWorkRoute.POST,
+  "PUT /api/external-work": externalWorkRoute.PUT,
+  "GET /api/ready-made": readyMadeRoute.GET,
+  // Registered so a test can build an order's exact variants. There is no PUT:
+  // the dormant unaudited single-row quantity write was closed in Task 2.
+  "GET /api/order-sizes": orderSizesRoute.GET,
+  "POST /api/order-sizes": orderSizesRoute.POST,
+  "GET /api/material-purchases": materialPurchasesRoute.GET,
+  "POST /api/material-purchases": materialPurchasesRoute.POST,
+  "GET /api/material-usage": materialUsageRoute.GET,
+  "GET /api/allocations": allocationsRoute.GET,
+  "POST /api/allocations": allocationsRoute.POST,
+  "PUT /api/allocations": allocationsRoute.PUT,
+  "POST /api/material-usage": materialUsageRoute.POST,
+  // Material can be returned to the store or written off after it was issued, which is
+  // how it actually happens, so the update path is part of the surface under test.
+  "PUT /api/material-usage": materialUsageRoute.PUT,
+  "POST /api/ready-made": readyMadeRoute.POST,
+  "PUT /api/ready-made": readyMadeRoute.PUT,
 };
 
 /** Parameterised routes, matched in order. */
@@ -113,6 +158,11 @@ export type ApiResponse = {
   status: number;
   data: any;
   cookie: string | null;
+  /**
+   * Response headers, so a test can assert what a paged endpoint reports in
+   * `X-Total-Count` rather than only what it returned in the body.
+   */
+  headers: Headers;
 };
 
 export type ApiOptions = {
@@ -164,6 +214,7 @@ export async function api(
     status: response.status,
     data,
     cookie: setCookie?.match(/matesther_session=([^;]+)/)?.[1] ?? null,
+    headers: response.headers,
   };
 }
 

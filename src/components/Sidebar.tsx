@@ -15,6 +15,7 @@ import {
   Boxes,
   Truck,
   PackageCheck,
+  Route,
   Wallet,
   CreditCard,
   TrendingUp,
@@ -30,6 +31,7 @@ import {
   Menu,
   X,
   HandHelping,
+  Gauge,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useAuth, roleLabel, Role } from "@/lib/auth";
@@ -56,9 +58,12 @@ const OWNER_NAV: NavGroup[] = [
     label: "Production",
     items: [
       { href: "/production", label: "Active Production", icon: Factory },
+      { href: "/production/control", label: "Production Control", icon: Gauge },
       { href: "/production/assign", label: "Assign Production", icon: UserCheck },
       { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
+      { href: "/production/external", label: "External & Ready-made", icon: PackageCheck },
+      { href: "/production/routes", label: "Production Routes", icon: Route },
       { href: "/production/history", label: "Production History", icon: History },
       { href: "/workers", label: "Workers", icon: ContactRound },
     ],
@@ -103,8 +108,11 @@ const PM_NAV: NavGroup[] = [
     items: [
       { href: "/production/assign", label: "Assign Production", icon: UserCheck },
       { href: "/production", label: "Active Production", icon: Factory },
+      { href: "/production/control", label: "Production Control", icon: Gauge },
       { href: "/production/support", label: "Support Work", icon: HandHelping },
       { href: "/production/inspection", label: "Inspection Queue", icon: ClipboardCheck },
+      { href: "/production/external", label: "External & Ready-made", icon: PackageCheck },
+      { href: "/production/routes", label: "Production Routes", icon: Route },
       { href: "/production/history", label: "Production History", icon: History },
     ],
   },
@@ -165,6 +173,39 @@ export default function Sidebar() {
   const { user, logout } = useAuth();
   const [open, setOpen] = useState(false);
 
+  /**
+   * What needs attention, pulled once when the signed-in role is known.
+   *
+   * This is the visible half of GET /api/attention. It is deliberately a pull and deliberately
+   * not polled: the alerts are derived from the production ledger on every request, so a
+   * background timer would repeat an expensive derivation on every open tab for a figure that
+   * only has to be right when somebody looks. One read per page load, no retries, and a
+   * failure that cannot break the navigation - an alert bar that will not load is an
+   * inconvenience, a sidebar that will not render is not.
+   */
+  const [attention, setAttention] = useState<{
+    total: number;
+    top: { count: number; unit: string; title: string } | null;
+  } | null>(null);
+  const role = user?.role;
+  useEffect(() => {
+    // Staff only. The endpoint refuses a Worker, and a Worker's own view of their work is the
+    // worker dashboard, which already scopes to their allocations - so not sending the request
+    // at all keeps a pointless 403 off the network and an expensive derivation off a screen
+    // that could never show it.
+    if (!role || role === ("WORKER" as Role)) return;
+    let cancelled = false;
+    fetch("/api/attention", { cache: "no-store", headers: { Accept: "application/json" } })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        if (cancelled || !data || typeof data.total !== "number") return;
+        const top = Array.isArray(data.alerts) && data.alerts.length ? data.alerts[0] : null;
+        setAttention({ total: data.total, top });
+      })
+      .catch(() => { /* nothing to show; the navigation is what matters */ });
+    return () => { cancelled = true; };
+  }, [role]);
+
   useEffect(() => {
     if (!open) return;
     const previous = document.body.style.overflow;
@@ -178,6 +219,21 @@ export default function Sidebar() {
 
   const list = (
     <nav className="px-3 pb-4 space-y-4">
+      {attention !== null && attention.total > 0 && (
+        <Link
+          href="/production/control"
+          className="mx-3 mb-3 flex items-start gap-2 rounded-lg border border-amber-300/30 bg-amber-300/10 px-3 py-2 text-[11px] leading-snug text-amber-50"
+        >
+          <span className="mt-px inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-amber-300 px-1 text-[10px] font-extrabold text-[#282b25]">
+            {attention.total}
+          </span>
+          <span>
+            {attention.top
+              ? `${attention.top.count} ${attention.top.unit} — ${attention.top.title}`
+              : "Needs attention"}
+          </span>
+        </Link>
+      )}
       {groups.map((g) => (
         <div key={g.label}>
           <p className="px-3 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-matesther-100/50">

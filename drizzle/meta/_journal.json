@@ -43,6 +43,41 @@
       "when": 1790914981061,
       "tag": "0005_support_work_and_payroll",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1791037524298,
+      "tag": "0006_production_ledger_and_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791051756889,
+      "tag": "0007_variants_routes_and_external_work",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1791065498866,
+      "tag": "0008_production_allocations",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1791075691179,
+      "tag": "0009_support_cost_and_material_detail",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1791283060029,
+      "tag": "0010_actor_audit",
+      "breakpoints": true
     }
   ]
 }

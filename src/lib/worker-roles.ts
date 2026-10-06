@@ -47,8 +47,25 @@ export function effectiveRoles(
   return roles;
 }
 
+/**
+ * A caller-supplied per-request memo. One PUT /api/operations can ask whether the
+ * same person holds two different roles, which used to resolve their role list
+ * twice (4 queries). Pass one Map through a handler to resolve it once.
+ * Deliberately NOT module-level: roles can change, so a cache must never outlive
+ * the request that created it.
+ */
+export type RoleCache = Map<number, Promise<string[]>>;
+
 /** Effective roles for one person. */
-export async function rolesForWorker(workerId: number): Promise<string[]> {
+export async function rolesForWorker(workerId: number, cache?: RoleCache): Promise<string[]> {
+  const cached = cache?.get(workerId);
+  if (cached) return cached;
+  const pending = loadRolesForWorker(workerId);
+  cache?.set(workerId, pending);
+  return pending;
+}
+
+async function loadRolesForWorker(workerId: number): Promise<string[]> {
   const [rows, stored] = await Promise.all([
     db.select({ specialty: workers.specialty }).from(workers).where(eq(workers.id, workerId)).limit(1),
     db
@@ -88,11 +105,12 @@ export async function rolesByWorker(): Promise<Map<number, string[]>> {
  */
 export async function workerHoldsRole(
   person: { id: number; specialty: string | null } | undefined | null,
-  role: string
+  role: string,
+  cache?: RoleCache
 ): Promise<boolean> {
   if (!person) return false;
   if (sameRole(person.specialty, role)) return true;
-  return rolesInclude(await rolesForWorker(person.id), role);
+  return rolesInclude(await rolesForWorker(person.id, cache), role);
 }
 
 /** Convenience wrapper around the shared comparator. */
