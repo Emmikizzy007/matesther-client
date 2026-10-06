@@ -4,7 +4,7 @@ import { orderItemSizes, orderItems, products } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { guard, OWNER, STAFF } from "@/lib/authz";
 import { variantLabel } from "@/lib/format";
-import { completedForVariant } from "@/lib/production-route";
+import { completedForVariants } from "@/lib/production-route";
 
 /**
  * The exact garment VARIANTS on an order item.
@@ -45,8 +45,9 @@ export async function GET(req: Request) {
       .select()
       .from(orderItemSizes)
       .where(eq(orderItemSizes.orderItemId, item.id));
-    // Derived, per variant, from the ledger - not typed in.
-    const derived = await Promise.all(rows.map((row) => completedForVariant(row.id)));
+    // Derived for every variant in two queries, from the ledger - not typed in, and not one
+    // round trip per variant as it was.
+    const derived = await completedForVariants(rows.map((row) => row.id));
 
     return NextResponse.json({
       item: {
@@ -54,17 +55,36 @@ export async function GET(req: Request) {
         productName: product[0]?.name ?? "-",
         quantity: item.quantity,
       },
-      sizes: rows.map((r, index) => ({
-        id: r.id,
-        size: r.size,
-        color: r.color,
-        quantity: r.quantity,
-        // The truthful figure when the variant has been produced.
-        completed: derived[index] > 0 ? Math.min(derived[index], r.quantity) : r.completed,
-        completedFromProduction: derived[index],
-        completedRecorded: r.completed,
-        variant: variantLabel(r.size, r.color),
-      })),
+      sizes: rows.map((r) => {
+        const production = derived.get(r.id) ?? { completed: 0, produced: false };
+        return {
+          id: r.id,
+          size: r.size,
+          color: r.color,
+          quantity: r.quantity,
+          /**
+           * The authoritative figure.
+           *
+           * Where this variant HAS production, the ledger decides - including when the ledger
+           * says zero. It used to read `derived > 0 ? derived : recorded`, which let a number
+           * somebody typed survive whenever production had approved nothing yet: twenty pieces
+           * submitted and awaiting inspection, or all rejected, showed the typed figure as
+           * finished. That is precisely the "arbitrary manual entry" this field must not be.
+           *
+           * Where the variant has NO production at all there is no ledger to consult, so the
+           * recorded figure stands rather than being quietly zeroed - a historical order, or
+           * one made up outside the system, keeps the number somebody wrote down.
+           */
+          completed: production.produced
+            ? Math.min(production.completed, r.quantity)
+            : r.completed,
+          completedFromProduction: production.completed,
+          /** True once any live batch has been made against this variant. */
+          produced: production.produced,
+          completedRecorded: r.completed,
+          variant: variantLabel(r.size, r.color),
+        };
+      }),
     });
   } catch (e: any) {
     return NextResponse.json(

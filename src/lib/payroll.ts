@@ -579,6 +579,45 @@ export async function accrualForWorker(workerId: number, month: string): Promise
  * inspection history. Now: 7 statements and only the month's rows, with the
  * per-worker split done by `GROUP BY`.
  */
+/**
+ * Every piece of piecework ever approved, per worker, with NO date bound.
+ *
+ * `lib/../app/api/reports` needs an all-time earnings figure per worker. It used to compute
+ * one by loading every stage inspection and every production operation into memory and
+ * running `inspectionEarnings()` over the cross product in JavaScript - two whole tables and
+ * O(inspections x operations) filtering on every request.
+ *
+ * This reuses `PAID_WORKER` and `PIECEWORK_SUM` verbatim, so the all-time figure on a report
+ * and the month figure on payroll are the SAME expression and cannot drift apart: the same
+ * rate precedence (inspection snapshot, then job rate, then worker rate), the same
+ * PER_PIECE-only gate, and the same attribution to whoever the inspection names, falling
+ * back to the stage's worker. No bound is applied at all rather than a very wide one, so
+ * nothing can be silently excluded by a date range that does not cover it.
+ *
+ * Stage piecework only. Support piecework is deliberately NOT folded in here: the report
+ * this feeds has always shown stage piecework, and adding the other stream would change a
+ * money figure nobody asked to change. Payroll, which is where support pay is settled,
+ * counts both and shows the deduction.
+ */
+export async function allTimePiecework(): Promise<Map<number, PieceworkRow>> {
+  const rows = await db
+    .select({
+      workerId: PAID_WORKER,
+      pieces: sql<number>`coalesce(sum(${stageInspections.quantityApproved}), 0)`,
+      piecework: PIECEWORK_SUM,
+    })
+    .from(stageInspections)
+    .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
+    .innerJoin(workers, eq(workers.id, PAID_WORKER))
+    .groupBy(PAID_WORKER);
+  return new Map(
+    rows.map((row) => [
+      Number(row.workerId),
+      { workerId: Number(row.workerId), pieces: Number(row.pieces) || 0, piecework: Number(row.piecework) || 0 },
+    ])
+  );
+}
+
 export async function workerAccruals(month: string) {
   const { from, to } = monthBounds(month);
   const [people, roleMap, stage, support, delegated, paid, extra] = await Promise.all([

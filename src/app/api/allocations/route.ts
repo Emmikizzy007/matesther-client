@@ -3,7 +3,7 @@ import { db } from "@/db";
 import { productionAllocations, productionBatches, productionOperations, workers } from "@/db/schema";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { refreshBatchAndOrder } from "@/lib/server";
-import { guard, getSessionUser, productionAccess, ANYONE, STAFF } from "@/lib/authz";
+import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE, STAFF } from "@/lib/authz";
 import { isExternalMethod, isPurchasedMethod, methodLabel, sameRole } from "@/lib/format";
 import { workerHoldsRole, type RoleCache } from "@/lib/worker-roles";
 import { roleForStage } from "@/lib/production-route";
@@ -51,21 +51,60 @@ export async function GET(req: Request) {
     const query = new URL(req.url).searchParams;
     const operationId = query.get("operationId") ? Number(query.get("operationId")) : null;
     const batchId = query.get("batchId") ? Number(query.get("batchId")) : null;
-    // A Worker sees only their own allocations.
-    const workerId = session.role === "WORKER" ? Number(query.get("workerId") ?? NaN) : query.get("workerId") ? Number(query.get("workerId")) : null;
+    /**
+     * A Worker sees ONLY their own allocations, whatever the query string says.
+     *
+     * Two holes closed here, both of which handed a Worker the whole-stage view they
+     * must never get:
+     *   - the `workerId` filter was taken from the query string, so a Worker who simply
+     *     omitted it dropped the filter entirely and received every share in the
+     *     database, and a Worker who supplied somebody else's id received that person's;
+     *   - the `operationId` path returns every allocation on a stage by design, because
+     *     a supervisor splitting a stage needs to see all of them.
+     * So the worker's own id is resolved from their login and the scope is applied to the
+     * RESULT, which makes it impossible for either query path to widen it. Staff keep the
+     * parameter, because choosing whose shares to look at is their job.
+     */
+    const isWorkerSession = session.role === "WORKER";
+    const myWorkerId = isWorkerSession ? await getLinkedWorkerId(session) : null;
+    if (isWorkerSession && myWorkerId === null)
+      return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
+    const requestedWorkerId = query.get("workerId") ? Number(query.get("workerId")) : null;
+    // Asking for somebody else's shares returns NOTHING rather than the worker's own:
+    // silently substituting their own rows would hide the fact that a wider id was asked
+    // for, and this way the answer to a probe is indistinguishable from "no such work".
+    if (
+      isWorkerSession && requestedWorkerId !== null &&
+      Number.isSafeInteger(requestedWorkerId) && requestedWorkerId !== myWorkerId
+    )
+      return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
+    const workerId = isWorkerSession ? myWorkerId : requestedWorkerId;
 
-    const rows = operationId
+    // `live=1` narrows to shares that can still be worked, which is what a picker of
+    // "hand this out" needs; without it the caller would download every share ever made.
+    const liveOnly = query.get("live") === "1";
+    const rawLimit = query.get("limit") ? Number(query.get("limit")) : NaN;
+    const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : null;
+    const rawOffset = query.get("offset") ? Number(query.get("offset")) : 0;
+    const offset = Number.isSafeInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
+    const fetched = operationId
       ? await allocationsIncludingClosed(db, operationId)
-      : await db
-          .select()
-          .from(productionAllocations)
-          .where(
-            and(
-              batchId ? eq(productionAllocations.productionBatchId, batchId) : undefined,
-              workerId !== null && Number.isSafeInteger(workerId) ? eq(productionAllocations.workerId, workerId) : undefined
+      : await (async () => {
+          const builder = db
+            .select()
+            .from(productionAllocations)
+            .where(
+              and(
+                batchId ? eq(productionAllocations.productionBatchId, batchId) : undefined,
+                workerId !== null && Number.isSafeInteger(workerId) ? eq(productionAllocations.workerId, workerId) : undefined,
+                liveOnly ? inArray(productionAllocations.status, LIVE_ALLOC_STATUSES) : undefined
+              )
             )
-          )
-          .orderBy(desc(productionAllocations.assignedAt), desc(productionAllocations.id));
+            .orderBy(desc(productionAllocations.assignedAt), desc(productionAllocations.id));
+          return limit === null ? builder : builder.limit(limit).offset(offset);
+        })();
+    const rows = isWorkerSession ? fetched.filter((row) => row.workerId === myWorkerId) : fetched;
 
     const workerIds = [...new Set(rows.map((row) => row.workerId))];
     const opIds = [...new Set(rows.map((row) => row.productionOperationId))];

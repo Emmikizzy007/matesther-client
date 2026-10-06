@@ -264,6 +264,20 @@ export function methodLabel(method: string | null | undefined): string {
 export const READY_MADE_CATEGORY = "Ready-made garment";
 
 /**
+ * Is this catalogue item a finished garment rather than a raw material?
+ *
+ * The single question behind three rules that must agree with each other: a ready-made
+ * purchase is a purchase cost and never tailor labour (`order-cost` classifies
+ * `material_purchases` in this category as `readyMade`), it never enters raw-material
+ * inventory, and issuing one never draws down the fabric shelf. Compared exactly, not
+ * case-insensitively, because that is how the costing SQL compares it - a looser match
+ * here would exempt an item from stock while costing still treated it as a raw material.
+ */
+export function isReadyMadeMaterial(category: string | null | undefined): boolean {
+  return category === READY_MADE_CATEGORY;
+}
+
+/**
  * One exact garment: "Navy • Size M", or whichever parts the variant has.
  * Used everywhere a worker or supervisor must see the specific garment they are
  * working on rather than the whole order.

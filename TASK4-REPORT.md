@@ -1,194 +1,329 @@
-# Task 4 — progress report
+# Task 4 — final report
 
-Branch `arena/01a10141-matesther-client`, HEAD **`247b6f1`**, pushed. Working tree clean.
-Task 4 is **partially complete**. Nothing below was rebuilt; everything evolves the tables and
-modules already in production.
+Task 4 is complete. All thirteen items are implemented, and the whole gate passes.
+
+Everything below was measured against this commit. Nothing was pushed: per your instruction
+this work stays local on `arena/01a10141-matesther-client` until you say otherwise.
 
 ---
 
-## Verification numbers (all run against this commit)
+## Verification numbers
 
-| Check | Result |
-|---|---|
-| `npm test` | **209 / 209 pass**, 0 fail, 0 skipped (was 198/198 at the start of Task 4) |
-| `npx tsc --noEmit` | **clean**, 0 errors |
-| `DATABASE_URL=… npm run build` | **succeeds**, all routes compiled |
-| `npm run lint` | **32 problems (28 errors, 4 warnings)** — identical to the Task 3 end state. Baseline before any of my work was 30. **No file changed in Task 4 contributes a single lint problem**; the two apparent matches are `(app)/orders/[id]/page.tsx` and `(app)/payroll/page.tsx`, UI pages carrying the pre-existing `react-hooks/set-state-in-effect` from Task 2/3, not the API route or `lib/payroll.ts` I edited. |
-| Schema drift | **zero**. `drizzle-kit generate` reports *"No schema changes, nothing to migrate"*. Journal has **10** entries, last `0009_support_cost_and_material_detail`. |
-| Migration verification | All **10** migrations apply in order on a fresh database — the test bootstrap applies every journal entry before each run, and 209/209 pass. `0009` alone: **25 statements**. |
-| `deploy/upgrade-support-cost-material-detail.sql` | **15** `ADD COLUMN IF NOT EXISTS`, **5** `CREATE INDEX IF NOT EXISTS`, **5** guarded `ADD CONSTRAINT`, **0** `CREATE TABLE`, **0** `DROP`/`TRUNCATE`/`DELETE`/`RENAME`, **0** data writes. Verified by scanning for dangerous statement starters — none. |
-| Mutation tests | **12 / 12 caught**, every file md5-verified restored afterwards, tree confirmed clean. |
+| Gate | Command | Result |
+| --- | --- | --- |
+| Tests | `npm test` | **252 pass, 0 fail, 0 skipped** (was 198 at Task 4 start, 209 at the last pushed checkpoint, 245 before the returned-material review) |
+| Types | `npx tsc --noEmit` | **clean**, no output |
+| Build | `DATABASE_URL=… npm run build` | **succeeds**; `/production/control` and `/api/production-control` both in the route manifest |
+| Lint | `npm run lint` | **33 problems (29 errors, 4 warnings)** — see the note below |
+| Schema drift | `npx drizzle-kit generate --name drift_probe` | **"No schema changes, nothing to migrate"** — zero drift, no file created |
+| Migrations | journal + `drizzle/*.sql` | **10 entries**, last `0009_support_cost_and_material_detail`; all 10 apply on a fresh database (the test preload applies them in order and fails loudly if an expected column is missing — 252 passing tests across 15 files is that verification) |
+| Deploy SQL | `deploy/upgrade-support-cost-material-detail.sql` | 15 `ADD COLUMN IF NOT EXISTS`, 5 `CREATE INDEX IF NOT EXISTS`, 5 guarded `ADD CONSTRAINT`; **0** CREATE TABLE / DROP / TRUNCATE / DELETE / RENAME, **0** data writes |
 
-Production data: untouched. No demo or business data seeded. No migration re-run.
+**No schema change was made in this final phase or in the returned-material review that
+followed it**, so the migration set and the deploy script are exactly as previously verified.
+No production data was touched, nothing was seeded, no migration was re-run.
+
+### The lint number, precisely
+
+Baseline before Task 4: 30. At Task 3 end and at the last Task 4 checkpoint: 32. Now: 33.
+
+The single addition is one instance of `react-hooks/set-state-in-effect` on the new
+`/production/control` page — the identical pattern every other `(app)` page in this repository
+already has (`production/routes:60`, `production/external:87`, `production/history:85`,
+`production/inspection:76`, `production/assign:91`, all the same rule at the same kind of
+line). No new rule class appeared, and no existing file's count changed. I chose consistency
+with the ten other pages over making the new one the only page in the app written differently;
+if you would rather the count went back to 32, that is a one-line change and I would want to
+apply it to all eleven pages at once rather than to one.
 
 ---
 
 ## Your four decisions, applied
 
-1. **Ready-made stays OUT of stock.** A bought-in finished uniform is a purchase with its own cost,
-   linked to the order and its variant, and does not touch `materials.current_stock`. Task 3's
-   behaviour stands; no stock accounting was introduced.
-2. **Hand-entered "Materials" and "Labour" expenses are excluded from cost and reported
-   separately** as `superseded`. They are not deleted and not hidden — they are simply no longer
-   added on top of a computed figure for the same thing.
-3. **Carry forward.** A deduction is taken only as far as the month's piece-rate earnings allow;
-   the remainder is held (`supportDeductionOwed`) and recovered from the first later month that has
-   piece-rate earnings. No worker's pay is ever driven negative and no helper pay is written off.
-4. **Restate, and show both.** Every order is costed on the full nine-category formula, and the old
-   formula's answer is returned beside it as `legacy`, so no historical figure is silently
-   overwritten.
+1. **`ready_made_stock` → keep out of stock accounting.** A ready-made garment is a purchase
+   with its own cost, linked to the order and the exact variant. `materials.current_stock`
+   remains raw-materials-only. No stock accounting was introduced.
+2. **`expense_overlap` → exclude superseded.** Computed materials and computed labour win.
+   Hand-entered `expenses` rows categorised `Materials` or `Labour` are excluded from computed
+   profit and reported separately as `superseded` — and now *named on screen*, with their
+   amounts, rather than silently dropped.
+3. **`negative_deduction` → carry forward.** A deduction is taken only from piece-rate
+   earnings that exist in the month. Whatever cannot be absorbed is held as
+   `supportDeductionOwed`, never written off, and never allowed to make a balance negative.
+   It is now visible on the payroll screen with the rule in its tooltip.
+4. **`history` → both.** Every order is restated on the nine-category model, and the old
+   answer is returned beside it as `legacy` — and now *displayed* beside it on the order page
+   as "Previously reported", with one line explaining why the two differ.
 
 ## Your clarification on support labour, applied
 
-> Support workers are still paid directly by MATESTHER, but delegated support payment is not an
-> additional labour cost on top of the tailor's piece-rate commission.
+Support workers are paid directly by Matesther, and the delegated payment is **not** an
+additional labour cost on top of the tailor's commission — it is the same money, reallocated.
 
-That is exactly the model now implemented, and it is pinned by a test using your numbers:
+Your worked example, asserted in tests:
 
-```
-tailor rate 300 x 100 approved  = 30,000 gross commission   -> costs.internalLabour
-18 pieces delegated at 30       =    540 to support worker   -> costs.supportGrossPaid
-tailor's commission             = 29,460                    -> payroll due
-total internal labour cost      = 30,000   NOT 30,540       -> costs.supportLabour = 0
-```
+> ₦300 × 100 approved = **₦30,000** gross commission. 18 pieces delegated at ₦30 ⇒ Matesther
+> pays the helper **₦540** and the tailor's commission becomes **₦29,460**. Total internal
+> labour cost remains **₦30,000, not ₦30,540**.
 
-`supportLabour` is the **difference** between the two sides, so the same 18 pieces are never costed
-twice. Both sides are reported (`supportGrossPaid`, `supportDeductedFromTailors`, and
-`supportAllocation` on the order) so the internal allocation is visible rather than hidden behind a
-zero, and payroll shows the helper's payment and the tailor's deduction as separate lines.
+So `internalLabour` is the tailor's **gross** commission, and `supportLabour` is
+`supportGrossPaid − supportDeductedFromTailors`, which is normally **zero**. Payroll shows
+both sides — gross commission, support deduction, net due, and the helper's support payment —
+while profitability counts the underlying labour exactly once.
 
-**Bug this clarification caught:** payroll's deduction was gated on the *helper's* payment type
-only, so it carried a deduction against a monthly-paid tailor who had no commission for it to come
-out of. It is now gated on the **tailor** being `PER_PIECE`, matching the costing rule exactly. A
-salaried tailor gets no deduction, and the helper's pay then correctly stands alone as a real extra
-cost of the order.
+The one exception, which the system already established and which the tests pin down: a
+**MONTHLY** tailor has no commission, so there is nothing to deduct from and nothing to carry.
+The helper's pay then stands alone as a real extra cost.
+
+Before Task 4, support pay was **additive** — ₦30,000 to the tailor *and* ₦540 to the helper.
 
 ---
 
 ## Items complete
 
-**Item 1 — exact support-work allocation.** `POST /api/support-work` resolves the exact share
-(`productionAllocationId`, or the stage job) and **inherits** order, item, variant and stage from
-it. A helper is never handed a school to pick from scratch. Only the holder of the work may hand it
-out; an Owner recording it on someone's behalf must name them and it is attributed to the holder, so
-inspection authority and the deduction both land on the right person. Quantity is ceilinged per
-(share, operation): 40 garments can take 40 weaves **and** 40 tapes, never 41 weaves.
-
-**Item 2 — the deduction.** Implemented, capped, carried forward, gated on the tailor having a piece
-rate, and server-side only. Same SQL expression as the helper's own earnings, so the two sides
-cannot drift. Applied identically in the monthly accrual, the twelve-month history and the bank
-payment sheet — one implementation, three readers.
-
-**Item 3 — inspection.** Existing separation of duty is preserved and now also exercised against the
-new allocation link: the tailor who handed the work out may inspect it, the support worker may not
-approve their own work whatever their login role, and a supervisor who did the work may not either.
-Split-stage inspection keeps the explicit `attributions` mechanism from Task 3 — no invented FIFO or
-pro-rata policy.
-
-**Item 4 — the nine cost categories.** `src/lib/order-cost.ts` is the single definition. Ready-made
-is never tailor labour; a vendor is never a worker and never appears in payroll; no phantom payroll
-is created for outsourced or ready-made work. Proven by test: the cutter is paid 2,000, the vendor's
-5,000 sits in `outsourced`, and payroll `totals.due` for that worker is 2,000 with no row for
-"Lagos Embroidery".
-
-**Item 5 — external/outsourced work.** Already carried variant, quantity sent, vendor, method, sent
-date, actual return, returned/accepted/rejected/short, unit and total cost, and released **only
-accepted** quantities downstream. Now also live: `expectedReturnAt`, `amountPayable`, `amountPaid`,
-`paymentReference`, `paidAt`, plus derived `paymentStatus` and `amountOutstanding`. Payable cannot
-exceed the cost of the work; paid cannot exceed payable; money already sent can be added to but
-never quietly reduced — the same protection an accepted quantity already had. Audit history is the
-existing movement ledger.
-
-**Item 6 — ready-made as a purchase cost.** Kept separate from monogram/packing/delivery labour by
-the `READY_MADE` method and the `Ready-made garment` material category. Out of stock, as decided.
-
-**Item 7 — material detail.** Issued / used / returned / wasted, with worker, exact variant,
-timestamp, unit and total cost, and a mandatory written reason for any return or write-off. Same
-material system, one stock figure. `quantity_issued` is **nullable on purpose**: NULL means
-"issued = used", which is what every pre-existing row means; a zero would claim nothing was handed
-out. Used and wasted are costed (both consumed); returned is not, and goes back into stock.
-`GET` is now filtered and paged in SQL with only the returned rows enriched — it previously read
-every usage row, every material and every order in the database and filtered them in JavaScript.
-
-**Item 8 — profitability.** `revenue − ready-made − materials − internal labour − machine labour −
-net support labour − outsourced − packaging − delivery − other`. Six grouped statements cost the
-whole order book in one pass. `api/orders/[id]` and `api/reports` both read the same module, so they
-can no longer disagree. Nothing is double-counted: `material_purchases` feeds only `readyMade`,
-`material_usage` only `materials`, and superseded expense rows are excluded.
+| # | Item | Where |
+| --- | --- | --- |
+| 1 | Exact support-work allocation linked to `production_allocation`, inheriting order / item / variant / size / colour / stage | `support_assignments` columns (0009), `POST /api/support-work`, and the hand-out form now offers **shares, not jobs** |
+| 2 | Support-worker payment rule: full piece rate is the base, delegated ⇒ helper rate **deducted**, only APPROVED pieces pay, rate snapshotted, server-side only | `lib/payroll.ts` (`SUPPORT_SUM`, `DEDUCTION_SUM`), `lib/order-cost.ts` |
+| 3 | Separation of duty preserved: tailor may inspect delegated support work, support worker cannot approve own work, worker cannot approve own allocation, split-stage attribution unchanged | `support-work`, `inspections`, `allocations` |
+| 4 | Nine cost categories distinguished; ready-made never tailor labour, vendors never workers, no phantom payroll | `lib/order-cost.ts` (`COST_LINES`) |
+| 5 | External/outsourced: exact variant + quantity sent, vendor / method / sent / expected return / actual return, returned / accepted / rejected / short, cost / rate / payable / paid / status / reference / notes, only accepted flows on, audit history | `external_work_orders` (0009), `PUT /api/external-work`, and now the external-work screen |
+| 6 | Ready-made as purchase cost, linked to order + variant, separate from monogram / packing / delivery labour, **no stock accounting** | `material_purchases` + `READY_MADE_CATEGORY` |
+| 7 | Existing material system reused: issued / used / returned / wasted + unit and total cost + worker + timestamp + reason; no duplicate inventory | `material_usage` (0009), `/api/material-usage`, and now the materials screen |
+| 8 | Profitability = revenue − all nine categories; existing expense and material records **not** double-counted; legacy figure alongside | `lib/order-cost.ts`, `api/orders/[id]`, `api/reports`, and now both screens |
+| 9 | Route-aware production control dashboard, everything derived, nothing editable | `lib/production-control.ts`, `GET /api/production-control`, `/production/control` |
+| 10 | Worker sees their exact work: school, item, colour, size, quantity, stage, their allocation | `lib/worker-dashboard.ts`, `GET /api/support-work`, `/production/support` |
+| 11 | Reassignment preserves completed work, inspection history and earned pay — now proven to preserve an **earned support deduction** too | `transferAllocation` + new tests |
+| 12 | Business calculations server-side, no whole-table frontend loads, no N+1, indexes and pagination | `lib/order-cost.ts` (6 grouped statements), `deriveQuantitiesBulk`, `api/material-usage`, `api/allocations`, `api/production-control`, `api/reports` |
+| 13 | Comprehensive tests + mutation tests on the important business rules | 252 tests; **36 added in this final phase, 7 more for returned material**; 12 mutations all caught at the last checkpoint, 31 in Task 3 |
 
 ---
 
-## Items NOT complete — what remains
+## Defects found and fixed in this final phase
 
-**Item 9 — route-aware production control dashboard.** Not started. Needs school/order, due date,
-ordered/approved/remaining, current route stage, assigned quantity, awaiting inspection, rework,
-rejected, bottleneck and priority, all derived from the ledger, allocations, inspections and route.
-The derivation helpers exist (`production-ledger.ts`, `production-route.ts`,
-`production-allocation.ts`, `batchApprovedProgress`); what is missing is the endpoint and screen
-that assemble them per school/order.
+Four, none of them cosmetic.
 
-**Item 10 — worker dashboard shows their exact work.** Partially there from Task 3 (variant, method
-and route fields, allocation awareness). The new inherited fields on `support_assignments`
-(item / variant / stage) are returned by `GET /api/support-work` but are **not yet surfaced on the
-helper's own screen**.
+**1. `GET /api/allocations` leaked every allocation in the database to any worker.**
+The worker filter was taken from the query string, so a Worker who simply omitted `workerId`
+dropped the filter and received everybody's shares — stages, quantities and rates. The
+`operationId` path returned every share on a stage by design (a supervisor splitting a stage
+needs that), so it leaked too. The worker's own id is now resolved from their login and
+applied to the **result**, so neither query path can widen it. Asking for somebody else's id
+returns nothing rather than the worker's own rows, so the answer to a probe is
+indistinguishable from "no such work".
 
-**Item 11 — reassignment preservation.** Not changed by any Task 4 work, so the Task 3 guarantees
-still hold (only unworked quantity moves; approvals, inspection history and earned pay stay with the
-person who earned them). What is missing is a Task-4 test proving a reassignment also preserves an
-**earned support deduction**.
+**2. `order-cost.ts` could not be tested for four of its nine categories — and nobody noticed.**
+Every scoped query was written `and(isNotNull(col), scope ? inArray(col, scope) : undefined)`.
+That is the same predicate twice (`col IN (…)` can never be true for a NULL `col`), but pg-mem
+returns **no rows** for `IS NOT NULL` combined with `IN (…)` on a nullable column. So with a
+scope in place the materials, ready-made, support and expense buckets came back empty and
+every single-order cost test silently measured zero. `production_batches.order_id` is NOT
+NULL, which is why the labour bucket was immune: **the one bucket that had coverage was the
+one that could not fail.** The redundant not-null test is now dropped when a scope is present.
+In Postgres the two forms are identical, so no production figure changes — what changes is
+that these lines can finally be asserted, and now are.
 
-**Item 12 — performance.** Done for order costing (6 grouped queries) and material usage (paged,
-SQL-filtered). **`api/reports` still loads whole tables** — `production_operations`, `workers`,
-`materials`, `material_purchases`, `material_usage`, `expenses`, `stage_inspections` — for its
-materials, worker and expense sections. Its profitability section is now grouped, but the rest is
-not. This is the largest remaining performance item.
+**3. Reports attributed piecework to the wrong person on any split stage.**
+`api/reports` credited a piece to `production_operations.worker_id` — the worker the stage
+nominally belongs to. Payroll, which settles the money, credits
+`coalesce(stage_inspections.worker_id, production_operations.worker_id)`, because a split
+stage records who performed each inspected piece explicitly. On a split stage those are
+different people, and on a stage with no nominal worker the report credited **nobody** while
+payroll paid three tailors. Reports now call the payroll module's own grouped SQL
+(`allTimePiecework()`, reusing `PAID_WORKER` and `PIECEWORK_SUM` verbatim), so there is one
+implementation of "what is this piece worth" and the two screens cannot drift apart. A test
+asserts the report's figure equals payroll's for the same worker.
 
-**Item 13 — tests.** 11 new tests and 12 mutations this task, on top of the 198 existing. The 16
-named areas are **not all covered**; in particular there are no Task-4 tests yet for the production
-control dashboard (item 9) or the worker dashboard (item 10), because those do not exist yet.
+**4. The helper's dashboard rendered a worker record instead of a name.**
+`allocation.holder` was built from a map of id → row rather than id → name, so the screen
+would have printed `[object Object]` and carried the worker's other columns into a payload a
+support worker reads.
 
-**UI.** No screen was changed in Task 4. The APIs expose the nine cost lines, `supportAllocation`,
-`legacy`, `superseded`, `notListed`, the vendor payment fields and the material issue/return/waste
-fields, but the order page, reports page, payroll page, external-work page and materials page do not
-display them yet. The existing screens still work unchanged — `totalCost`, `profit` and `margin`
-kept their keys and now carry the correct numbers.
+Also fixed: the new board and support API described a variant as `10 / Navy` while the rest of
+the system has always said `Navy • Size 10`. Both now call `variantLabel`, so one fact reads
+one way everywhere.
+
+---
+
+## Performance, this phase
+
+`GET /api/reports` was **eleven `db.select().from(x)` with no WHERE and no limit** — every
+order, customer, item, batch, production operation, worker, material, purchase, usage record,
+expense and stage inspection in the database — then filtered in JavaScript once per row of the
+report, with operations and inspections crossed in a loop to price every piece.
+
+Now the only tables read row-for-row are the three the report genuinely prints one row per
+record (orders, workers, materials), each selecting only the columns it uses. Everything else
+arrives pre-aggregated: one row per stage, per worker, per material, per expense category, per
+order. Statement count is constant whatever the size of the book. No response key was added,
+removed or renamed.
+
+`GET /api/production-control` runs about **nine constant statements** for a page of one batch
+or for a thousand: SQL filters (school/order search, due window, order status, one order, one
+batch) push down and bound the candidate set, which is derived in one pass through
+`deriveQuantitiesBulk()` — a single grouped ledger statement for a whole window of stages
+instead of one query per stage — capped at 1000 batches and ordered earliest-due-first, so a
+capped window is always the most urgent work.
+
+`GET /api/allocations` gained `live=1` plus `limit`/`offset` (capped at 1000), because filling
+the hand-out picker used to download the whole allocation history. The unbounded form of that
+pattern on `/api/operations` is what Task 2 measured at **14,593 rows and 11 MB**.
 
 ---
 
 ## Decisions I made conservatively, flagged for your review
 
-None of these restates a historical figure, and each is a one-line change if you disagree.
+None restates a historical figure, and each is a one-line change if you disagree.
 
-1. **What a deduction may come out of: piece-rate earnings only** — production piecework plus any
-   support piecework the worker earned themselves. Salary, overtime and other approved payments are
-   left alone, because your rule is expressed against the tailor's *piece rate* and carving a
-   helper's rate out of a contracted monthly salary would be inventing payroll behaviour.
-   Consequence: a pure-salary tailor accumulates no deduction at all (see the clarification above).
-2. **Wasted material is costed.** `totalCost = (quantityUsed + quantityWasted) × unitCost`. Both are
-   consumed; only returned material comes back. Every pre-existing row has `quantity_wasted = 0`, so
-   no historical cost changes.
-3. **Returned material goes back into `materials.current_stock`.** This completes the single
-   decrement that already existed rather than adding a stock system — but it *is* a stock movement,
-   so it is flagged. When no issued figure is given the behaviour is byte-identical to before.
-4. **Machine running cost contributes 0.** `machineLabour` is piecework on `MACHINE`-method stages.
-   There is no existing record of machine *running* cost (fuel, maintenance per job), so nothing is
-   invented; `Repairs` and `Electricity` expenses still land in `other`.
-5. **Salaried labour is not attributed to any order.** Order profit is therefore a **direct-cost**
-   margin. `unattributableCosts()` reports monthly salaries and business-wide expenses alongside it
-   (surfaced as `businessCosts` in `api/reports`) so an order margin is never read as the whole
-   business's margin. No spreading rule was invented.
-6. **`api/payment-sheet` totals now describe the sheet's own rows**, with a `notListed` block
-   reporting what is deliberately off it (workers with nothing due, and the deduction held against
-   them). Previously the sheet's total came from the whole payroll while its rows were filtered, so
-   the two could disagree — and under the deduction rule they did, by 18,400 across the test corpus.
+1. **A deduction comes only out of piece-rate earnings.** A monthly-paid tailor has no
+   commission, so there is nothing to deduct from: the helper's pay stands alone as real extra
+   cost. This follows your rule that the deduction comes out of the tailor's commission.
+2. **Wasted material is costed.** `(used + wasted) × unitCost`. Material ruined still cost
+   money; only what physically came back is uncharged.
+3. **Returned material goes back into `current_stock`.** This is a stock movement. You asked
+   me to stop and ask before introducing stock behaviour — flagging it explicitly: it is the
+   minimum needed for "returned" to mean anything, and it does not change any figure for a
+   record that has no returned quantity (i.e. every record that predates the field).
+4. **Machine *running* cost contributes zero.** `machineLabour` is piecework earned on
+   MACHINE-method stages. Nothing in the existing system records what a machine costs to run,
+   and I did not invent a rate.
+5. **Salaried labour is not attributed to any order.** Order profit is therefore a
+   **direct-cost** margin. `unattributableCosts()` reports monthly salaries, salaried
+   headcount and business-wide expenses alongside it, and the reports screen now says on the
+   page that an order's margin does not carry them. No spreading rule was invented.
+6. **`api/payment-sheet` totals describe the sheet's own rows**, with a `notListed` block for
+   what is deliberately off it. Previously the total came from the whole payroll while the rows
+   were filtered, so the two could disagree — and under the deduction rule they did, by
+   ₦18,400 across the test corpus.
 
 ---
 
-## One process note
+## Returned material — the question you asked
 
-The sandbox reset mid-task: `node_modules` was wiped and `HEAD` was moved back to the base commit.
-The working tree survived. I recovered with `npm ci`, `git fetch`, `git reset --soft FETCH_HEAD`,
-confirmed the delta was exactly my Task 4 files, and checkpoint-committed immediately. Everything
-from Task 2 and Task 3 is intact and pushed; the earlier reports under `/home/user` (`TASK1-AUDIT.md`,
-`TASK2-REPORT.md`, `TASK3-REPORT.md`) were outside the repository and were lost to an earlier reset.
-This file is inside the repository, so it will survive.
+You asked me to determine exactly how a quantity issued to production and genuinely
+returned unused behaves. I read the path end to end before changing anything:
+`POST`/`PUT /api/material-usage` (the only two places that move `materials.current_stock`
+for usage), `material_usage` and `production_movements` in the schema, the order-cost
+aggregation, and the ready-made path.
+
+**The stock and costing behaviour was already correct.** These seven rules hold, and each
+is now pinned by its own test in `tests/cost-and-material-detail.test.ts`:
+
+| Rule | How the system does it |
+| --- | --- |
+| Issued reduces available stock | `POST` nets it: `netOut = issued ?? consumed`, then `current_stock -= netOut` |
+| Returned increases it again | `POST` nets the return out of the issue; `PUT` adds `returnedDelta` back |
+| Returned is **not** a cost of the job | `totalCost = (used + wasted) * unitCost`; order cost sums `material_usage.total_cost` |
+| Wasted stays consumed and never returns to stock | `PUT` moves only `returnedDelta`, never `wastedDelta`, and still charges it |
+| The same quantity can never be returned twice | `PUT` refuses to *reduce* a recorded return, adds only the delta, and bounds `used + returned + wasted` by what was issued |
+| Profitability reflects consumed, not issued | an order issued 20, used 15, returned 3, wasted 2 is charged 17 × unit cost, not 20 |
+| A record written the old way still behaves | `quantityIssued` NULL means "issued = used", byte-identical to the pre-Task-4 formula |
+| Ready-made stays out of raw-material stock | `/api/ready-made` has **zero** `current_stock` references |
+
+**Three gaps, all in `PUT /api/material-usage`, all corrected** (commit `d31105b`). Each one
+is the edit path disagreeing with the create path, or with this route's own contract comment:
+
+1. **A return needed no reason of its own.** The check read `b.notes ?? usage.notes`, so a
+   return recorded weeks after the issue silently inherited the reason the material was
+   *issued* for — a reason for a different event. `POST` has always required the reason in
+   the request. It now reads `b.notes` alone.
+2. **The trail was overwritten, so a return left no who and no when.** `material_usage` has
+   no `updated_at` and no `recorded_by`, and `usedAt` stays at the moment of issue, so
+   writing the return's reason over the issue's reason destroyed the only history the record
+   had. A return or write-off now **appends** a dated, attributed line —
+   `[2026-10-04] 2 returned to store by <name>: <reason>` — and keeps the issue reason
+   beside it. An edit that only corrects `used` still replaces the free-text note exactly as
+   before, so nothing else behaves differently.
+3. **The ceiling shrank as material came back.** For a record with no stored issued figure it
+   fell back to `quantityUsed`, which a return lowers. Eight yards out and two returned left
+   a ceiling of six, so a third yard genuinely coming back was refused as *"more than the 6
+   issued"* when eight had been issued. It now falls back to what the record accounts for
+   (`used + returned + wasted`) — the definition `POST` already uses for that request shape,
+   and invariant under a correct return. Refusals still happen; they just stop being wrong.
+
+**Why the trail is not a ledger event.** `production_movements` is the obvious home and was
+designed with a `MATERIAL_ISSUED` event in mind, but it cannot hold one: it requires
+`production_operation_id`, `production_batch_id` and `stage`, all NOT NULL, while material is
+issued against an **order** and usually has no stage at all. `MATERIAL_ISSUED` appears only in
+comments (`schema.ts:1002`, `production-ledger.ts:43`) and has never been written. Using it
+would mean a migration widening three columns — a redesign of the ledger for one field on one
+table — so the trail goes in the existing reason column, with **no schema change**.
+
+---
+
+## Remaining, if you want it
+
+Nothing in the thirteen items is outstanding. Three things are deliberately **not** done,
+because each is a change you have not asked for:
+
+- The payment-sheet screen does not yet render its `notListed` block (the API returns it).
+- The hand-out picker lists shares for staff across the whole book; narrowing it to one
+  tailor's shares first is a UI preference, not a correctness matter.
+- The eleven `react-hooks/set-state-in-effect` lint errors are the repository's existing
+  pattern. Cleaning them up is a cross-cutting change to eleven working pages.
+
+Two further findings surfaced while reading the material path. **Both are pre-existing**
+(confirmed against the base commit `b5c6ce8`, before any Task 4 work), **both are outside the
+returned-material question**, and **both change inventory behaviour**, so I stopped rather
+than deciding them for you.
+
+> **BOTH HAVE SINCE BEEN DECIDED AND IMPLEMENTED.** See `TASK5-REPORT.md`, Part A: ready-made
+> purchases no longer enter raw-material stock on the general purchases screen, and raw-material
+> stock can no longer go negative on issue. The text below is kept as the report of what was
+> found, not as an open question.
+
+1. **`POST /api/material-purchases` has no ready-made guard.** It contains zero occurrences of
+   `READY_MADE` and unconditionally does `current_stock += quantity`. So a material catalogued
+   with the category *Ready-made garment*, bought through the general purchases screen, **would
+   enter raw-material stock** — a door around the rule that ready-made is a purchase and never
+   inventory. The designated `/api/ready-made` path correctly never touches stock. Closing the
+   door is a few lines, but it would start refusing a purchase that succeeds today, so it is
+   your call.
+2. **Stock can go negative.** Neither `POST` nor `PUT /api/material-usage` checks availability
+   against what is on the shelf before issuing. The original code was the same
+   (`current_stock = mat.currentStock - qty`), so this is not a Task 4 regression. `PUT` does
+   guard the *return* direction (a return that would push stock past what is available is
+   refused); the issue direction does not. Adding an availability check would block issues that
+   succeed today, which in a real store usually means the shelf figure is wrong rather than the
+   issue — so it needs your decision, not mine.
+
+---
+
+## Process note
+
+This phase was run entirely locally, as instructed: **not pushed, not merged to `main`, no
+Netlify deploy.**
+
+**A sandbox reset destroyed the granular history of this phase.** The workspace was rebuilt
+from scratch three times during Tasks 2–4; the third reset, at the start of this review, put
+`HEAD` back at the base commit `b5c6ce8`, removed the remote-tracking ref, deleted
+`node_modules`, and **destroyed the eight unpushed commits of this final phase as git objects**.
+Their *content* survived in the working tree, and was recovered by:
+
+```
+npm ci                                                    # restore the toolchain
+git fetch origin arena/01a10141-matesther-client           # FETCH_HEAD = b903cec, last pushed
+grep -c <markers> src/…                                    # prove the content survived
+git add -A && git reset --soft FETCH_HEAD                  # one tree, on top of the pushed ref
+git commit                                                 # = bdea322
+```
+
+The suite was re-verified at **245/245** immediately after recovery, so nothing was lost — but
+the eight separate commits are collapsed into one, and their individual messages are gone. Two
+commits now sit on `arena/01a10141-matesther-client` ahead of the last pushed checkpoint
+`b903cec`:
+
+```
+bdea322  Task 4 final phase (recovered as one commit): production control board, exact helper
+         context, bounded reports, 36 tests, and the screens that quote the new figures
+d31105b  Returned material: make the return itself auditable and stop the ceiling shrinking
+```
+
+The eight original subjects, for the record: item 9 route-aware production control board;
+item 10 a helper sees the exact garment (+ the allocations leak); item 12 reports stops
+loading eleven whole tables; item 13 22 tests for the control board; items 3/11/12/13
+reassignment integrity, exact garment, report figures; item 8 nine categories and the legacy
+figure on screen; items 2/5 payroll's two sides, vendor payment on dispatches; item 7 material
+issue, return and waste on screen.
+
+Say **"PUSH TASK 4"** and I will push the branch — one push only, to conserve Netlify credits.

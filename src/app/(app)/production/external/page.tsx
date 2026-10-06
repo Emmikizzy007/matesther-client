@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, CheckCircle2, Package, Send, Truck } from "lucide-react";
 import { Badge, Btn, Card, EmptyState, Field, Loading, Modal, PageHeader, inputCls } from "@/components/ui";
-import { fmtDate, methodLabel } from "@/lib/format";
+import { naira, fmtDate, methodLabel } from "@/lib/format";
 
 /**
  * EXTERNAL WORK AND READY-MADE RECEIPTS.
@@ -28,6 +28,10 @@ type Dispatch = {
   quantitySent: number; quantityReturned: number; quantityAccepted: number; quantityRejected: number; quantityShort: number;
   unitCost: number | null; totalCost: number | null; sentAt: string | null; returnedAt: string | null;
   sentBy: string | null; acceptedBy: string | null; notes: string | null;
+  /** When the vendor promised to bring them back, and what the work costs Matesther. */
+  expectedReturnAt: string | null;
+  amountPayable: number | null; amountPaid: number; amountOutstanding: number | null;
+  paymentStatus: string | null; paymentReference: string | null; paidAt: string | null;
   batchNumber: string; variant: string; orderNumber: string; customer: string; dueDate: string | null;
 };
 type Receipt = {
@@ -51,11 +55,13 @@ export default function ExternalWorkPage() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState<Job | null>(null);
-  const [sendForm, setSendForm] = useState({ vendorName: "", quantitySent: "", unitCost: "", notes: "" });
+  const [sendForm, setSendForm] = useState({ vendorName: "", quantitySent: "", unitCost: "", expectedReturnAt: "", notes: "" });
   const [returning, setReturning] = useState<Dispatch | null>(null);
   const [returnForm, setReturnForm] = useState({ quantityReturned: "", quantityAccepted: "", quantityRejected: "", quantityShort: "", notes: "" });
   const [buying, setBuying] = useState<Job | null>(null);
   const [buyForm, setBuyForm] = useState({ materialId: "", quantity: "", unitCost: "", supplier: "", notes: "" });
+  const [paying, setPaying] = useState<Dispatch | null>(null);
+  const [payForm, setPayForm] = useState({ amountPayable: "", amountPaid: "", paymentReference: "", paidAt: "", notes: "" });
   const [judging, setJudging] = useState<Receipt | null>(null);
   const [judgeForm, setJudgeForm] = useState({ quantityAccepted: "", quantityRejected: "", notes: "" });
   const [materials, setMaterials] = useState<{ id: number; name: string; category: string | null }[]>([]);
@@ -148,7 +154,7 @@ export default function ExternalWorkPage() {
                       <p className="text-[11px] text-slate-500">{job.orderNumber} • {job.batchNumber} • {methodLabel(job.method)}</p>
                       <p className="mt-0.5 text-[11px] text-slate-600">Holds {job.quantityReceived}, {job.quantityRemaining} still outstanding</p>
                     </div>
-                    <Btn variant="secondary" onClick={() => { setSending(job); setSendForm({ vendorName: "", quantitySent: String(job.quantityRemaining || ""), unitCost: "", notes: "" }); }}><Send className="h-3.5 w-3.5" /> Send out</Btn>
+                    <Btn variant="secondary" onClick={() => { setSending(job); setSendForm({ vendorName: "", quantitySent: String(job.quantityRemaining || ""), unitCost: "", expectedReturnAt: "", notes: "" }); }}><Send className="h-3.5 w-3.5" /> Send out</Btn>
                   </div>
                 ))}
               </div>}
@@ -170,10 +176,52 @@ export default function ExternalWorkPage() {
                       {dispatch.acceptedBy ? ` • accepted by ${dispatch.acceptedBy}` : ""}
                       {dispatch.totalCost ? ` • ₦${Number(dispatch.totalCost).toLocaleString("en-NG")}` : ""}
                     </p>
+                    {/*
+                      When they promised to bring it back, and the money side of the
+                      dispatch. Payment is a separate fact from the work: `status` says
+                      where the GARMENTS are, this says where the MONEY is, and closing a
+                      dispatch has never meant it was paid for.
+                    */}
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {dispatch.expectedReturnAt
+                        ? <>Expected back {fmtDate(dispatch.expectedReturnAt)}{dispatch.status === "SENT" && !dispatch.returnedAt ? " • still out" : ""}</>
+                        : "No return date recorded"}
+                    </p>
+                    <p className="mt-0.5 text-[11px]">
+                      <span className="text-slate-500">Payable </span>
+                      <strong className="text-slate-800">{naira(dispatch.amountPayable ?? dispatch.totalCost ?? 0)}</strong>
+                      <span className="text-slate-500"> · paid </span>
+                      <strong className="text-slate-800">{naira(dispatch.amountPaid ?? 0)}</strong>
+                      <span className="text-slate-500"> · outstanding </span>
+                      <strong className={(dispatch.amountOutstanding ?? 0) > 0 ? "text-red-700" : "text-emerald-700"}>
+                        {naira(dispatch.amountOutstanding ?? Math.max(0, (dispatch.amountPayable ?? dispatch.totalCost ?? 0) - (dispatch.amountPaid ?? 0)))}
+                      </strong>
+                      {dispatch.paymentStatus && (
+                        <span className={`ml-2 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+                          dispatch.paymentStatus === "SETTLED" ? "bg-emerald-50 text-emerald-700"
+                          : dispatch.paymentStatus === "PART_PAID" ? "bg-amber-50 text-amber-700"
+                          : "bg-slate-100 text-slate-600"
+                        }`}>{dispatch.paymentStatus.replace("_", " ")}</span>
+                      )}
+                      {dispatch.paymentReference && (
+                        <span className="ml-2 text-slate-500">ref {dispatch.paymentReference}</span>
+                      )}
+                      {dispatch.paidAt && <span className="ml-2 text-slate-500">on {fmtDate(dispatch.paidAt)}</span>}
+                    </p>
                     {dispatch.notes && <p className="mt-1 rounded-md bg-slate-50 px-2 py-1 text-xs text-slate-600">{dispatch.notes}</p>}
                   </div>
                   <div className="flex items-center gap-2">
                     <Badge status={dispatch.status === "CLOSED" ? "COMPLETED" : dispatch.status === "RETURNED" ? "SUBMITTED" : "IN_PROGRESS"} />
+                    <Btn variant="secondary" onClick={() => {
+                      setPaying(dispatch);
+                      setPayForm({
+                        amountPayable: String(dispatch.amountPayable ?? dispatch.totalCost ?? ""),
+                        amountPaid: String(dispatch.amountPaid ?? ""),
+                        paymentReference: dispatch.paymentReference ?? "",
+                        paidAt: dispatch.paidAt ? String(dispatch.paidAt).slice(0, 10) : "",
+                        notes: "",
+                      });
+                    }}>Record payment</Btn>
                     {dispatch.status !== "CLOSED" && <Btn variant="secondary" onClick={() => {
                       setReturning(dispatch);
                       setReturnForm({
@@ -263,6 +311,7 @@ export default function ExternalWorkPage() {
         const ok = await post("/api/external-work", {
           operationId: sending.id, vendorName: sendForm.vendorName.trim(),
           quantitySent: Number(sendForm.quantitySent), unitCost: sendForm.unitCost === "" ? null : Number(sendForm.unitCost),
+          expectedReturnAt: sendForm.expectedReturnAt || null,
           notes: sendForm.notes.trim() || null,
         }, "POST", "Dispatch recorded. Nothing counts as produced until it comes back and is accepted.");
         if (ok) setSending(null);
@@ -271,9 +320,46 @@ export default function ExternalWorkPage() {
         <Field label="Who is doing the work *"><input className={inputCls} required value={sendForm.vendorName} onChange={(event) => setSendForm({ ...sendForm, vendorName: event.target.value })} placeholder="e.g. Lagos Embroidery Ltd" /></Field>
         <Field label="Garments going out *"><input className={inputCls} type="number" min="1" max={sending.quantityRemaining} step="1" required value={sendForm.quantitySent} onChange={(event) => setSendForm({ ...sendForm, quantitySent: event.target.value })} /></Field>
         <Field label="Agreed cost per garment (₦)"><input className={inputCls} type="number" min="0" step="1" value={sendForm.unitCost} onChange={(event) => setSendForm({ ...sendForm, unitCost: event.target.value })} /></Field>
+        <Field label="Expected back"><input className={inputCls} type="date" value={sendForm.expectedReturnAt} onChange={(event) => setSendForm({ ...sendForm, expectedReturnAt: event.target.value })} /></Field>
         <Field label="Notes"><textarea className={inputCls} rows={2} value={sendForm.notes} onChange={(event) => setSendForm({ ...sendForm, notes: event.target.value })} /></Field>
         <p className="rounded-lg bg-slate-50 p-2.5 text-[11px] text-slate-600">Sending work out is recorded on the audit trail but moves no quantity: the stage is not further along just because garments left the building.</p>
         <div className="flex justify-end gap-2"><Btn variant="secondary" onClick={() => setSending(null)}>Cancel</Btn><Btn type="submit" disabled={busy}>{busy ? "Saving…" : "Record dispatch"}</Btn></div>
+      </form>}
+    </Modal>
+
+    {/* ---- what the vendor's work costs, and what has been paid ---- */}
+    <Modal open={!!paying} onClose={() => setPaying(null)} title={paying ? `Payment - ${paying.vendorName}` : ""}>
+      {paying && <form className="space-y-3" onSubmit={async (event) => {
+        event.preventDefault();
+        const ok = await post("/api/external-work", {
+          id: paying.id,
+          amountPayable: payForm.amountPayable === "" ? null : Number(payForm.amountPayable),
+          amountPaid: payForm.amountPaid === "" ? null : Number(payForm.amountPaid),
+          paymentReference: payForm.paymentReference.trim() || null,
+          paidAt: payForm.paidAt || null,
+          notes: payForm.notes.trim() || null,
+        }, "PUT", "Payment recorded.");
+        if (ok) setPaying(null);
+      }}>
+        <p className="text-xs text-slate-500">
+          {paying.quantitySent} garment(s) sent • agreed cost {naira(paying.totalCost ?? 0)} • already paid {naira(paying.amountPaid ?? 0)}
+        </p>
+        <Field label="Total payable for this dispatch (₦)">
+          <input className={inputCls} type="number" min="0" step="1" value={payForm.amountPayable} onChange={(event) => setPayForm({ ...payForm, amountPayable: event.target.value })} />
+        </Field>
+        <Field label="Paid so far (₦)">
+          <input className={inputCls} type="number" min="0" step="1" value={payForm.amountPaid} onChange={(event) => setPayForm({ ...payForm, amountPaid: event.target.value })} />
+        </Field>
+        <Field label="Bank / transfer reference"><input className={inputCls} value={payForm.paymentReference} onChange={(event) => setPayForm({ ...payForm, paymentReference: event.target.value })} placeholder="Required to raise the paid figure" /></Field>
+        <Field label="Paid on"><input className={inputCls} type="date" value={payForm.paidAt} onChange={(event) => setPayForm({ ...payForm, paidAt: event.target.value })} /></Field>
+        <Field label="Notes"><textarea className={inputCls} rows={2} value={payForm.notes} onChange={(event) => setPayForm({ ...payForm, notes: event.target.value })} /></Field>
+        <p className="rounded-lg bg-slate-50 p-2.5 text-[11px] text-slate-600">
+          Payable can never exceed the agreed cost, and paid can never exceed payable or go
+          backwards without a reference. This is what a vendor charges Matesther for making
+          our garment - it is never recorded as tailor labour and never creates a payroll
+          entry, because a vendor is not a worker.
+        </p>
+        <div className="flex justify-end gap-2"><Btn variant="secondary" onClick={() => setPaying(null)}>Cancel</Btn><Btn type="submit" disabled={busy}>{busy ? "Saving…" : "Save payment"}</Btn></div>
       </form>}
     </Modal>
 

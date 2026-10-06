@@ -110,7 +110,16 @@ function OwnerDashboard({ d }: any) {
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-5">
         <StatCard label="Total Revenue" value={naira(k.revenue)} icon={<Banknote className="w-5 h-5" />} sub="All orders" href="/profitability" />
         <StatCard label="Total Expenses" value={naira(k.expenseTotal)} icon={<Wallet className="w-5 h-5" />} tone="red" sub="All records" href="/expenses" />
-        <StatCard label="Est. Profit" value={naira(k.profit)} icon={<TrendingUp className="w-5 h-5" />} tone="green" sub={`Costs ${naira(k.totalCost)}`} href="/profitability" />
+        <StatCard
+          label="Profit"
+          value={naira(k.profit)}
+          icon={<TrendingUp className="w-5 h-5" />}
+          tone={k.profit >= 0 ? "green" : "red"}
+          sub={`Costs ${naira(k.totalCost)}, labour included${
+            k.legacy && k.legacy.profit !== k.profit ? ` • previously reported ${naira(k.legacy.profit)}` : ""
+          }`}
+          href="/profitability"
+        />
         <StatCard label="Owed by Customers" value={naira(k.outstanding)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub="Outstanding balances" href="/payments" />
         <StatCard label={`Payroll Due (${payrollLabel})`} value={naira(d.payroll?.due ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`Paid ${naira(d.payroll?.paid ?? 0)} • ${naira(d.payroll?.balance ?? 0)} left`} href="/payroll" />
         <StatCard label="Material Purchases" value={naira(k.materialCost)} icon={<Boxes className="w-5 h-5" />} tone="slate" sub="Purchase records" href="/materials/purchases" />

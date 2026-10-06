@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
+import { orderCosts, unattributableCosts } from "@/lib/order-cost";
 import {
   orders,
   customers,
@@ -147,8 +148,7 @@ export async function GET(req: Request) {
     const outstanding = orderRows
       .filter((o) => o.status !== "CANCELLED")
       .reduce((s, o) => s + Math.max(0, o.balance ?? 0), 0);
-    const totalCost = expenseTotal + usageCost;
-    const profit = revenue - totalCost;
+    const legacyTotalCost = expenseTotal + usageCost;
     const stockValue = materialRows.reduce((s, m) => s + (m.currentStock ?? 0) * (m.unitCost ?? 0), 0);
 
     const opsByBatch = new Map<number, typeof opRows>();
@@ -346,6 +346,34 @@ export async function GET(req: Request) {
       .slice(0, 8)
       .map(opContext);
 
+    /**
+     * Profit comes from the same implementation the order page and the reports screen use.
+     *
+     * This screen used to compute its own: `revenue - (expenses + material usage)`. That
+     * counted NO LABOUR AT ALL - no tailor commission, no support pay, no machine work, no
+     * vendor bill, no ready-made purchase - on the home screen of a manufacturing business,
+     * which is the most-read money figure in the system. It reported as profit most of what
+     * the company actually pays out, and it mixed costs belonging to an order with costs
+     * belonging to the business, so it could not be reconciled against either the order page
+     * or the reports screen.
+     *
+     * There is one authoritative costing implementation, `src/lib/order-cost.ts`. This calls
+     * it rather than restating a formula, keeps the figure it used to show as `legacy` so the
+     * change is visible instead of silent - the convention Task 4 established for reports -
+     * and reports unattributable business costs BESIDE order profit rather than merged into
+     * it, for the same reason the reports screen keeps them apart: an order's margin must not
+     * be read as the whole business's margin.
+     */
+    const costedByOrder = await orderCosts(orderRows.map((o) => o.id));
+    let totalCost = 0;
+    let profit = 0;
+    for (const costed of costedByOrder.values()) {
+      totalCost += costed.totalCost;
+      profit += costed.profit;
+    }
+    const businessCosts = await unattributableCosts();
+    const legacyProfit = revenue - legacyTotalCost;
+
     return NextResponse.json({
       view: "owner",
       payroll: {
@@ -369,6 +397,10 @@ export async function GET(req: Request) {
         outstanding,
         profit,
         totalCost,
+        /** Costs that belong to the business rather than to a job, kept out of order profit. */
+        businessCosts,
+        /** What this screen used to report, so the restatement is visible rather than silent. */
+        legacy: { totalCost: legacyTotalCost, profit: legacyProfit },
         stockValue,
         inspectionQueue: opRows.filter(
           (o) => (o.quantityCompleted ?? 0) > (o.quantityInspected ?? 0)

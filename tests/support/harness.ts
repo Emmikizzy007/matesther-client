@@ -41,12 +41,15 @@ import * as productionOrdersRoute from "@/app/api/production-orders/route";
 import * as paymentsRoute from "@/app/api/payments/route";
 import * as receiptsRoute from "@/app/api/receipts/route";
 import * as deliveriesRoute from "@/app/api/deliveries/route";
+import * as packingRoute from "@/app/api/packing/route";
 import * as expensesRoute from "@/app/api/expenses/route";
 import * as materialsRoute from "@/app/api/materials/route";
 import * as healthRoute from "@/app/api/health/route";
 import * as productionCorrectionsRoute from "@/app/api/production-corrections/route";
 import * as routesRoute from "@/app/api/routes/route";
 import * as externalWorkRoute from "@/app/api/external-work/route";
+import * as attentionRoute from "@/app/api/attention/route";
+import * as productionControlRoute from "@/app/api/production-control/route";
 import * as readyMadeRoute from "@/app/api/ready-made/route";
 import * as orderSizesRoute from "@/app/api/order-sizes/route";
 import * as materialPurchasesRoute from "@/app/api/material-purchases/route";
@@ -101,9 +104,12 @@ const ROUTES: Record<string, Handler> = {
   "GET /api/payments": paymentsRoute.GET,
   "POST /api/payments": paymentsRoute.POST,
   "GET /api/receipts": receiptsRoute.GET,
+  "GET /api/packing": packingRoute.GET,
+  "POST /api/packing": packingRoute.POST,
   "GET /api/deliveries": deliveriesRoute.GET,
   "POST /api/deliveries": deliveriesRoute.POST,
   "GET /api/expenses": expensesRoute.GET,
+  "POST /api/expenses": expensesRoute.POST,
   "GET /api/materials": materialsRoute.GET,
   "POST /api/materials": materialsRoute.POST,
   "PUT /api/materials": materialsRoute.PUT,
@@ -115,6 +121,9 @@ const ROUTES: Record<string, Handler> = {
   "PUT /api/routes": routesRoute.PUT,
   "DELETE /api/routes": routesRoute.DELETE,
   "GET /api/external-work": externalWorkRoute.GET,
+  // The route-aware production control board: read-only, every figure derived.
+  "GET /api/attention": attentionRoute.GET,
+  "GET /api/production-control": productionControlRoute.GET,
   "POST /api/external-work": externalWorkRoute.POST,
   "PUT /api/external-work": externalWorkRoute.PUT,
   "GET /api/ready-made": readyMadeRoute.GET,

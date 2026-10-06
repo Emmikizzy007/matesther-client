@@ -171,7 +171,32 @@ export default function PayrollPage() {
             <StatCard label="Expected to Pay (this month)" value={naira(d.totals.due)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`${d.workers.filter((w: any) => w.due > 0).length} workers with earnings`} />
             <StatCard label="Already Paid" value={naira(d.totals.paid)} icon={<HandCoins className="w-5 h-5" />} tone="green" />
             <StatCard label="Still Owed" value={naira(d.totals.balance)} icon={<HandCoins className="w-5 h-5" />} tone={d.totals.balance > 0 ? "red" : "green"} sub={d.totals.balance > 0 ? "Settle before month end" : "All settled ✓"} />
-            <StatCard label="Piecework Share" value={naira(d.workers.reduce((s: number, w: any) => s + w.piecework, 0))} icon={<HandCoins className="w-5 h-5" />} tone="blue" sub="Approved pieces × rate" />
+            <StatCard label="Piecework Share" value={naira(d.workers.reduce((s: number, w: any) => s + w.piecework, 0))} icon={<HandCoins className="w-5 h-5" />} tone="blue" sub="Approved pieces × rate — gross, before any support deduction" />
+            {/*
+              Both sides of delegated support work, side by side. Matesther pays the helper
+              directly, and takes the same amount back out of the commission of the tailor
+              who handed the work over — so these two figures are the SAME money, and the
+              order's labour cost does not rise by either of them. Showing only one side
+              is what made support labour look like an extra cost.
+            */}
+            <StatCard
+              label="Support Paid to Helpers"
+              value={naira(d.breakdown?.supportPiecework ?? 0)}
+              icon={<HandCoins className="w-5 h-5" />}
+              tone="green"
+              sub={`${d.workers.filter((w: any) => (w.supportPieces ?? 0) > 0).length} helpers on approved pieces`}
+            />
+            <StatCard
+              label="Deducted from Tailors"
+              value={naira(d.breakdown?.supportDeduction ?? 0)}
+              icon={<HandCoins className="w-5 h-5" />}
+              tone="red"
+              sub={
+                (d.breakdown?.supportDeductionOwed ?? 0) > 0
+                  ? `${naira(d.breakdown.supportDeductionOwed)} more held against a tailor with no commission this month — carried forward, never written off`
+                  : "The same money as the line above, not an extra cost"
+              }
+            />
           </div>
         )}
       </Card>
@@ -191,8 +216,9 @@ export default function PayrollPage() {
                   <th className="px-5 py-3">Worker</th>
                   <th className="px-3 py-3">Pay Type</th>
                   <th className="px-3 py-3 text-right">Pieces Approved</th>
-                  <th className="px-3 py-3 text-right">Piecework</th>
-                  <th className="px-3 py-3 text-right">Support</th>
+                  <th className="px-3 py-3 text-right" title="Gross commission on approved pieces, before any support deduction">Piecework (gross)</th>
+                  <th className="px-3 py-3 text-right">Support Earned</th>
+                  <th className="px-3 py-3 text-right">Support Deduction</th>
                   <th className="px-3 py-3 text-right">Salary</th>
                   <th className="px-3 py-3 text-right">Overtime</th>
                   <th className="px-3 py-3 text-right">Other</th>
@@ -215,7 +241,34 @@ export default function PayrollPage() {
                       <td className="px-3 py-3 text-xs">{w.paymentType.replace("_", " ")}</td>
                       <td className="px-3 py-3 text-right">{w.pieces.toLocaleString()}</td>
                       <td className="px-3 py-3 text-right">{w.piecework ? naira(w.piecework) : "-"}</td>
-                      <td className="px-3 py-3 text-right">{w.supportPiecework ? naira(w.supportPiecework) : "-"}</td>
+                      <td className="px-3 py-3 text-right" title="Pieces this person was handed by a tailor, approved, and paid for directly by Matesther">
+                        {w.supportPiecework ? naira(w.supportPiecework) : "-"}
+                        {(w.supportPieces ?? 0) > 0 && (
+                          <span className="block text-[11px] font-normal text-slate-400">{w.supportPieces} pcs delegated to them</span>
+                        )}
+                      </td>
+                      {/*
+                        What came OUT of this person's own commission because they handed
+                        work to a helper. Without this column the Piecework figure (gross)
+                        and Total Due (net) disagree on screen with nothing to explain the
+                        difference.
+                      */}
+                      <td className="px-3 py-3 text-right">
+                        {w.supportDeduction ? <span className="text-red-600">−{naira(w.supportDeduction)}</span> : "-"}
+                        {(w.supportPiecesDelegated ?? 0) > 0 && (
+                          <span className="block text-[11px] font-normal text-slate-400">
+                            {w.supportPiecesDelegated} pcs they handed out
+                          </span>
+                        )}
+                        {(w.supportDeductionOwed ?? 0) > 0 && (
+                          <span
+                            className="block text-[11px] font-semibold text-amber-700"
+                            title="This tailor had no piece-rate commission this month to deduct from. The amount is held and carried forward to the next month that has commission — it is never written off, and it never makes a balance negative."
+                          >
+                            +{naira(w.supportDeductionOwed)} carried forward
+                          </span>
+                        )}
+                      </td>
                       <td className="px-3 py-3 text-right">{w.salary ? naira(w.salary) : "-"}</td>
                       <td className="px-3 py-3 text-right">{w.overtime ? naira(w.overtime) : "-"}</td>
                       <td className="px-3 py-3 text-right">{w.other ? naira(w.other) : "-"}</td>

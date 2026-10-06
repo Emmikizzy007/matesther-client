@@ -257,6 +257,59 @@ function deriveQuantitiesFromRow(row: {
 }
 
 /**
+ * The same derivation as `deriveDetail()`, for a whole set of stages at once.
+ *
+ * ONE grouped statement over the ledger instead of one statement per stage, so a
+ * control dashboard can cost a hundred batches without issuing a hundred queries.
+ * It reads the ledger rather than the cached counters on `production_operations`
+ * for the same reason `deriveDetail()` does: the ledger is the source of truth, and
+ * a screen that reads it cannot drift from one that recomputes it.
+ *
+ * Stages with no ledger rows at all are simply absent from the map, which reads as
+ * seven zeros - exactly what `deriveQuantities()` returns for them.
+ */
+export async function deriveQuantitiesBulk(
+  handle: Db,
+  operationIds: number[]
+): Promise<Map<number, DerivedQuantities & { quantityShort: number }>> {
+  const out = new Map<number, DerivedQuantities & { quantityShort: number }>();
+  if (!operationIds.length) return out;
+  const rows = await handle
+    .select({
+      operationId: productionMovements.productionOperationId,
+      received: sumBucket(RECEIVED_EVENTS),
+      completed: sumBucket(COMPLETED_EVENTS),
+      approved: sumBucket(APPROVED_EVENTS),
+      rework: sumBucket(REWORK_EVENTS),
+      rejected: sumBucket(REJECTED_EVENTS),
+      short: sumBucket(SHORT_EVENTS),
+    })
+    .from(productionMovements)
+    .where(inArray(productionMovements.productionOperationId, operationIds))
+    .groupBy(productionMovements.productionOperationId);
+  for (const row of rows) {
+    const id = Number(row.operationId);
+    if (!id) continue;
+    const base = deriveQuantitiesFromRow(row);
+    out.set(id, { ...base, quantityShort: Math.max(0, Number(row.short ?? 0)) });
+  }
+  return out;
+}
+
+const ZERO_DETAIL: DerivedQuantities & { quantityShort: number } = {
+  quantityReceived: 0, quantityCompleted: 0, quantityApproved: 0, quantityRework: 0,
+  quantityRejected: 0, quantityInspected: 0, quantityRemaining: 0, quantityShort: 0,
+};
+
+/** Look one stage up in a bulk derivation, treating "no ledger rows" as seven zeros. */
+export function detailOrZero(
+  bulk: Map<number, DerivedQuantities & { quantityShort: number }>,
+  operationId: number
+): DerivedQuantities & { quantityShort: number } {
+  return bulk.get(operationId) ?? ZERO_DETAIL;
+}
+
+/**
  * Append events, then rewrite the operation's counters from the ledger.
  *
  * Always call this inside the same transaction as the change that caused it, so

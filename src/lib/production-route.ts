@@ -395,15 +395,77 @@ export async function roleForStage(
  * that runs all the way to DELIVERY contributes its DELIVERY approvals. Neither is
  * compared against a stage it does not have.
  */
-export async function completedForVariant(variantId: number): Promise<number> {
-  const [variant] = await db.select().from(orderItemSizes).where(eq(orderItemSizes.id, variantId)).limit(1);
-  if (!variant) return 0;
+export type VariantCompletion = {
+  /**
+   * Garments of this exact variant that are FINISHED: approved at the last stage of each
+   * batch producing it, summed across those batches. Submitted, uninspected, rework and
+   * rejected quantities are not in here, and a stage in the middle of a route cannot
+   * contribute - only the batch's own final stage can.
+   */
+  completed: number;
+  /**
+   * Whether any live batch has ever been produced against this variant. This is what makes
+   * the figure authoritative: a variant WITH production is reported from the ledger even when
+   * the ledger says zero, while a variant with no production at all keeps whatever figure was
+   * recorded against it, because there is no ledger to consult and quietly zeroing a number
+   * somebody wrote down is exactly the kind of silent overwrite this system refuses.
+   */
+  produced: boolean;
+};
+
+/** The final stage of one batch's OWN frozen route, not of the house eight-stage list. */
+function lastStageOfBatch(
+  list: { stage: string; routePosition: number | null; quantityApproved: number | null }[]
+) {
+  return [...list].sort((a, b) =>
+    a.routePosition !== null || b.routePosition !== null
+      ? (b.routePosition ?? 0) - (a.routePosition ?? 0)
+      : stageIndex(b.stage) - stageIndex(a.stage)
+  )[0];
+}
+
+/**
+ * How many of EACH exact variant are finished, in two queries however many variants are
+ * asked for.
+ *
+ * The single-variant `completedForVariant` below is now a wrapper on this. It used to be the
+ * other way round: the order-sizes endpoint called it once per variant inside a
+ * `Promise.all`, which is three queries per variant - an order with twelve size/colour
+ * combinations ran thirty-six queries to draw one table. Nothing about the arithmetic has
+ * changed, only how many round trips it takes to do it.
+ *
+ * A batch whose route ends at IRONING contributes its IRONING approvals; a batch that runs
+ * all the way to DELIVERY contributes its DELIVERY approvals. Neither is compared against a
+ * stage it does not have, and no batch can contribute twice: exactly one stage per batch is
+ * read, its own last.
+ */
+export async function completedForVariants(variantIds: number[]): Promise<Map<number, VariantCompletion>> {
+  const result = new Map<number, VariantCompletion>();
+  const ids = [...new Set(variantIds.filter((id) => Number.isSafeInteger(id) && id > 0))];
+  for (const id of ids) result.set(id, { completed: 0, produced: false });
+  if (!ids.length) return result;
+
   const batches = await db
-    .select({ id: productionBatches.id, status: productionBatches.status })
+    .select({
+      id: productionBatches.id,
+      variantId: productionBatches.orderVariantId,
+      status: productionBatches.status,
+    })
     .from(productionBatches)
-    .where(eq(productionBatches.orderVariantId, variantId));
-  const live = batches.filter((batch) => batch.status !== "CANCELLED").map((batch) => batch.id);
-  if (!live.length) return 0;
+    .where(inArray(productionBatches.orderVariantId, ids));
+
+  const batchToVariant = new Map<number, number>();
+  const liveBatchIds: number[] = [];
+  for (const batch of batches) {
+    if (batch.variantId === null || batch.status === "CANCELLED") continue;
+    batchToVariant.set(batch.id, batch.variantId);
+    liveBatchIds.push(batch.id);
+    // A live batch means this variant HAS production, so the ledger is the authority from
+    // here on - even if nothing has been approved yet.
+    result.set(batch.variantId, { completed: 0, produced: true });
+  }
+  if (!liveBatchIds.length) return result;
+
   const ops = await db
     .select({
       batchId: productionOperations.productionBatchId,
@@ -412,26 +474,34 @@ export async function completedForVariant(variantId: number): Promise<number> {
       quantityApproved: productionOperations.quantityApproved,
     })
     .from(productionOperations)
-    .where(inArray(productionOperations.productionBatchId, live));
+    .where(inArray(productionOperations.productionBatchId, liveBatchIds));
+
   const byBatch = new Map<number, typeof ops>();
   for (const op of ops) {
     const list = byBatch.get(op.batchId) ?? [];
     list.push(op);
     byBatch.set(op.batchId, list);
   }
-  let total = 0;
-  for (const list of byBatch.values()) {
+  for (const [batchId, list] of byBatch) {
     if (!list.length) continue;
-    // The final stage of THIS batch's own route: highest position, or for a legacy
-    // batch the latest stage in the eight-stage order.
-    const last = [...list].sort((a, b) =>
-      a.routePosition !== null || b.routePosition !== null
-        ? (b.routePosition ?? 0) - (a.routePosition ?? 0)
-        : stageIndex(b.stage) - stageIndex(a.stage)
-    )[0];
-    total += last.quantityApproved ?? 0;
+    const variantId = batchToVariant.get(batchId);
+    if (variantId === undefined) continue;
+    const entry = result.get(variantId) ?? { completed: 0, produced: true };
+    entry.completed += lastStageOfBatch(list).quantityApproved ?? 0;
+    result.set(variantId, entry);
   }
-  return total;
+  return result;
+}
+
+/**
+ * How many of ONE exact variant are finished - derived from the production ledger, not typed
+ * in. `order_item_sizes.completed` used to be a free-text field: a quantity with no event
+ * behind it, editable by anyone with an Owner session and recorded nowhere. The truthful
+ * figure is the quantity approved at the LAST stage of each batch producing that variant.
+ */
+export async function completedForVariant(variantId: number): Promise<number> {
+  const derived = await completedForVariants([variantId]);
+  return derived.get(variantId)?.completed ?? 0;
 }
 
 /** Every route, with its stages, for the route editor. */

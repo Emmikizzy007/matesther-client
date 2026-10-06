@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
+import { orderFulfilment } from "@/lib/production-control";
 import {
   orders,
   customers,
@@ -18,7 +19,7 @@ import {
   qualityChecks,
   reworkRecords,
 } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { refreshOrderMoney, batchProgress } from "@/lib/server";
 import { orderCosts, emptyOrderCosts, COST_LINES } from "@/lib/order-cost";
 import { guard, OWNER } from "@/lib/authz";
@@ -37,7 +38,11 @@ export async function GET(
 
     const [customerRows, itemRows, productRows, batchRows, workerRows, materialRows] =
       await Promise.all([
-        db.select().from(customers),
+        // One customer, not the whole customer book. `customerId` is nullable, so an order
+        // without one simply has no customer row to fetch.
+        order.customerId !== null
+          ? db.select().from(customers).where(eq(customers.id, order.customerId)).limit(1)
+          : Promise.resolve([] as typeof customers.$inferSelect[]),
         db.select().from(orderItems).where(eq(orderItems.orderId, orderId)),
         db.select().from(products),
         db.select().from(productionBatches).where(eq(productionBatches.orderId, orderId)),
@@ -45,9 +50,18 @@ export async function GET(
         db.select().from(materials),
       ]);
     const batchIds = batchRows.map((b) => b.id);
-    const [allOps, usageRows, expenseRows, paymentRows, purchaseRows, packRows, delRows] =
+    const [ops, usageRows, expenseRows, paymentRows, purchaseRows, packRows, delRows] =
       await Promise.all([
-        db.select().from(productionOperations),
+        /**
+         * Only this order's stages. This used to select every production operation in the
+         * book and then filter it in JavaScript, so opening one order downloaded the whole
+         * factory floor - and the same was true of the quality and rework reads below. All
+         * three grow with every stage of every batch ever made, while the rows this page
+         * needs grow only with this order.
+         */
+        batchIds.length
+          ? db.select().from(productionOperations).where(inArray(productionOperations.productionBatchId, batchIds))
+          : Promise.resolve([] as typeof productionOperations.$inferSelect[]),
         db.select().from(materialUsage).where(eq(materialUsage.orderId, orderId)),
         db.select().from(expenses).where(eq(expenses.orderId, orderId)),
         db.select().from(payments).where(eq(payments.orderId, orderId)),
@@ -55,14 +69,15 @@ export async function GET(
         db.select().from(packingRecords).where(eq(packingRecords.orderId, orderId)),
         db.select().from(deliveries).where(eq(deliveries.orderId, orderId)),
       ]);
-    const ops = allOps.filter((o) => batchIds.includes(o.productionBatchId));
     const opIds = ops.map((o) => o.id);
-    const [qcRows, rwRows] = await Promise.all([
-      db.select().from(qualityChecks),
-      db.select().from(reworkRecords),
+    const [quality, rework] = await Promise.all([
+      opIds.length
+        ? db.select().from(qualityChecks).where(inArray(qualityChecks.productionOperationId, opIds))
+        : Promise.resolve([] as typeof qualityChecks.$inferSelect[]),
+      opIds.length
+        ? db.select().from(reworkRecords).where(inArray(reworkRecords.productionOperationId, opIds))
+        : Promise.resolve([] as typeof reworkRecords.$inferSelect[]),
     ]);
-    const quality = qcRows.filter((q) => opIds.includes(q.productionOperationId));
-    const rework = rwRows.filter((r) => opIds.includes(r.productionOperationId));
 
     const pMap = new Map(productRows.map((p) => [p.id, p]));
     const wMap = new Map(workerRows.map((w) => [w.id, w]));
@@ -138,7 +153,17 @@ export async function GET(
           )
         : 0;
 
+    /**
+     * Where this order actually is, end to end, derived from the ledger and from the packing
+     * and delivery records that already exist - not from the status column and not from
+     * anything anybody can type. `fulfilment.complete` and `fulfilment.statusSaysComplete`
+     * sit beside each other so a status that was changed by hand without the production to
+     * back it is visible instead of trusted.
+     */
+    const fulfilment = await orderFulfilment(orderId);
+
     return NextResponse.json({
+      fulfilment,
       order: {
         ...order,
         customer: customerRows.find((c) => c.id === order.customerId) ?? null,

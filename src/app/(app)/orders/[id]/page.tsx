@@ -127,8 +127,12 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
               // `completedRecorded` is carried through untouched and sent back, so
               // saving the variants can never zero a figure someone recorded.
               completed: String(s.completedRecorded ?? 0),
-              // What is shown: derived from the production ledger, not typed.
+              // What is shown: derived from the production ledger, not typed. The API
+              // decides which figure is authoritative - it knows whether this variant has any
+              // production behind it - so the screen no longer re-implements that rule.
               completedFromProduction: Number(s.completedFromProduction ?? 0),
+              completedShown: Number(s.completed ?? 0),
+              produced: Boolean(s.produced),
             }))
           : ["S", "M", "L", "XL"].map((s) => ({ size: s, color: "", quantity: "", completed: "0", completedFromProduction: 0 }))
       );
@@ -239,31 +243,96 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
 
       {/* Profitability panel */}
       <Card className="mb-4">
-        <CardHeader title="Revenue → Costs → Profit" subtitle="Updates automatically as materials, labour and expenses are recorded" />
+        <CardHeader
+          title="Revenue → Costs → Profit"
+          subtitle="Every cost category this order actually carries, derived from the records behind it"
+        />
         <div className="p-5 grid lg:grid-cols-3 gap-5">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Cost breakdown</p>
+            {/*
+              The nine categories, which are what TOTAL COST is actually made of, so the
+              lines on this screen add up to the figure beneath them. This used to list the
+              raw material-usage and expense records and then print a total that included
+              labour the list never mentioned - the numbers did not add up, and there was
+              no way to see why from the screen.
+            */}
             <div className="space-y-1.5 text-sm">
-              {costs.usageByCategory.map((c: any) => (
-                <div key={c.category} className="flex justify-between">
-                  <span className="text-slate-600">{c.category} (materials used)</span>
-                  <span className="font-semibold">{naira(c.amount)}</span>
+              {(costs.lines ?? []).map((line: any) => (
+                <div key={line.key} className="flex justify-between">
+                  <span className={line.amount ? "text-slate-600" : "text-slate-400"}>{line.label}</span>
+                  <span className={line.amount ? "font-semibold" : "text-slate-400"}>{naira(line.amount)}</span>
                 </div>
               ))}
-              {costs.expensesByCategory.map((c: any) => (
-                <div key={c.category} className="flex justify-between">
-                  <span className="text-slate-600">{c.category}</span>
-                  <span className="font-semibold">{naira(c.amount)}</span>
-                </div>
-              ))}
-              {costs.usageByCategory.length + costs.expensesByCategory.length === 0 && (
-                <p className="text-slate-400">No costs recorded yet.</p>
-              )}
+              {(costs.lines ?? []).length === 0 && <p className="text-slate-400">No costs recorded yet.</p>}
             </div>
             <div className="flex justify-between border-t border-slate-200 mt-3 pt-2 text-sm font-bold">
               <span>TOTAL COST</span>
               <span>{naira(costs.totalCost)}</span>
             </div>
+
+            {/* Support labour is the same money as internal labour, moved between two
+                people, so it is shown as an allocation rather than as a second cost. */}
+            {!!costs.supportAllocation && (costs.supportAllocation.grossPaidToSupportWorkers > 0 || costs.supportAllocation.deductedFromTailorCommission > 0) && (
+              <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+                Support workers were paid{" "}
+                <span className="font-semibold">{naira(costs.supportAllocation.grossPaidToSupportWorkers)}</span> for
+                delegated pieces, and{" "}
+                <span className="font-semibold">{naira(costs.supportAllocation.deductedFromTailorCommission)}</span> of
+                the tailors&rsquo; commission was deducted for the same pieces, so this order carries{" "}
+                <span className="font-semibold">{naira(costs.supportAllocation.addedToOrderCost)}</span> of extra
+                labour cost. The labour is counted once.
+              </p>
+            )}
+
+            {/* Hand-entered expenses that the computed categories already cover. They are
+                set aside rather than deleted, and named here so whoever typed them can
+                see that they were seen. */}
+            {!!costs.superseded && (costs.superseded.materials > 0 || costs.superseded.labour > 0) && (
+              <p className="text-[11px] text-amber-700 mt-2 leading-relaxed">
+                Set aside to avoid counting twice: {naira(costs.superseded.materials)} of hand-entered
+                Materials and {naira(costs.superseded.labour)} of hand-entered Labour expenses. The
+                material records and the approved piecework above already cover them.
+              </p>
+            )}
+
+            {/* The old formula's answer, beside the restated one rather than replaced by
+                it, so a figure somebody has already reported can still be recognised. */}
+            {!!costs.legacy && costs.legacy.totalCost !== costs.totalCost && (
+              <div className="mt-3 rounded-lg bg-slate-50 border border-slate-200 p-3 text-[11px] text-slate-600">
+                <p className="font-semibold uppercase tracking-wide text-slate-500 mb-1">Previously reported</p>
+                <p>
+                  Cost {naira(costs.legacy.totalCost)} · Profit {naira(costs.legacy.profit)} · Margin {costs.legacy.margin}%
+                </p>
+                <p className="mt-1 text-slate-500">
+                  The old figure counted materials and hand-entered expenses only, and no labour at all.
+                  This order has been restated on the full model; the old answer is kept here, not overwritten.
+                </p>
+              </div>
+            )}
+
+            <details className="mt-3 text-xs">
+              <summary className="cursor-pointer font-semibold text-slate-500 hover:text-slate-700">
+                The records behind these figures
+              </summary>
+              <div className="space-y-1.5 mt-2">
+                {costs.usageByCategory.map((c: any) => (
+                  <div key={c.category} className="flex justify-between">
+                    <span className="text-slate-600">{c.category} (materials used)</span>
+                    <span className="font-semibold">{naira(c.amount)}</span>
+                  </div>
+                ))}
+                {costs.expensesByCategory.map((c: any) => (
+                  <div key={c.category} className="flex justify-between">
+                    <span className="text-slate-600">{c.category} (expense record)</span>
+                    <span className="font-semibold">{naira(c.amount)}</span>
+                  </div>
+                ))}
+                {costs.usageByCategory.length + costs.expensesByCategory.length === 0 && (
+                  <p className="text-slate-400">No material or expense records on this order.</p>
+                )}
+              </div>
+            </details>
           </div>
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Products in this order</p>
@@ -988,8 +1057,8 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
               {/* Not editable. It is derived from what production actually got
                   approved at the last stage of each batch for this variant. */}
               <span className="col-span-2 text-sm font-semibold text-emerald-700" title="Derived from the production trail - approved at the final stage of each batch for this exact garment">
-                {r.completedFromProduction > 0 ? r.completedFromProduction : Number(r.completed) || 0}
-                {r.completedFromProduction > 0 && <span className="ml-1 text-[10px] font-normal text-slate-400">from production</span>}
+                {r.completedShown ?? (Number(r.completed) || 0)}
+                {r.produced && <span className="ml-1 text-[10px] font-normal text-slate-400">from production</span>}
               </span>
               <button type="button" onClick={() => setSizeRows(sizeRows.filter((_, x) => x !== i))} className="col-span-2 text-red-600 text-xs font-semibold text-center">Remove</button>
             </div>

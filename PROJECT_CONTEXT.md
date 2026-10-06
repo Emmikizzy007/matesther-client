@@ -1830,5 +1830,155 @@ drift. Deploying Task 5 is a code deploy only.
   would 404 and slots would show the gold "M" until the Owner uploads, so the
   file must ship with the app.
 - Section 33's item 7 - deriving a size's `completed` count from approved
-  production, and the batch payroll query - is **not** part of Task 5 and
-  remains outstanding.
+  production, and the batch payroll query - was **not** part of this UI pass.
+  It is resolved in section 39.6.
+
+---
+
+# 39. IMPLEMENTED: operational completion, integration and control (Task 5, this run)
+
+**This is a different Task 5 from section 38.** Section 38 records an earlier UI/PWA/mobile
+polish pass that also happened to be called Task 5. This section is the ERP operational
+completion, integration and control pass. The full account, with every verification number, is
+in **`TASK5-REPORT.md`**; what follows is only what a future reader of this file needs in order
+not to redo or undo it.
+
+## 39.1 Verified as already implemented (do not redo)
+
+Checked against the code, not assumed:
+
+- **Separation of duties** is enforced server-side in all four places it matters:
+  `POST /api/inspections` refuses self-inspection including on split stages, `PUT
+  /api/support-work` refuses a support worker approving their own work,
+  `POST /api/production-corrections` refuses a worker correcting their own job, and
+  `PUT /api/operations` refuses a submitter who is not the stage's own worker.
+- **Worker isolation** on `GET /api/allocations` and `GET /api/operations` cannot be widened by
+  omitting a parameter, by naming somebody else, or by using the `operationId` path.
+- **`POST /api/auth/setup`** requires a private setup key *and* refuses once any user exists.
+- **The production control board** already reports every figure section 33 asks for, derived,
+  paginated, with no money key at any depth and no write method on the route.
+- **Mobile and PWA** are as section 38 records: `inputCls` (269 call sites) is `min-h-11` and
+  `text-base sm:text-sm` so iOS does not zoom, the sidebar is a scroll-locking drawer, modals are
+  bottom sheets, worker job lists are cards, and the tables that exist scroll horizontally.
+  An independent audit for this task found **no genuine usability defect** and changed no styling.
+- **Material control**: the reports screen's materials section already reports purchased, used,
+  stock and stock value per material, reading the material system's own figure.
+
+## 39.2 What changed
+
+- **`isReadyMadeMaterial()` in `src/lib/format.ts`** is now the one predicate behind three rules
+  that must agree: a ready-made purchase is a cost and never labour, it never enters raw-material
+  inventory, and issuing one never draws down the fabric shelf. `POST /api/material-purchases`
+  used to add every purchase to `current_stock`, which let a finished garment bought on the
+  general screen be issued again as though it were cloth. `POST /api/ready-made` writes to the
+  same table and has never touched stock; the two now agree. Compared exactly, not
+  case-insensitively, because that is how the costing SQL compares it.
+- **Raw-material stock cannot go negative.** `POST /api/material-usage` counts the shelf *before*
+  writing and refuses an issue whole — no partial issue, no silent clamping. `PUT` can only ever
+  put material back, and that is now asserted rather than assumed: an edit whose net-out would
+  grow is refused.
+- **`orderFulfilment(orderId)` in `src/lib/production-control.ts`** is the one derived answer to
+  "where is this order": ordered, released, in production, approved, remaining, assigned, awaiting
+  inspection, rework, rejected, packed, delivered, ready for delivery, complete. It is the same
+  `approved` the control board shows, so the order page, the board and the packing and delivery
+  guards cannot disagree. `complete` is derived and returned beside `statusSaysComplete`, because
+  `PUT /api/orders/[id]` does accept a free `status` and a hand-set COMPLETED must not be trusted.
+- **`POST /api/packing` and `POST /api/deliveries` are bounded by approved production.** Packing
+  used to accept any positive number against any order id; delivery was bounded only by what was
+  ordered. An order that never entered production keeps the ordered ceiling it always had, so
+  historical and off-floor orders still work.
+- **`GET /api/dashboard` no longer computes its own profit.** It was `revenue − (expenses +
+  material usage)` — no labour of any kind — on the most-read money figure in the business. It now
+  calls `src/lib/order-cost.ts`, reports unattributable business costs *beside* order profit, and
+  returns the old figure as `legacy`, rendered as "previously reported". The costing runs below
+  the Project Manager early-return, so a PM request does not pay for financials it never sees.
+- **`GET /api/attention`** is what needs a person today, pulled rather than pushed: overdue work,
+  awaiting inspection, rework, outsourced not returned, unassigned stages, support work unjudged,
+  approved garments undelivered, material at or below reorder level, and orders marked complete
+  with batches still open. No notification table, queue or external service was added; every
+  signal is derived from `productionControl` or from records that already exist. Staff-only, and
+  read once per page load by a sidebar badge — never polled. It reads completed-status orders too,
+  so a hand-set status cannot switch off the alarms about the work behind it.
+- **`POST /api/payroll` takes `paidBy` from the session, not the request body.** It was the only
+  actor in the API a caller could forge, on the one record where "who paid this person" is the
+  whole audit.
+- **`GET /api/orders/[id]` and `GET /api/material-purchases` stopped downloading the book.** The
+  order page selected every production operation, quality check and rework record in the database
+  and filtered in JavaScript; purchases selected every purchase, material and order with no
+  pagination. Both are now scoped in SQL, purchases paged with `X-Total-Count` and still a bare
+  array so no consumer changed.
+- **The printed payment sheet now renders `notListed`**, which the API has returned since Task 4:
+  how many workers it leaves out and the support deduction carried forward against their later
+  piece-rate earnings — the difference between the sheet and the payroll screen.
+
+- **`order_item_sizes.completed` is authoritative wherever production exists.** The derivation
+  was already there (`completedForVariant`: approved at the last stage of each batch's own frozen
+  route) but it only won when it was *greater than zero*, so a number somebody typed survived
+  whenever production had approved nothing yet - twenty pieces awaiting inspection, or every piece
+  rejected, still showed the typed figure as finished. Where a variant has any live batch the
+  ledger now decides, **including when it says zero**; where it has no production at all the
+  recorded figure stands rather than being quietly zeroed. The endpoint also returns `produced`
+  and `completedRecorded` so a screen can tell the cases apart, and the order page no longer
+  re-implements the fallback in JSX. The derivation moved into `completedForVariants()`, which
+  answers for any number of variants in **two queries** instead of three per variant.
+- **`payments`, `packing_records` and `deliveries` now record WHO entered them**
+  (`recorded_by_id` + `recorded_by_name`, migration `0010_actor_audit`), taken from the session
+  and never from the request body. See 39.6.
+
+## 39.3 Schema, data and safety
+
+**One additive migration: `0010_actor_audit`.** Six nullable columns (`recorded_by_id`,
+`recorded_by_name` on `payments`, `packing_records` and `deliveries`) and three foreign keys to
+`users` with `ON DELETE set null`. No `NOT NULL`, no default, **no data write and no backfill**:
+every receipt, packing record and delivery already in the database keeps a NULL actor, because
+that is the truth about it, and inventing a name on a historical financial document would be worse
+than leaving the question open. `deploy/upgrade-actor-audit.sql` is the same statements idempotent
+and guarded, with commented verification queries, and follows the house rule of SQL first then
+code. Everything else in this task was schema-free.
+
+After it, `drizzle-kit generate` reports "No schema changes, nothing to migrate"; the journal has
+**11 entries** ending at `0010_actor_audit`, with 11 `.sql` files and 11 snapshots. No production
+data was touched, nothing was seeded, no applied migration was re-run, no destructive SQL was
+written, and no authorization was weakened — the only guard-level changes in this run are that
+`GET /api/attention` is staff-only and `POST /api/packing` now 404s on an order that does not
+exist.
+
+## 39.4 Regression coverage
+
+**278 tests, 0 failures**, all through the real route handlers: 252 at the start of this run, plus
+7 for the returned-material rules, 7 for stock integrity and ready-made, 8 in
+`tests/order-lifecycle-and-attention.test.ts` for the derived lifecycle, the packing and delivery
+ceilings, the attention list, purchase pagination, the session-derived payment actor and one
+authoritative profit across dashboard, reports and order page, and 11 in
+`tests/variant-completion-and-actor.test.ts` for variant completion from approved production and
+for the actor on receipts, packing and deliveries (including a forged actor in the body being
+ignored, a Worker and a Project Manager being refused, and the migration itself being asserted
+nullable, default-free and free of any data statement).
+
+One existing fixture was corrected rather than the guard: the nine-cost-categories test catalogued
+fabric with `currentStock: 0` and issued ten yards, which could only pass by drawing down an
+empty shelf.
+
+## 39.5 Known limitations and decisions left open
+
+- `recorded_by_*` records who **created** a receipt, packing record or delivery, not who last
+  edited it. An edit history for those three would need an `updated_by` pair or a document ledger
+  — a second mechanism, so it is a decision rather than a default. Edits are OWNER-only.
+- `GET /api/dashboard` still reads `productionOperations` whole. It genuinely summarises every
+  stage, so the rows cannot be reduced without changing what the screen means; of its 23 columns
+  only 5 are provably unused, so narrowing was reported rather than done.
+- `/api/attention` derives up to 500 batches per call and reports `window.capped` when there is
+  more.
+## 39.6 Section 33's item 7, resolved
+
+**A size's `completed` count now comes from approved production** wherever production exists -
+see 39.2. The recorded figure survives only on a variant with no live batch at all, so a
+historical or off-floor order keeps the number somebody wrote down instead of being zeroed.
+
+**There is no batch payroll query to fix.** `src/lib/payroll.ts` contains no reference to
+`production_batches` whatsoever: payroll is derived from approved inspections and attributed
+allocations, which is batch-independent by design. The item existed in a secondhand note carried
+forward from an earlier session, not in this codebase. The per-worker `completed` figure on the
+workers screen is a different concept - operation-level work plus submitted shares, shown beside a
+separate `approved` field - and was inspected and deliberately left alone rather than silently
+redefined.

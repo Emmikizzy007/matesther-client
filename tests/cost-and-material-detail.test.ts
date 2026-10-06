@@ -328,3 +328,468 @@ test("material usage is paged and filtered in the database, not loaded whole", a
   assert.ok(filtered.data.length >= 5);
   assert.ok(filtered.data.every((row: any) => row.orderId === w.order.orderId), "Nothing from another order leaks in");
 });
+
+// ---------------------------------------------------------------------------
+// 3. RETURNED MATERIAL: the seven rules, each asserted on its own.
+//
+// A material issued to production and genuinely returned unused goes back into available
+// stock. Everything below is what that sentence has to mean in this system, rule by rule,
+// so that no future change can satisfy one of them by breaking another.
+// ---------------------------------------------------------------------------
+
+/** Issue material through the real endpoint and read back both the record and the shelf. */
+async function issue(
+  w: { owner: { cookie: string }; order: { orderId: number }; fabric: { id: number } },
+  body: Record<string, unknown>
+) {
+  const record = await expectStatus(
+    await api("POST", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.fabric.id, orderId: w.order.orderId, ...body },
+    }),
+    201, "Issue the material"
+  );
+  return record;
+}
+
+test("rule 1 and 2: issued reduces available stock, returned unused increases it again", async () => {
+  const w = await materialWorld(100, 250);
+  const before = await stockOf(w.owner.cookie, w.fabric.id);
+
+  // Twelve yards leave the store; three come back uncut.
+  await issue(w, { quantityIssued: 12, quantityUsed: 9, quantityReturned: 3, notes: "Three yards came back uncut" });
+  const after = await stockOf(w.owner.cookie, w.fabric.id);
+
+  assert.equal(after, before - 12 + 3, "The shelf loses what was issued and gains back what was returned");
+  assert.equal(after, before - 9, "so it ends up down by the nine yards that actually stayed out");
+  assert.notEqual(after, before - 12, "and it is NOT down by the full issued figure");
+});
+
+test("rule 3: returned material stops being a cost of the job, the moment it comes back", async () => {
+  const w = await materialWorld(100, 250);
+
+  // Everything issued is used, so the whole issue is charged to the order.
+  const record = await issue(w, { quantityIssued: 12, quantityUsed: 12 });
+  assert.equal(record.totalCost, 12 * 250, "Twelve yards consumed costs twelve yards");
+
+  // Two turn out to be reusable and go back on the shelf.
+  const returned = await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { id: record.id, quantityUsed: 10, quantityReturned: 2, notes: "Two yards came back uncut" },
+    }),
+    200, "Return two yards"
+  );
+  assert.equal(returned.totalCost, 10 * 250, "The returned yards are no longer a cost of the job");
+  assert.notEqual(returned.totalCost, 12 * 250, "and the order is not still charged for them");
+  assert.equal(returned.quantityReturned, 2);
+  assert.equal(returned.quantityUsed, 10);
+});
+
+test("rule 4: wastage stays consumed and never goes back on the shelf", async () => {
+  const w = await materialWorld(100, 250);
+  const before = await stockOf(w.owner.cookie, w.fabric.id);
+
+  // Ten issued: six into garments, four ruined. Nothing came back.
+  const record = await issue(w, {
+    quantityIssued: 10, quantityUsed: 6, quantityWasted: 4, unitCost: 250,
+    notes: "Four yards cut off-grain",
+  });
+  assert.equal(record.totalCost, 10 * 250, "Used and wasted are BOTH consumed, so both are charged");
+  assert.equal(record.wastedCost, 4 * 250, "with the write-off visible on its own");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 10, "All ten left the store for good");
+
+  // A later write-off is already out of stock: recording it must not move the shelf at all.
+  const writtenOff = await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { id: record.id, quantityUsed: 4, quantityWasted: 6, notes: "Two more yards torn on the machine" },
+    }),
+    200, "Write off two more yards"
+  );
+  assert.equal(writtenOff.quantityWasted, 6);
+  assert.equal(writtenOff.totalCost, 10 * 250, "Wasted material is still charged to the job");
+  assert.equal(
+    await stockOf(w.owner.cookie, w.fabric.id), before - 10,
+    "Writing off more moved NO stock: wastage is lost, not returned"
+  );
+});
+
+test("rule 5: the same quantity can never be returned twice", async () => {
+  const w = await materialWorld(100, 250);
+  const before = await stockOf(w.owner.cookie, w.fabric.id);
+
+  const record = await issue(w, { quantityIssued: 20, quantityUsed: 20 });
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 20);
+
+  // Two come back, then three more, on separate occasions.
+  await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 18, quantityReturned: 2, notes: "Two uncut" },
+    }),
+    200, "Return two yards"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 18, "Two back on the shelf");
+
+  await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 15, quantityReturned: 5, notes: "Three more found uncut" },
+    }),
+    200, "Return three more, taking the total to five"
+  );
+  assert.equal(
+    await stockOf(w.owner.cookie, w.fabric.id), before - 15,
+    "Only the THREE new yards came back - not five again, which would double-count the first two"
+  );
+
+  // A return can never be taken back, so the shelf can never be credited twice for one yard.
+  const unReturned = await api("PUT", "/api/material-usage", {
+    cookie: w.owner.cookie, body: { id: record.id, quantityReturned: 3, notes: "Miscounted" },
+  });
+  assert.equal(unReturned.status, 400, "Five yards went back to the store; that cannot be un-recorded");
+  assert.match(String(unReturned.data.error), /cannot be un-returned/i);
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 15, "and the shelf did not move");
+
+  // Nor can returns exceed what was ever issued.
+  const tooMany = await api("PUT", "/api/material-usage", {
+    cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 0, quantityReturned: 21, notes: "All of it came back" },
+  });
+  assert.equal(tooMany.status, 400, "Twenty-one returned against twenty issued is impossible");
+  assert.match(String(tooMany.data.error), /more than the 20 issued/i);
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 15, "so no stock was created out of nothing");
+});
+
+test("rule 6: a return is auditable with who, when and why - and needs a reason of its own", async () => {
+  const w = await materialWorld(100, 250);
+
+  // The issue carries its own reason.
+  const record = await issue(w, {
+    quantityIssued: 12, quantityUsed: 12, notes: "Cutting the navy blazers",
+  });
+  assert.match(String(record.notes), /navy blazers/, "The reason the material was issued for is on the record");
+
+  // A return recorded later cannot borrow that reason: it is a reason for a different event.
+  const noReason = await api("PUT", "/api/material-usage", {
+    cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 10, quantityReturned: 2 },
+  });
+  assert.equal(noReason.status, 400, "A return with no reason of its own is refused");
+  assert.match(String(noReason.data.error), /written reason/i);
+
+  const returned = await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { id: record.id, quantityUsed: 10, quantityReturned: 2, notes: "Two yards came back uncut" },
+    }),
+    200, "Return two yards, with the reason for the RETURN"
+  );
+
+  // Who, when and why, and the original reason still beside them.
+  const trail = String(returned.notes);
+  assert.match(trail, /Two yards came back uncut/, "why: the return's own reason");
+  assert.match(trail, /2 returned to store/, "what: how much went back on the shelf");
+  assert.match(trail, /\[\d{4}-\d{2}-\d{2}\]/, "when: the date the return was recorded, not the date it was issued");
+  assert.match(trail, /by .+/, "who: the person who recorded it");
+  assert.match(trail, /navy blazers/, "and the reason the material was issued for is NOT destroyed by the return");
+
+  // A second return appends rather than replacing, so the whole history survives.
+  const again = await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { id: record.id, quantityUsed: 9, quantityReturned: 3, notes: "One more yard found" },
+    }),
+    200, "Return one more yard"
+  );
+  const longer = String(again.notes);
+  assert.match(longer, /navy blazers/, "The issue reason is still there");
+  assert.match(longer, /Two yards came back uncut/, "so is the first return");
+  assert.match(longer, /One more yard found/, "and the second");
+  assert.match(longer, /1 returned to store/, "each with its own quantity, so neither can be mistaken for the other");
+});
+
+test("rule 7: order profitability reflects material CONSUMED, not merely issued", async () => {
+  const w = await materialWorld(100, 250);
+
+  // Twenty issued against this order: fifteen into garments, three back on the shelf,
+  // two ruined. Only the eighteen that were consumed may reach the order's cost.
+  await issue(w, {
+    quantityIssued: 20, quantityUsed: 15, quantityReturned: 3, quantityWasted: 2, unitCost: 250,
+    notes: "Three yards came back, two ruined",
+  });
+
+  const order = await api("GET", `/api/orders/${w.order.orderId}`, { cookie: w.owner.cookie });
+  const costs = (await expectStatus(order, 200, "Owner opens the order")).costs;
+  const materialsLine = costs.lines.find((line: any) => line.key === "materials");
+  assert.equal(materialsLine.amount, 17 * 250, "Fifteen used plus two wasted, at N250 - the three returned are absent");
+  assert.equal(costs.materials, 17 * 250, "and the flat key agrees");
+  assert.notEqual(costs.materials, 20 * 250, "NOT the twenty that were issued");
+  assert.notEqual(costs.materials, 15 * 250, "and not the fifteen used, which would let the write-off go free");
+
+  // Returning more afterwards must reduce the order's cost, not merely the shelf.
+  const [record] = await expectStatus(
+    await api("GET", `/api/material-usage?orderId=${w.order.orderId}`, { cookie: w.owner.cookie }),
+    200, "Read the usage back"
+  );
+  await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { id: record.id, quantityUsed: 13, quantityReturned: 5, notes: "Two more yards came back uncut" },
+    }),
+    200, "Return two more yards"
+  );
+  const after = await api("GET", `/api/orders/${w.order.orderId}`, { cookie: w.owner.cookie });
+  const afterCosts = (await expectStatus(after, 200, "Owner reopens the order")).costs;
+  assert.equal(afterCosts.materials, 15 * 250, "Thirteen used plus two wasted - the order is charged only for what it consumed");
+  assert.equal(afterCosts.totalCost, afterCosts.materials, "No other cost line moved, so the restatement is entirely the return");
+  assert.equal(afterCosts.profit, afterCosts.revenue - afterCosts.totalCost, "and profit still follows from the restated cost");
+});
+
+test("an entry made the old way is normalised, so returns against it are still bounded", async () => {
+  const w = await materialWorld(100, 250);
+  const before = await stockOf(w.owner.cookie, w.fabric.id);
+
+  // No issued figure at all: the shape every record had before issue tracking existed.
+  const legacy = await issue(w, { quantityUsed: 8 });
+  assert.equal(
+    legacy.quantityIssued, 8,
+    "Issued is normalised to what was used, because nothing was reported as returned"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 8, "Stock fell exactly as it always did");
+  assert.equal(legacy.totalCost, 8 * 250, "and the cost is unchanged from the old formula");
+
+  // Two of those yards turn out to be reusable. Used has to fall for the record to still
+  // account for the eight that went out: returned material leaves the job's cost, not its history.
+  const returned = await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: legacy.id, quantityUsed: 6, quantityReturned: 2, notes: "Two yards came back uncut" },
+    }),
+    200, "Return two yards against a legacy record"
+  );
+  assert.equal(returned.totalCost, 6 * 250, "The order stops paying for what came back");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 6, "and the two yards are back on the shelf");
+
+  // A second genuine return is still allowed: eight went out, only two have come back, so the
+  // ceiling must not have shrunk to the six that are still recorded as used.
+  const second = await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: legacy.id, quantityUsed: 5, quantityReturned: 3, notes: "One more yard found uncut" },
+    }),
+    200, "Return a third yard against the same legacy record"
+  );
+  assert.equal(second.totalCost, 5 * 250, "Charged only for the five that stayed out");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 5, "Three of the eight are back on the shelf");
+
+  // And the ceiling still stops an old-style record from returning more than it took.
+  const impossible = await api("PUT", "/api/material-usage", {
+    cookie: w.owner.cookie, body: { id: legacy.id, quantityReturned: 9, notes: "Trying to return more than was issued" },
+  });
+  assert.equal(impossible.status, 400, "Eight were issued, so nine cannot have come back");
+  assert.match(String(impossible.data.error), /more than the 8 issued/i, "Eight went out, so nine cannot have come back");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before - 5, "and no stock was invented by the refused return");
+});
+
+// ---------------------------------------------------------------------------
+// 4. STOCK INTEGRITY: ready-made never enters raw-material inventory, and the
+//    shelf can never be drawn below zero.
+// ---------------------------------------------------------------------------
+
+/** A finished garment in the catalogue - the category that marks it as bought, not stored. */
+async function readyMadeWorld(unitCost = 5000) {
+  const owner = await createOwner();
+  const order = await createOrder(owner.cookie, { quantity: 10, unitPrice: 9000 });
+  const garment = await expectStatus(
+    await api("POST", "/api/materials", {
+      cookie: owner.cookie,
+      body: { name: unique("Ready-made polo"), category: "Ready-made garment", unit: "pcs", unitCost, reorderLevel: 0, currentStock: 0 },
+    }),
+    201, "Catalogue the finished garment"
+  );
+  return { owner, order, garment, unitCost };
+}
+
+test("a ready-made purchase through the general screen is a cost, and never raw-material stock", async () => {
+  const w = await readyMadeWorld(5000);
+  const before = await stockOf(w.owner.cookie, w.garment.id);
+
+  // Bought through the general purchases screen, not the dedicated ready-made flow.
+  const purchase = await expectStatus(
+    await api("POST", "/api/material-purchases", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.garment.id, quantity: 6, unitCost: 5000, supplier: "Lagos Uniforms Ltd", orderId: w.order.orderId },
+    }),
+    201, "Buy six finished polos"
+  );
+  assert.equal(purchase.totalCost, 30000, "The purchase is still recorded, with its own cost");
+
+  assert.equal(
+    await stockOf(w.owner.cookie, w.garment.id), before,
+    "Six finished garments did NOT enter raw-material inventory - the shelf is exactly where it was"
+  );
+
+  // And the cost lands where ready-made cost belongs, not in fabric.
+  const order = await api("GET", `/api/orders/${w.order.orderId}`, { cookie: w.owner.cookie });
+  const costs = (await expectStatus(order, 200, "Owner opens the order")).costs;
+  assert.equal(costs.readyMade, 30000, "Counted as a ready-made purchase");
+  assert.equal(costs.materials, 0, "and not as a raw material consumed on the job");
+  assert.equal(costs.internalLabour, 0, "and never as tailor labour: buying a garment pays no worker");
+});
+
+test("a legitimate raw-material purchase still lands on the shelf", async () => {
+  const w = await materialWorld(20, 250);
+  const before = await stockOf(w.owner.cookie, w.fabric.id);
+
+  await expectStatus(
+    await api("POST", "/api/material-purchases", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.fabric.id, quantity: 30, unitCost: 260, supplier: "Kano Textiles" },
+    }),
+    201, "Buy thirty more yards of fabric"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before + 30, "Raw material still enters stock exactly as before");
+
+  const listed = await api("GET", "/api/materials", { cookie: w.owner.cookie });
+  const rows = Array.isArray(listed.data) ? listed.data : listed.data.data ?? [];
+  assert.equal(rows.find((m: any) => m.id === w.fabric.id).unitCost, 260, "and the catalogue price still follows the purchase");
+});
+
+test("a purchase against a material that does not exist is refused, not written as an orphan", async () => {
+  const w = await readyMadeWorld();
+  const missing = await api("POST", "/api/material-purchases", {
+    cookie: w.owner.cookie, body: { materialId: 999999, quantity: 5, unitCost: 100 },
+  });
+  assert.equal(missing.status, 404, "There is nothing to buy against");
+  const listed = await api("GET", "/api/material-purchases", { cookie: w.owner.cookie });
+  const rows = Array.isArray(listed.data) ? listed.data : listed.data.data ?? [];
+  assert.equal(rows.some((r: any) => r.materialId === 999999), false, "and no purchase row was left behind");
+});
+
+test("material cannot be issued beyond what the store actually holds", async () => {
+  const w = await materialWorld(12, 250);
+  const before = await stockOf(w.owner.cookie, w.fabric.id);
+  assert.equal(before, 12);
+
+  // Twenty yards asked for against twelve on the shelf.
+  const tooMuch = await api("POST", "/api/material-usage", {
+    cookie: w.owner.cookie,
+    body: { materialId: w.fabric.id, orderId: w.order.orderId, quantityIssued: 20, quantityUsed: 20, notes: "Cutting the whole order at once" },
+  });
+  assert.equal(tooMuch.status, 400, "The store does not have it, so it cannot be issued");
+  assert.match(String(tooMuch.data.error), /only 12/i, "The message says what IS there");
+  assert.match(String(tooMuch.data.error), /not enough to issue 20/i, "and what was asked for");
+  assert.match(String(tooMuch.data.error), /cannot go negative/i, "and why");
+
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), before, "Stock did not move");
+
+  const after = await api("GET", `/api/material-usage?orderId=${w.order.orderId}`, { cookie: w.owner.cookie });
+  const rows = await expectStatus(after, 200, "Read the usage back");
+  assert.equal(
+    rows.filter((r: any) => r.materialId === w.fabric.id).length, 0,
+    "Nothing was partially issued: the refused request left no record behind"
+  );
+
+  // Twelve is exactly what is there, so it must still be allowed.
+  await expectStatus(
+    await api("POST", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.fabric.id, orderId: w.order.orderId, quantityIssued: 12, quantityUsed: 12, notes: "Cutting the whole order at once" },
+    }),
+    201, "Issue exactly what the store holds"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 0, "The shelf is empty, and exactly empty - not negative");
+});
+
+test("a return at issue time is counted against the store, so what stays out is what must be there", async () => {
+  const w = await materialWorld(8, 250);
+
+  // Ten issued and two come straight back, so only eight ever leave the shelf.
+  await expectStatus(
+    await api("POST", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.fabric.id, orderId: w.order.orderId, quantityIssued: 10, quantityUsed: 8, quantityReturned: 2, notes: "Two yards came back uncut" },
+    }),
+    201, "Issue ten, of which two return immediately"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 0, "Eight left, two came back: the shelf is empty but never negative");
+
+  // Nine would genuinely stay out, and the store does not have nine.
+  const refused = await api("POST", "/api/material-usage", {
+    cookie: w.owner.cookie,
+    body: { materialId: w.fabric.id, orderId: w.order.orderId, quantityIssued: 10, quantityUsed: 9, quantityReturned: 1, notes: "One yard came back uncut" },
+  });
+  assert.equal(refused.status, 400, "Nine yards staying out against eight on the shelf is refused");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 0, "and the refused issue changed nothing");
+});
+
+test("an edit can put material back on the shelf but can never draw the shelf down", async () => {
+  const w = await materialWorld(20, 250);
+
+  const record = await expectStatus(
+    await api("POST", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.fabric.id, orderId: w.order.orderId, quantityIssued: 20, quantityUsed: 20, notes: "Cutting the navy blazers" },
+    }),
+    201, "Issue twenty yards"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 0, "All twenty left the store");
+
+  // Four come back: the shelf rises, and stays honest.
+  await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 16, quantityReturned: 4, notes: "Four yards came back uncut" },
+    }),
+    200, "Return four yards"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 4, "Four are back on the shelf");
+
+  // Every way of trying to take MORE out through an edit is refused before stock moves.
+  const unReturn = await api("PUT", "/api/material-usage", {
+    cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 20, quantityReturned: 0, notes: "They were not usable after all" },
+  });
+  assert.equal(unReturn.status, 400, "A recorded return cannot be un-recorded");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 4, "so the shelf did not fall");
+
+  const overIssue = await api("PUT", "/api/material-usage", {
+    cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 24, notes: "Actually more was used" },
+  });
+  assert.equal(overIssue.status, 400, "An edit cannot claim more than the record was issued");
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 4, "and the shelf still did not fall");
+
+  // A genuine further return is still allowed, and still needs its own reason.
+  await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 14, quantityReturned: 6, notes: "Two more yards found uncut" },
+    }),
+    200, "Return two more yards"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.fabric.id), 6, "Six back in total - only ever the delta each time");
+});
+
+test("issuing a ready-made garment leaves raw-material stock alone in both directions", async () => {
+  const w = await readyMadeWorld(5000);
+  const before = await stockOf(w.owner.cookie, w.garment.id);
+
+  // A finished garment is bought, not drawn from a fabric shelf, so issuing one against a job
+  // has no shelf to empty - and the guard must not turn that into a refusal either.
+  const record = await expectStatus(
+    await api("POST", "/api/material-usage", {
+      cookie: w.owner.cookie,
+      body: { materialId: w.garment.id, orderId: w.order.orderId, quantityIssued: 4, quantityUsed: 4, notes: "Four bought-in polos monogrammed for this order" },
+    }),
+    201, "Charge four bought-in garments to the order"
+  );
+  assert.equal(record.totalCost, 4 * 5000, "The cost of the finished garments is charged to the job");
+  assert.equal(await stockOf(w.owner.cookie, w.garment.id), before, "No raw-material stock was drawn down");
+
+  // And returning one must not conjure finished goods onto a shelf that never held them.
+  await expectStatus(
+    await api("PUT", "/api/material-usage", {
+      cookie: w.owner.cookie, body: { id: record.id, quantityUsed: 3, quantityReturned: 1, notes: "One polo was the wrong size and went back" },
+    }),
+    200, "Send one back"
+  );
+  assert.equal(await stockOf(w.owner.cookie, w.garment.id), before, "Returning one did not create raw-material stock out of nothing");
+
+  const order = await api("GET", `/api/orders/${w.order.orderId}`, { cookie: w.owner.cookie });
+  const costs = (await expectStatus(order, 200, "Owner opens the order")).costs;
+  assert.equal(costs.readyMade, 3 * 5000, "Still classified as ready-made, and only for what was consumed");
+  assert.equal(costs.materials, 0, "never as a raw material");
+});

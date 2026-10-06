@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { asc, desc, eq } from "drizzle-orm";
 import { db } from "@/db";
+import { orderFulfilment } from "@/lib/production-control";
 import { customers, deliveries, deliveryLines, orderItems, orderItemSizes, orders, organizations, products } from "@/db/schema";
-import { guard, OWNER } from "@/lib/authz";
+import { guard, getSessionUser, OWNER } from "@/lib/authz";
 
 export const dynamic = "force-dynamic";
 
@@ -119,6 +120,20 @@ export async function POST(req: Request) {
   const denied = await guard(req, OWNER);
   if (denied) return denied;
   try {
+    /**
+     * The actor is the signed-in user, read from the session.
+     *
+     * Nothing here is taken from the request body: a caller must not be able to put somebody
+     * else's name on a receipt, a packing record or a delivery note, which is exactly what made
+     * payroll's `paidBy` worth fixing. Same derivation as `worker_payments.paid_by`,
+     * `stage_inspections.inspected_by` and the ledger's `actor_user_id` / `actor_name`.
+     *
+     * Stamped once, when the record is created, and never rewritten by a later edit - so it
+     * means WHO RECORDED THIS, not who last touched it. An edit is already OWNER-only on all
+     * three routes, and silently moving this column would change the meaning of rows that are
+     * already on somebody's filing cabinet.
+     */
+    const actor = await getSessionUser(req);
     const body: DeliveryInput = await req.json();
     const orderId = Number(body.orderId);
     if (!Number.isSafeInteger(orderId) || orderId < 1)
@@ -133,6 +148,26 @@ export async function POST(req: Request) {
     const ordered = items.reduce((sum, item) => sum + item.quantity, 0);
     if (alreadyDelivered + total > ordered)
       return NextResponse.json({ error: `Only ${Math.max(0, ordered - alreadyDelivered)} garments remain undelivered for this order.` }, { status: 400 });
+
+    /**
+     * And a delivery cannot run ahead of what production actually made and had approved.
+     *
+     * The check above is against what was ORDERED, which is a ceiling on the contract, not
+     * on the factory: an order of a hundred could be delivered in full with sixty approved
+     * garments and forty that never existed. The figure used here is the same derived
+     * `approved` the order page and the control board show, from the same `orderFulfilment`,
+     * so what management sees and what this route will allow cannot drift apart.
+     *
+     * An order that never entered production keeps the ordered ceiling it has always had, so
+     * a historical order or one satisfied off the floor still delivers exactly as before.
+     */
+    const fulfilment = await orderFulfilment(orderId);
+    if (fulfilment?.productionStarted && alreadyDelivered + total > fulfilment.ceiling) {
+      const stillDeliverable = Math.max(0, fulfilment.ceiling - alreadyDelivered);
+      return NextResponse.json({
+        error: `Production has approved ${fulfilment.approved} of the ${fulfilment.ordered} garments ordered, and ${alreadyDelivered} have already been delivered, so only ${stillDeliverable} more can be delivered. A delivery cannot run ahead of approved production - approve the work first, or correct the quantities with a reason if the ledger is wrong.`,
+      }, { status: 400 });
+    }
     const created = await db.transaction(async (tx) => {
       const [delivery] = await tx.insert(deliveries).values({
         orderId, deliveryDate: date, deliveredQuantity: total,
@@ -140,6 +175,8 @@ export async function POST(req: Request) {
         deliveryAddress: String(body.deliveryAddress ?? "").trim() || null,
         status: body.status === "PARTIAL" ? "PARTIAL" : "DELIVERED",
         notes: String(body.notes ?? "").trim() || null,
+        recordedById: actor?.id ?? null,
+        recordedByName: actor?.name ?? null,
       }).returning();
       await tx.insert(deliveryLines).values(prepared.map((line) => ({ ...line, deliveryId: delivery.id })));
       return delivery;

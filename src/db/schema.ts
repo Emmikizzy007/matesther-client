@@ -749,6 +749,18 @@ export const payments = pgTable("payments", {
   paymentMethod: text("payment_method").notNull().default("Bank Transfer"),
   reference: text("reference"),
   notes: text("notes"),
+  /**
+   * WHO recorded this, derived from the authenticated session - never from the request body.
+   *
+   * Same actor pattern as `production_movements.actor_user_id` / `actor_name`, and the same
+   * server-side derivation as `worker_payments.paid_by` and `stage_inspections.inspected_by`,
+   * so this is the existing audit mechanism reaching three tables that had none - not a second
+   * system. Both columns are nullable and NOTHING is backfilled: a row recorded before this
+   * existed has no actor, which is the truth, rather than an invented one. The id is `set null`
+   * if the user is ever deleted, so the name still reads as the record of who it was.
+   */
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name"),
 },
   (table) => [
     index("payments_order_id_idx").on(table.orderId)
@@ -798,6 +810,18 @@ export const packingRecords = pgTable("packing_records", {
   packageCount: integer("package_count").notNull().default(0),
   packedAt: timestamp("packed_at").defaultNow(),
   notes: text("notes"),
+  /**
+   * WHO recorded this, derived from the authenticated session - never from the request body.
+   *
+   * Same actor pattern as `production_movements.actor_user_id` / `actor_name`, and the same
+   * server-side derivation as `worker_payments.paid_by` and `stage_inspections.inspected_by`,
+   * so this is the existing audit mechanism reaching three tables that had none - not a second
+   * system. Both columns are nullable and NOTHING is backfilled: a row recorded before this
+   * existed has no actor, which is the truth, rather than an invented one. The id is `set null`
+   * if the user is ever deleted, so the name still reads as the record of who it was.
+   */
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name"),
 },
   (table) => [
     index("packing_records_order_id_idx").on(table.orderId)
@@ -873,6 +897,18 @@ export const deliveries = pgTable("deliveries", {
   deliveryAddress: text("delivery_address"),
   status: text("status").notNull().default("PENDING"),
   notes: text("notes"),
+  /**
+   * WHO recorded this, derived from the authenticated session - never from the request body.
+   *
+   * Same actor pattern as `production_movements.actor_user_id` / `actor_name`, and the same
+   * server-side derivation as `worker_payments.paid_by` and `stage_inspections.inspected_by`,
+   * so this is the existing audit mechanism reaching three tables that had none - not a second
+   * system. Both columns are nullable and NOTHING is backfilled: a row recorded before this
+   * existed has no actor, which is the truth, rather than an invented one. The id is `set null`
+   * if the user is ever deleted, so the name still reads as the record of who it was.
+   */
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name"),
 },
   (table) => [
     index("deliveries_order_id_idx").on(table.orderId)

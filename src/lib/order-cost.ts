@@ -293,6 +293,23 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     orderRows.map((row) => [row.id, Number(row.totalAmount) || 0])
   );
 
+  /**
+   * A note on every `where(scope ? inArray(...) : isNotNull(...))` below.
+   *
+   * These used to be `and(isNotNull(col), scope ? inArray(col, scope) : undefined)`, which
+   * is the same predicate written twice: `col IN (1,2,3)` can never be true for a NULL col,
+   * so the not-null test adds nothing when a scope is present. It was not harmless, though.
+   * pg-mem - the in-memory database the test suite runs against - returns NO ROWS for
+   * `IS NOT NULL` combined with `IN (...)` on a nullable column, so with a scope in place
+   * the materials, ready-made, support and expense buckets all came back empty and every
+   * single-order cost test silently measured zero. `production_batches.order_id` is NOT
+   * NULL, which is why the labour bucket was immune and the bug went unnoticed: the one
+   * bucket that was covered was the one that could not fail.
+   *
+   * In Postgres the two forms are identical, so this changes no production figure. What it
+   * changes is that these cost lines can now actually be asserted.
+   */
+
   /* ---- 2. material consumed on the order ---- */
   const usageRows = await db
     .select({
@@ -303,7 +320,7 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     })
     .from(materialUsage)
     .leftJoin(materials, eq(materials.id, materialUsage.materialId))
-    .where(and(isNotNull(materialUsage.orderId), scope ? inArray(materialUsage.orderId, scope) : undefined))
+    .where(scope ? inArray(materialUsage.orderId, scope) : isNotNull(materialUsage.orderId))
     .groupBy(materialUsage.orderId);
   for (const row of usageRows) {
     const orderId = Number(row.orderId);
@@ -327,12 +344,9 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     .leftJoin(productionOperations, eq(productionOperations.id, materialPurchases.productionOperationId))
     .leftJoin(productionBatches, eq(productionBatches.id, productionOperations.productionBatchId))
     .where(
-      and(
-        or(isNotNull(materialPurchases.orderId), isNotNull(productionBatches.orderId)),
-        scope
-          ? or(inArray(materialPurchases.orderId, scope), inArray(productionBatches.orderId, scope))
-          : undefined
-      )
+      scope
+        ? or(inArray(materialPurchases.orderId, scope), inArray(productionBatches.orderId, scope))
+        : or(isNotNull(materialPurchases.orderId), isNotNull(productionBatches.orderId))
     )
     .groupBy(sql`coalesce(${materialPurchases.orderId}, ${productionBatches.orderId})`);
   for (const row of purchaseRows) {
@@ -357,7 +371,7 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     // The pieces belong to whoever the inspection was attributed to; where a stage was
     // never split that is the stage's own worker, exactly as payroll resolves it.
     .innerJoin(workers, eq(workers.id, sql`coalesce(${stageInspections.workerId}, ${productionOperations.workerId})`))
-    .where(and(isNotNull(productionBatches.orderId), scope ? inArray(productionBatches.orderId, scope) : undefined))
+    .where(scope ? inArray(productionBatches.orderId, scope) : isNotNull(productionBatches.orderId))
     .groupBy(productionBatches.orderId);
   for (const row of labourRows) {
     const orderId = Number(row.orderId);
@@ -381,12 +395,9 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     .leftJoin(productionOperations, eq(productionOperations.id, supportAssignments.productionOperationId))
     .leftJoin(productionBatches, eq(productionBatches.id, productionOperations.productionBatchId))
     .where(
-      and(
-        or(isNotNull(supportAssignments.orderId), isNotNull(productionBatches.orderId)),
-        scope
-          ? or(inArray(supportAssignments.orderId, scope), inArray(productionBatches.orderId, scope))
-          : undefined
-      )
+      scope
+        ? or(inArray(supportAssignments.orderId, scope), inArray(productionBatches.orderId, scope))
+        : or(isNotNull(supportAssignments.orderId), isNotNull(productionBatches.orderId))
     )
     .groupBy(sql`coalesce(${supportAssignments.orderId}, ${productionBatches.orderId})`);
   for (const row of supportRows) {
@@ -412,7 +423,7 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
     })
     .from(externalWorkOrders)
     .innerJoin(productionBatches, eq(productionBatches.id, externalWorkOrders.productionBatchId))
-    .where(and(isNotNull(productionBatches.orderId), scope ? inArray(productionBatches.orderId, scope) : undefined))
+    .where(scope ? inArray(productionBatches.orderId, scope) : isNotNull(productionBatches.orderId))
     .groupBy(productionBatches.orderId);
   for (const row of externalRows) {
     const orderId = Number(row.orderId);
@@ -428,7 +439,7 @@ export async function orderCosts(orderIds?: number[]): Promise<Map<number, Order
       amount: sql<number>`coalesce(sum(coalesce(${expenses.amount}, 0)), 0)`,
     })
     .from(expenses)
-    .where(and(isNotNull(expenses.orderId), scope ? inArray(expenses.orderId, scope) : undefined))
+    .where(scope ? inArray(expenses.orderId, scope) : isNotNull(expenses.orderId))
     .groupBy(expenses.orderId, expenses.category);
   for (const row of expenseRows) {
     const orderId = Number(row.orderId);

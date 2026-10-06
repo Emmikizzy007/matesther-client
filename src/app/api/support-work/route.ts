@@ -12,9 +12,10 @@ import {
   orderItems,
   products,
   productionAllocations,
+  orderItemSizes,
 } from "@/db/schema";
 import { guard, getSessionUser, getLinkedWorkerId, ANYONE } from "@/lib/authz";
-import { SUPPORT_OPERATIONS, SUPPORT_ROLE, sameRole } from "@/lib/format";
+import { SUPPORT_OPERATIONS, SUPPORT_ROLE, sameRole, variantLabel } from "@/lib/format";
 import { workerHoldsRole } from "@/lib/worker-roles";
 import {
   supportPending,
@@ -122,9 +123,32 @@ export async function GET(req: Request) {
       ? await db.select({ id: orderItems.id, productId: orderItems.productId }).from(orderItems).where(inArray(orderItems.id, itemIds))
       : [];
     const productIds = [...new Set(items.map((item) => item.productId).filter((v): v is number => !!v))];
-    const garments = productIds.length
-      ? await db.select({ id: products.id, name: products.name }).from(products).where(inArray(products.id, productIds))
+    // The exact variant and, where the work was handed out from a named share, that
+    // share - so a helper is told WHICH garment and whose work they are supporting
+    // rather than being shown a whole order's quantity.
+    const variantIds = [...new Set(assignments.map((row) => row.orderVariantId).filter((v): v is number => !!v))];
+    const shareIds = [...new Set(assignments.map((row) => row.productionAllocationId).filter((v): v is number => !!v))];
+    const [garments, variantRows, shareRows] = await Promise.all([
+      productIds.length
+        ? db.select({ id: products.id, name: products.name }).from(products).where(inArray(products.id, productIds))
+        : Promise.resolve([] as { id: number; name: string }[]),
+      variantIds.length
+        ? db.select({ id: orderItemSizes.id, size: orderItemSizes.size, color: orderItemSizes.color, quantity: orderItemSizes.quantity })
+            .from(orderItemSizes).where(inArray(orderItemSizes.id, variantIds))
+        : Promise.resolve([] as { id: number; size: string | null; color: string | null; quantity: number }[]),
+      shareIds.length
+        ? db.select({
+            id: productionAllocations.id, workerId: productionAllocations.workerId,
+            quantityAllocated: productionAllocations.quantityAllocated, stage: productionAllocations.stage,
+          }).from(productionAllocations).where(inArray(productionAllocations.id, shareIds))
+        : Promise.resolve([] as { id: number; workerId: number; quantityAllocated: number; stage: string }[]),
+    ]);
+    // The tailor holding each share, named so the helper knows whose work it is.
+    const shareHolderIds = [...new Set(shareRows.map((row) => row.workerId))];
+    const shareHolders = shareHolderIds.length
+      ? await db.select({ id: workers.id, name: workers.name }).from(workers).where(inArray(workers.id, shareHolderIds))
       : [];
+    const shareHolderById = new Map(shareHolders.map((person) => [person.id, person.name]));
 
     const personById = new Map(people.map((person) => [person.id, person]));
     const orderById = new Map(orderRows.map((order) => [order.id, order]));
@@ -133,14 +157,29 @@ export async function GET(req: Request) {
     const batchById = new Map(batches.map((batch) => [batch.id, batch]));
     const itemById = new Map(items.map((item) => [item.id, item]));
     const productById = new Map(garments.map((garment) => [garment.id, garment]));
+    const variantById = new Map(variantRows.map((variant) => [variant.id, variant]));
+    const shareById = new Map(shareRows.map((share) => [share.id, share]));
 
     const rows = assignments.map((row) => {
       const parent = row.productionOperationId ? opById.get(row.productionOperationId) : undefined;
       const batch = parent ? batchById.get(parent.productionBatchId) : undefined;
       const order = row.orderId ? orderById.get(row.orderId) : undefined;
-      const garment = batch?.orderItemId
-        ? productById.get(itemById.get(batch.orderItemId)?.productId ?? -1)
-        : undefined;
+      // The garment comes from the assignment's own inherited item first, and falls back
+      // to the batch's, so support work recorded before the inheritance existed still
+      // names its garment.
+      const itemId = row.orderItemId ?? batch?.orderItemId ?? null;
+      const garment = itemId ? productById.get(itemById.get(itemId)?.productId ?? -1) : undefined;
+      const variant = row.orderVariantId ? variantById.get(row.orderVariantId) : undefined;
+      const share = row.productionAllocationId ? shareById.get(row.productionAllocationId) : undefined;
+      // The exact variant is the size and colour the ORDER specified. The batch's own
+      // size/colour text is the older, free-text answer and is only a fallback.
+      const size = variant?.size ?? batch?.size ?? null;
+      const color = variant?.color ?? batch?.color ?? null;
+      const variantParts = [size, color].filter((value): value is string => !!value && String(value).trim() !== "");
+      // The house rendering of a variant, the same one the production board, the
+      // operations list and the worker's dashboard use, so a helper reading "Navy •
+      // Size 10" here sees the same words everywhere else in the system.
+      const variantText = variantParts.length ? variantLabel(size, color) : null;
       return {
         ...row,
         supportWorker: personById.get(row.workerId)?.name ?? "-",
@@ -148,11 +187,29 @@ export async function GET(req: Request) {
         approvedBy: row.approvedByWorkerId ? personById.get(row.approvedByWorkerId)?.name ?? "-" : null,
         orderNumber: order?.orderNumber ?? "-",
         customer: order?.customerId ? customerById.get(order.customerId)?.name ?? "-" : "-",
-        stage: parent?.stage ?? null,
+        // The stage inherited onto the assignment when it was handed out, else the parent
+        // stage job's. Never retyped by the helper and never guessed.
+        stage: row.stage ?? parent?.stage ?? share?.stage ?? null,
         batchNumber: batch?.batchNumber ?? null,
-        size: batch?.size ?? null,
-        color: batch?.color ?? null,
+        size,
+        color,
+        variant: variantText,
+        variantQuantity: variant?.quantity ?? null,
         garment: garment?.name ?? null,
+        /**
+         * The exact share this support work was handed out from, when there is one:
+         * whose work it is and how big that share is. A helper is never shown a whole
+         * order's quantity when an exact production allocation exists behind their work.
+         */
+        allocation: share
+          ? {
+              id: share.id,
+              stage: share.stage,
+              holderWorkerId: share.workerId,
+              holder: shareHolderById.get(share.workerId) ?? personById.get(share.workerId)?.name ?? "-",
+              quantityAllocated: share.quantityAllocated,
+            }
+          : null,
         pending: supportPending(row),
       };
     });

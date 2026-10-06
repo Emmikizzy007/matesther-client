@@ -27,7 +27,18 @@ export default function MaterialsPage({
   const [purModal, setPurModal] = useState(false);
   const [purForm, setPurForm] = useState({ materialId: "", supplier: "", quantity: "", unitCost: "", purchaseDate: new Date().toISOString().slice(0, 10), orderId: "", notes: "" });
   const [useModal, setUseModal] = useState(false);
-  const [useForm, setUseForm] = useState({ materialId: "", orderId: "", quantityUsed: "", unitCost: "" });
+  /**
+   * What left the store, and what happened to all of it.
+   *
+   * `quantityIssued` is optional on purpose: leaving it blank means "issued equals used",
+   * which is what every usage record made before this field existed means, so no
+   * historical figure is restated by having somewhere to type it.
+   */
+  const [useForm, setUseForm] = useState({
+    materialId: "", orderId: "", quantityIssued: "", quantityUsed: "",
+    quantityReturned: "", quantityWasted: "", workerId: "", unitCost: "", notes: "",
+  });
+  const [people, setPeople] = useState<any[]>([]);
   const [err, setErr] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -38,12 +49,15 @@ export default function MaterialsPage({
       fetch("/api/material-purchases", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/material-usage", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/orders", { cache: "no-store" }).then((r) => r.json()),
+      // Slim list, for naming who took the material out of the store.
+      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
     ])
-      .then(([m, p, u, o]) => {
+      .then(([m, p, u, o, w]) => {
         setMats(Array.isArray(m) ? m : []);
         setPurchases(Array.isArray(p) ? p : []);
         setUsage(Array.isArray(u) ? u : []);
         setOrders(Array.isArray(o) ? o : []);
+        setPeople(Array.isArray(w) ? w : []);
       })
       .finally(() => setLoading(false));
   }
@@ -79,7 +93,7 @@ export default function MaterialsPage({
         subtitle={`Fabric, thread, elastic, buttons & supplies - total stock value ${naira(totalStockValue)}`}
         action={
           <>
-            <Btn variant="secondary" onClick={() => { setErr(""); setUseForm({ materialId: "", orderId: "", quantityUsed: "", unitCost: "" }); setUseModal(true); }}>Record Usage</Btn>
+            <Btn variant="secondary" onClick={() => { setErr(""); setUseForm({ materialId: "", orderId: "", quantityIssued: "", quantityUsed: "", quantityReturned: "", quantityWasted: "", workerId: "", unitCost: "", notes: "" }); setUseModal(true); }}>Record Usage</Btn>
             <Btn variant="secondary" onClick={() => { setErr(""); setPurForm({ materialId: "", supplier: "", quantity: "", unitCost: "", purchaseDate: new Date().toISOString().slice(0, 10), orderId: "", notes: "" }); setPurModal(true); }}>Record Purchase</Btn>
             <Btn onClick={() => { setEditing(null); setMatForm({ name: "", category: "Fabric", unit: "pcs", currentStock: "", reorderLevel: "", unitCost: "" }); setErr(""); setMatModal(true); }}>
               <Plus className="w-4 h-4" /> Add Material
@@ -192,23 +206,53 @@ export default function MaterialsPage({
 
       {tab === "usage" && (
         <Card>
-          <CardHeader title="Material usage" subtitle="What was actually consumed - charged to each order's cost" />
+          <CardHeader
+            title="Material usage"
+            subtitle="What left the store, what happened to all of it, and what it cost the order - used and wasted are both charged, returned is not"
+          />
           <div className="overflow-x-auto slim-scroll">
-            <table className="w-full text-sm min-w-[760px]">
-              <thead><tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100"><th className="px-5 py-3">Date</th><th className="px-3 py-3">Material</th><th className="px-3 py-3">Order</th><th className="px-3 py-3 text-right">Qty Used</th><th className="px-3 py-3 text-right">Cost</th></tr></thead>
+            <table className="w-full text-sm min-w-[1080px]">
+              <thead>
+                <tr className="text-left text-[11px] uppercase text-slate-500 border-b border-slate-100">
+                  <th className="px-5 py-3">Date</th>
+                  <th className="px-3 py-3">Material</th>
+                  <th className="px-3 py-3">Order</th>
+                  <th className="px-3 py-3 text-right">Issued</th>
+                  <th className="px-3 py-3 text-right">Used</th>
+                  <th className="px-3 py-3 text-right">Returned</th>
+                  <th className="px-3 py-3 text-right">Wasted</th>
+                  <th className="px-3 py-3 text-right">Cost</th>
+                  <th className="px-3 py-3">Taken by</th>
+                  <th className="px-3 py-3">Reason</th>
+                </tr>
+              </thead>
               <tbody className="divide-y divide-slate-50">
                 {usage.map((u) => (
                   <tr key={u.id} className="hover:bg-slate-50">
-                    <td className="px-5 py-3">{fmtDate(u.usedAt)}</td>
+                    <td className="px-5 py-3 whitespace-nowrap">{fmtDate(u.usedAt)}</td>
                     <td className="px-3 py-3 font-medium">{u.materialName}</td>
-                    <td className="px-3 py-3">{u.orderNumber}</td>
-                    <td className="px-3 py-3 text-right">{u.quantityUsed} {u.unit} × {naira(u.unitCost)}</td>
-                    <td className="px-3 py-3 text-right font-bold">{naira(u.totalCost)}</td>
+                    <td className="px-3 py-3 text-xs">
+                      {u.orderNumber ?? "—"}
+                      {u.variant && <span className="block text-slate-500">{u.variant}</span>}
+                    </td>
+                    {/* A blank issued figure means issued equals used, which is what every
+                        record made before the field existed means. Printed as the used
+                        figure rather than as a dash, so the column still adds up. */}
+                    <td className="px-3 py-3 text-right">{u.quantityIssued ?? u.quantityUsed} {u.unit}</td>
+                    <td className="px-3 py-3 text-right">{u.quantityUsed} × {naira(u.unitCost)}</td>
+                    <td className="px-3 py-3 text-right">{u.quantityReturned ? <span className="text-emerald-700">{u.quantityReturned}</span> : "-"}</td>
+                    <td className="px-3 py-3 text-right">{u.quantityWasted ? <span className="text-red-700">{u.quantityWasted}</span> : "-"}</td>
+                    <td className="px-3 py-3 text-right font-bold" title="Used plus wasted, at the unit cost. Returned material goes back into stock and is not charged to the order.">
+                      {naira(u.totalCost)}
+                      {(u.wastedCost ?? 0) > 0 && <span className="block text-[11px] font-normal text-red-600">incl. {naira(u.wastedCost)} wasted</span>}
+                    </td>
+                    <td className="px-3 py-3 text-xs">{u.workerName ?? "—"}</td>
+                    <td className="px-3 py-3 text-xs text-slate-600 max-w-[220px]">{u.notes ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            {usage.length === 0 && <EmptyState title="No usage recorded" />}
+            {usage.length === 0 && <EmptyState title="No usage recorded" hint="Issue material against an order here and what is used, returned and wasted is charged to that order's cost." />}
           </div>
         </Card>
       )}
@@ -307,8 +351,13 @@ export default function MaterialsPage({
             const ok = await submit("/api/material-usage", {
               materialId: Number(useForm.materialId),
               orderId: Number(useForm.orderId),
+              quantityIssued: useForm.quantityIssued === "" ? undefined : Number(useForm.quantityIssued),
               quantityUsed: Number(useForm.quantityUsed),
+              quantityReturned: useForm.quantityReturned === "" ? 0 : Number(useForm.quantityReturned),
+              quantityWasted: useForm.quantityWasted === "" ? 0 : Number(useForm.quantityWasted),
+              workerId: useForm.workerId === "" ? undefined : Number(useForm.workerId),
               unitCost: useForm.unitCost === "" ? undefined : Number(useForm.unitCost),
+              notes: useForm.notes.trim() || undefined,
             }, "POST");
             if (ok) { setUseModal(false); load(); }
           }}
@@ -329,8 +378,27 @@ export default function MaterialsPage({
               {orders.filter((o) => o.status !== "CANCELLED").map((o) => <option key={o.id} value={o.id}>{o.orderNumber} - {o.customer}</option>)}
             </select>
           </Field>
+          <Field label="Quantity issued"><input type="number" min="0" value={useForm.quantityIssued} onChange={(e) => setUseForm({ ...useForm, quantityIssued: e.target.value })} className={inputCls} placeholder="Blank = issued equals used" /></Field>
           <Field label="Quantity used *"><input type="number" min="1" required value={useForm.quantityUsed} onChange={(e) => setUseForm({ ...useForm, quantityUsed: e.target.value })} className={inputCls} /></Field>
+          <Field label="Returned unused"><input type="number" min="0" value={useForm.quantityReturned} onChange={(e) => setUseForm({ ...useForm, quantityReturned: e.target.value })} className={inputCls} /></Field>
+          <Field label="Wasted / written off"><input type="number" min="0" value={useForm.quantityWasted} onChange={(e) => setUseForm({ ...useForm, quantityWasted: e.target.value })} className={inputCls} /></Field>
+          <Field label="Taken by">
+            <select value={useForm.workerId} onChange={(e) => setUseForm({ ...useForm, workerId: e.target.value })} className={inputCls}>
+              <option value="">Not recorded</option>
+              {people.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}
+            </select>
+          </Field>
           <Field label="Unit cost (₦)"><input type="number" min="0" value={useForm.unitCost} onChange={(e) => setUseForm({ ...useForm, unitCost: e.target.value })} className={inputCls} /></Field>
+          <Field label="Reason / notes" className="sm:col-span-2">
+            <textarea rows={2} value={useForm.notes} onChange={(e) => setUseForm({ ...useForm, notes: e.target.value })} className={inputCls} placeholder="Required if anything was returned or written off, so the figure can be audited" />
+          </Field>
+          <p className="sm:col-span-2 rounded-lg bg-slate-50 p-2.5 text-[11px] text-slate-600">
+            Used plus returned plus wasted can never exceed what was issued, and anything
+            returned or written off needs a written reason. The order is charged for what was
+            USED and what was WASTED; what came back goes into stock and is not charged.
+            Leaving &ldquo;issued&rdquo; blank records it the way every older record reads -
+            issued equals used - so no historical figure changes.
+          </p>
           {err && <p className="sm:col-span-2 text-sm text-red-600">{err}</p>}
           <div className="sm:col-span-2 flex justify-end gap-2">
             <Btn variant="secondary" onClick={() => setUseModal(false)}>Cancel</Btn>

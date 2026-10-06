@@ -61,6 +61,7 @@ const MIGRATIONS = [
   "0007_variants_routes_and_external_work",
   "0008_production_allocations",
   "0009_support_cost_and_material_detail",
+  "0010_actor_audit",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 

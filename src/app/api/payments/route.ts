@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { guard, OWNER } from "@/lib/authz";
+import { guard, getSessionUser, OWNER } from "@/lib/authz";
 import { db } from "@/db";
 import { payments, orders, customers } from "@/db/schema";
 import { eq, desc } from "drizzle-orm";
@@ -37,6 +37,20 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
   try {
+    /**
+     * The actor is the signed-in user, read from the session.
+     *
+     * Nothing here is taken from the request body: a caller must not be able to put somebody
+     * else's name on a receipt, a packing record or a delivery note, which is exactly what made
+     * payroll's `paidBy` worth fixing. Same derivation as `worker_payments.paid_by`,
+     * `stage_inspections.inspected_by` and the ledger's `actor_user_id` / `actor_name`.
+     *
+     * Stamped once, when the record is created, and never rewritten by a later edit - so it
+     * means WHO RECORDED THIS, not who last touched it. An edit is already OWNER-only on all
+     * three routes, and silently moving this column would change the meaning of rows that are
+     * already on somebody's filing cabinet.
+     */
+    const actor = await getSessionUser(req);
     const b = await req.json();
     if (!b.orderId) return NextResponse.json({ error: "Order is required" }, { status: 400 });
     if (!b.amount || Number(b.amount) <= 0)
@@ -50,6 +64,8 @@ export async function POST(req: Request) {
         paymentMethod: b.paymentMethod || "Bank Transfer",
         reference: b.reference || null,
         notes: b.notes || null,
+        recordedById: actor?.id ?? null,
+        recordedByName: actor?.name ?? null,
       })
       .returning();
     await refreshOrderMoney(Number(b.orderId));

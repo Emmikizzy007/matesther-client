@@ -7,6 +7,7 @@ import {
   orders,
   customers,
   orderItems,
+  orderItemSizes,
   products,
   stageInspections,
   supportAssignments,
@@ -194,11 +195,130 @@ export async function getWorkerDashboard(user: SessionUser) {
     ? await db.select().from(supportInspections).where(inArray(supportInspections.supportAssignmentId, supportIds))
     : [];
   const supportById = new Map(supportRows.map((row) => [row.id, row]));
+
+  /**
+   * The EXACT garment behind each piece of support work: school, order, item, size,
+   * colour, variant, stage, and the share it was handed out from.
+   *
+   * A helper used to see the label "Support work" with no order number against it, which
+   * is exactly the generic whole-order view this must never be. Every field below is
+   * inherited from a record that already exists - the assignment's own order, item,
+   * variant and stage columns, the parent stage job's batch, and the production
+   * allocation the assignment names - so the helper sees the same exact garment the
+   * tailor handed out, and never a quantity larger than their own.
+   */
+  const supportOrderIds = [...new Set(supportRows.map((row) => row.orderId).filter((v): v is number => !!v))];
+  const supportOpIds = [...new Set(supportRows.map((row) => row.productionOperationId).filter((v): v is number => !!v))];
+  const supportVariantIds = [...new Set(supportRows.map((row) => row.orderVariantId).filter((v): v is number => !!v))];
+  const supportItemIds = [...new Set(supportRows.map((row) => row.orderItemId).filter((v): v is number => !!v))];
+  const supportShareIds = [...new Set(supportRows.map((row) => row.productionAllocationId).filter((v): v is number => !!v))];
+  const [supportOrders, supportOps, supportVariants, supportItems, supportShares] = await Promise.all([
+    supportOrderIds.length
+      ? db.select({ id: orders.id, orderNumber: orders.orderNumber, customerId: orders.customerId, dueDate: orders.dueDate })
+          .from(orders).where(inArray(orders.id, supportOrderIds))
+      : [],
+    supportOpIds.length
+      ? db.select({
+          id: productionOperations.id, stage: productionOperations.stage, method: productionOperations.method,
+          productionBatchId: productionOperations.productionBatchId,
+        }).from(productionOperations).where(inArray(productionOperations.id, supportOpIds))
+      : [],
+    supportVariantIds.length
+      ? db.select({ id: orderItemSizes.id, size: orderItemSizes.size, color: orderItemSizes.color, quantity: orderItemSizes.quantity })
+          .from(orderItemSizes).where(inArray(orderItemSizes.id, supportVariantIds))
+      : [],
+    supportItemIds.length
+      ? db.select({ id: orderItems.id, productId: orderItems.productId }).from(orderItems).where(inArray(orderItems.id, supportItemIds))
+      : [],
+    supportShareIds.length
+      ? db.select({
+          id: productionAllocations.id, workerId: productionAllocations.workerId, stage: productionAllocations.stage,
+          quantityAllocated: productionAllocations.quantityAllocated,
+        }).from(productionAllocations).where(inArray(productionAllocations.id, supportShareIds))
+      : [],
+  ]);
+  const supportBatchIds = [...new Set(supportOps.map((op) => op.productionBatchId))];
+  const supportCustomerIds = [...new Set(supportOrders.map((order) => order.customerId).filter((v): v is number => !!v))];
+  const supportProductIds = [...new Set(supportItems.map((item) => item.productId).filter((v): v is number => !!v))];
+  const supportHolderIds = [...new Set(supportShares.map((share) => share.workerId))];
+  const [supportBatches, supportCustomers, supportProducts, supportHolders] = await Promise.all([
+    supportBatchIds.length
+      ? db.select({ id: productionBatches.id, batchNumber: productionBatches.batchNumber, size: productionBatches.size,
+          color: productionBatches.color, orderItemId: productionBatches.orderItemId })
+          .from(productionBatches).where(inArray(productionBatches.id, supportBatchIds))
+      : [],
+    supportCustomerIds.length
+      ? db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, supportCustomerIds))
+      : [],
+    supportProductIds.length
+      ? db.select({ id: products.id, name: products.name }).from(products).where(inArray(products.id, supportProductIds))
+      : [],
+    supportHolderIds.length
+      ? db.select({ id: workers.id, name: workers.name }).from(workers).where(inArray(workers.id, supportHolderIds))
+      : [],
+  ]);
+  const supportOrderById = new Map(supportOrders.map((row) => [row.id, row]));
+  const supportOpById = new Map(supportOps.map((row) => [row.id, row]));
+  const supportVariantById = new Map(supportVariants.map((row) => [row.id, row]));
+  const supportShareById = new Map(supportShares.map((row) => [row.id, row]));
+  const supportBatchById = new Map(supportBatches.map((row) => [row.id, row]));
+  const supportCustomerById = new Map(supportCustomers.map((row) => [row.id, row]));
+  const supportProductById = new Map(supportProducts.map((row) => [row.id, row]));
+  // id -> NAME, not id -> row: `holder` is printed on the helper's screen, so handing it
+  // a whole record would render as an object and leak the worker's other columns with it.
+  const supportHolderById = new Map<number, string>(supportHolders.map((row) => [row.id, row.name]));
+  // The batch may name the item where the assignment does not, so both routes are kept.
+  const supportItemIdsFromBatches = [...new Set(
+    supportBatches.map((batch) => batch.orderItemId).filter((v): v is number => !!v)
+  )].filter((id) => !supportItemIds.includes(id));
+  const extraItems = supportItemIdsFromBatches.length
+    ? await db.select({ id: orderItems.id, productId: orderItems.productId }).from(orderItems).where(inArray(orderItems.id, supportItemIdsFromBatches))
+    : [];
+  const supportItemById = new Map<number, { id: number; productId: number | null }>(
+    [...supportItems, ...extraItems].map((row) => [row.id, row])
+  );
+
+  /** The exact context of one support assignment, inherited and never retyped. */
+  function supportContext(row: typeof supportRows[number]) {
+    const operation = row.productionOperationId ? supportOpById.get(row.productionOperationId) : undefined;
+    const batch = operation ? supportBatchById.get(operation.productionBatchId) : undefined;
+    const order = row.orderId ? supportOrderById.get(row.orderId) : undefined;
+    const variant = row.orderVariantId ? supportVariantById.get(row.orderVariantId) : undefined;
+    const share = row.productionAllocationId ? supportShareById.get(row.productionAllocationId) : undefined;
+    const itemId = row.orderItemId ?? batch?.orderItemId ?? null;
+    const product = itemId ? supportProductById.get(supportItemById.get(itemId)?.productId ?? -1) : undefined;
+    const size = variant?.size ?? batch?.size ?? null;
+    const color = variant?.color ?? batch?.color ?? null;
+    return {
+      orderNumber: order?.orderNumber ?? "",
+      school: order?.customerId ? supportCustomerById.get(order.customerId)?.name ?? "" : "",
+      dueDate: order?.dueDate ? String(order.dueDate).slice(0, 10) : null,
+      batchNumber: batch?.batchNumber ?? null,
+      product: product?.name ?? null,
+      size,
+      color,
+      variant: variantLabel(size, color),
+      variantQuantity: variant?.quantity ?? null,
+      stage: row.stage ?? operation?.stage ?? share?.stage ?? null,
+      method: operation?.method ?? null,
+      /** Whose share of the stage this support work was handed out from, and how big it is. */
+      allocation: share
+        ? {
+            id: share.id,
+            stage: share.stage,
+            holder: supportHolderById.get(share.workerId) ?? null,
+            quantityAllocated: share.quantityAllocated,
+          }
+        : null,
+    };
+  }
   const supportEvents = supportChecks
     .filter((check) => check.quantityApproved > 0 && perPiece)
     .map((check) => {
       const assignment = supportById.get(check.supportAssignmentId);
       const rate = inspectionPieceRate(check, assignment ?? { pieceRate: null }, profile);
+      // Resolved once per inspection, not once per field.
+      const context = assignment ? supportContext(assignment) : null;
       return {
         id: check.id,
         source: "SUPPORT" as const,
@@ -207,10 +327,12 @@ export async function getWorkerDashboard(user: SessionUser) {
         quantityApproved: check.quantityApproved,
         pieceRate: rate,
         amount: check.quantityApproved * rate,
-        stage: assignment?.operation ?? "Support work",
-        orderNumber: "",
-        batchNumber: "",
-        customer: "Support work",
+        // The helper's own earnings journal names the real garment and the real school,
+        // not a generic "Support work" line with no order behind it.
+        stage: context ? `${context.stage ?? ""} ${assignment?.operation ?? ""}`.trim() : "Support work",
+        orderNumber: context?.orderNumber ?? "",
+        batchNumber: context?.batchNumber ?? "",
+        customer: context?.school || "Support work",
       };
     });
 
@@ -243,6 +365,7 @@ export async function getWorkerDashboard(user: SessionUser) {
     // Their own support work: what was handed to them and what was approved.
     supportJobs: supportRows.map((row) => ({
       ...row,
+      ...supportContext(row),
       pending: Math.max(
         0,
         row.quantitySubmitted - (row.quantityApproved + row.quantityRejected + row.quantityRework)
