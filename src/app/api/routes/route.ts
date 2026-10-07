@@ -4,7 +4,7 @@ import { productionBatches, productionRouteStages, productionRoutes, products } 
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
 import { PRODUCTION_METHODS, STAGES } from "@/lib/format";
-import { listRoutes, normaliseStages, unknownMethods, unknownStages, type RouteStage } from "@/lib/production-route";
+import { isAutomaticRoute, listRoutes, normaliseStages, unknownMethods, unknownStages, type RouteStage } from "@/lib/production-route";
 
 export const dynamic = "force-dynamic";
 
@@ -22,29 +22,59 @@ export const dynamic = "force-dynamic";
  * route allows stages to be replaced freely.
  */
 
-/** GET /api/routes?productId= - every route with its stages, for the editor. */
+/**
+ * GET /api/routes?productId=&activeOnly=1 - routes with their stages, for the editor.
+ *
+ * `productId` absent  -> every route this organisation owns.
+ * `productId=` (empty) -> organization-level routes only (no product).
+ * `productId=7`       -> product 7's routes.
+ *
+ * The organisation filter is pushed into `listRoutes` rather than applied to the
+ * result, so another company's routes are never read at all - previously every
+ * route in the database was selected and then filtered in JavaScript, which both
+ * leaked the read and grew with the whole table.
+ */
 export async function GET(req: Request) {
   const denied = await guard(req, STAFF);
   if (denied) return denied;
   try {
     const session = await getSessionUser(req);
     const query = new URL(req.url).searchParams;
-    const productId = query.get("productId") ? Number(query.get("productId")) : undefined;
-    const routes = await listRoutes(productId ?? null);
-    const ownOrganization = routes.filter(
-      (route) => !route.organizationId || route.organizationId === session?.organizationId
-    );
-    const productIds = [...new Set(ownOrganization.map((route) => route.productId).filter((v): v is number => !!v))];
+    const rawProductId = query.get("productId");
+    // A malformed productId is refused rather than quietly widened to "every route".
+    if (rawProductId !== null && rawProductId.trim() !== "" && !/^\d+$/.test(rawProductId.trim()))
+      return NextResponse.json({ error: "Choose a valid garment." }, { status: 400 });
+    const productId = rawProductId === null
+      ? undefined
+      : rawProductId.trim() === ""
+        ? null
+        : Number(rawProductId.trim());
+    const routes = await listRoutes({
+      productId,
+      organizationId: session?.organizationId ?? null,
+      activeOnly: query.get("activeOnly") === "1",
+    });
+    const productIds = [...new Set(routes.map((route) => route.productId).filter((v): v is number => !!v))];
     const garments = productIds.length
       ? await db.select({ id: products.id, name: products.name }).from(products).where(inArray(products.id, productIds))
       : [];
     const garmentById = new Map(garments.map((row) => [row.id, row.name]));
     return NextResponse.json(
-      ownOrganization.map((route) => ({
+      routes.map((route) => ({
         ...route,
         productName: route.productId ? garmentById.get(route.productId) ?? null : null,
         // What a NEW batch would follow if it used this route.
         applicableStages: route.stages.map((stage) => stage.stage),
+        /**
+         * Whether a new batch of this garment would actually FOLLOW this route.
+         *
+         * A route can be saved against a product and still not be the one used -
+         * it may be retired, another of the product's routes may be flagged as its
+         * default, or two unflagged routes may leave nothing to choose between.
+         * Saying so on the row is what stops the screen showing a product route
+         * that production silently ignores, which is how this bug was first seen.
+         */
+        usedForNewBatches: isAutomaticRoute(route, routes),
       })),
       { headers: { "Cache-Control": "private, no-store" } }
     );
@@ -124,7 +154,8 @@ export async function POST(req: Request) {
       );
       return route;
     });
-    const [withStages] = (await listRoutes(productId)).filter((route) => route.id === created.id);
+    const [withStages] = (await listRoutes({ organizationId: session.organizationId }))
+      .filter((route) => route.id === created.id);
     return NextResponse.json(withStages ?? created, { status: 201 });
   } catch (error) {
     console.error("Route creation failed", error);
@@ -133,22 +164,39 @@ export async function POST(req: Request) {
 }
 
 /**
- * PUT /api/routes - rename, re-order, re-method, or retire a route.
- * { id, name?, notes?, isActive?, isDefault?, stages? }
+ * PUT /api/routes - rename, re-order, re-method, re-assign, or retire a route.
+ * { id, name?, notes?, isActive?, isDefault?, productId?, stages? }
  *
  * Retiring (`isActive: false`) is the safe way to stop using a route: batches
  * already in production keep the stages they were created with, because their
  * route lives on their own operations, not here.
+ *
+ * `productId` IS EDITABLE, which it was not. A route created without a product
+ * could never be assigned to one afterwards, and a route assigned to the wrong
+ * garment could never be moved - the field arrived in the request body and was
+ * silently dropped. Moving a route rewrites no history for the same reason
+ * editing its stages does not: existing batches carry their own frozen positions.
  */
 export async function PUT(req: Request) {
   const denied = await guard(req, OWNER);
   if (denied) return denied;
   try {
     const body = await req.json();
+    const session = await getSessionUser(req);
+    if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
     const id = Number(body.id);
     if (!Number.isSafeInteger(id) || id < 1)
       return NextResponse.json({ error: "Choose a production route." }, { status: 400 });
-    const [route] = await db.select().from(productionRoutes).where(eq(productionRoutes.id, id)).limit(1);
+    // Scoped to the caller's organisation in the query, so another company's route
+    // is not found rather than found and then edited.
+    const [route] = await db
+      .select()
+      .from(productionRoutes)
+      .where(and(
+        eq(productionRoutes.id, id),
+        session.organizationId === null ? undefined : eq(productionRoutes.organizationId, session.organizationId)
+      ))
+      .limit(1);
     if (!route) return NextResponse.json({ error: "Route not found." }, { status: 404 });
 
     let stages: RouteStage[] | null = null;
@@ -161,17 +209,35 @@ export async function PUT(req: Request) {
       stages = normalised.stages;
     }
 
+    /* ---- which garment this route belongs to ---- */
+    // `undefined` keeps what is stored; `null` detaches it to organization level.
+    const nextProductId = body.productId === undefined
+      ? route.productId
+      : body.productId === null || body.productId === ""
+        ? null
+        : Number(body.productId);
+    if (nextProductId !== null && (!Number.isSafeInteger(nextProductId) || nextProductId < 1))
+      return NextResponse.json({ error: "Choose a valid garment." }, { status: 400 });
+    if (nextProductId !== null) {
+      const [garment] = await db.select({ id: products.id, organizationId: products.organizationId })
+        .from(products).where(eq(products.id, nextProductId)).limit(1);
+      if (!garment || (garment.organizationId && garment.organizationId !== session.organizationId))
+        return NextResponse.json({ error: "Choose one of Matesther's own garments." }, { status: 400 });
+    }
+
     const isDefault = body.isDefault === undefined ? route.isDefault : body.isDefault === true || body.isDefault === "true";
     const isActive = body.isActive === undefined ? route.isActive : body.isActive === true || body.isActive === "true";
 
     const updated = await db.transaction(async (tx) => {
+      // One default per scope. The scope is the route's NEW product, because moving
+      // a route between garments moves which set of siblings it competes with.
       if (isDefault) {
         await tx
           .update(productionRoutes)
           .set({ isDefault: false })
           .where(
-            route.productId
-              ? and(eq(productionRoutes.productId, route.productId), eq(productionRoutes.isActive, true))
+            nextProductId !== null
+              ? and(eq(productionRoutes.productId, nextProductId), eq(productionRoutes.isActive, true))
               : and(eq(productionRoutes.isDefault, true), isNull(productionRoutes.productId))
           );
       }
@@ -189,12 +255,14 @@ export async function PUT(req: Request) {
       const [row] = await tx.update(productionRoutes).set({
         name: body.name === undefined ? route.name : String(body.name).trim().slice(0, 120) || route.name,
         notes: body.notes === undefined ? route.notes : body.notes ? String(body.notes).slice(0, 2000) : null,
+        productId: nextProductId,
         isDefault,
         isActive,
       }).where(eq(productionRoutes.id, route.id)).returning();
       return row;
     });
-    const [withStages] = (await listRoutes(route.productId)).filter((entry) => entry.id === updated.id);
+    const [withStages] = (await listRoutes({ organizationId: session.organizationId }))
+      .filter((entry) => entry.id === updated.id);
     return NextResponse.json(withStages ?? updated);
   } catch (error) {
     console.error("Route update failed", error);
@@ -213,10 +281,21 @@ export async function DELETE(req: Request) {
   const denied = await guard(req, OWNER);
   if (denied) return denied;
   try {
+    const session = await getSessionUser(req);
+    if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
     const id = Number(new URL(req.url).searchParams.get("id"));
     if (!Number.isSafeInteger(id) || id < 1)
       return NextResponse.json({ error: "Choose a production route." }, { status: 400 });
-    const [route] = await db.select().from(productionRoutes).where(eq(productionRoutes.id, id)).limit(1);
+    // Scoped to the caller's organisation, exactly as PUT is: another company's
+    // route is not found rather than found and then deleted.
+    const [route] = await db
+      .select()
+      .from(productionRoutes)
+      .where(and(
+        eq(productionRoutes.id, id),
+        session.organizationId === null ? undefined : eq(productionRoutes.organizationId, session.organizationId)
+      ))
+      .limit(1);
     if (!route) return NextResponse.json({ error: "Route not found." }, { status: 404 });
     const [referenced] = await db
       .select({ id: productionBatches.id })

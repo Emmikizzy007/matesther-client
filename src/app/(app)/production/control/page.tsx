@@ -31,6 +31,27 @@ type StageControl = {
   received: number; submitted: number; approved: number; rework: number; rejected: number;
   remaining: number; awaitingInspection: number; assigned: number; workers: StageWorker[];
   openDispatches: number; isCurrent: boolean;
+  /**
+   * Support work handed out from this stage - the part a tailor gave to a helper - or
+   * NULL when nobody delegated from it.
+   *
+   * Mirrors lib/production-control.ts, including the nullability. That matters: this file
+   * re-declares the shape rather than importing it, so if the two drift the compiler
+   * cannot help, and a stage with no support work would be read as `null.delegated` at
+   * runtime. Most stages of most batches have no support work, so this is the common case
+   * and not an edge one.
+   */
+  support: StageSupport | null;
+};
+/** What one stage owes to support work. Mirrors StageSupport in lib/support-work.ts. */
+type StageSupport = {
+  delegated: number; approved: number; rework: number; rejected: number; outstanding: number;
+  active: number; paused: number; pausedReason: string | null; reworkOpen: number; blocking: boolean;
+};
+/** The batch-level rollup of that, across the whole route. */
+type SupportRoll = {
+  delegated: number; approved: number; outstanding: number; paused: number; reworkOpen: number;
+  blocking: boolean; pausedStages: { stage: string; reason: string | null }[];
 };
 type ControlRow = {
   batchId: number; batchNumber: string | null; orderId: number; orderNumber: string;
@@ -41,6 +62,7 @@ type ControlRow = {
   assigned: number; awaitingInspection: number; awaitingInspectionTotal: number;
   rework: number; rejected: number;
   bottleneck: { position: number; stage: string; quantity: number } | null;
+  support: SupportRoll;
   flags: string[]; stuck: boolean; priority: number; priorityLabel: string;
   route: StageControl[];
 };
@@ -49,6 +71,7 @@ type OrderRoll = {
   daysToDue: number | null; ordered: number; finished: number; remaining: number;
   assigned: number; awaitingInspection: number; rework: number; rejected: number;
   batches: number; stages: { stage: string; quantity: number }[];
+  support: SupportRoll;
   priority: number; priorityLabel: string; stuck: boolean; flags: string[];
 };
 
@@ -71,6 +94,15 @@ const FLAG_LABELS: Record<string, string> = {
   WAITING_UPSTREAM: "Nothing has reached this stage yet",
   NO_ROUTE: "No stage to do the remaining work at",
   COMPLETE: "Finished",
+  /* ---- support work is part of the chain, so it gets its own words ----
+   *
+   * SUPPORT_PAUSED is the one that matters most: it is the difference between a stage
+   * that looks busy and a stage that is standing still because a helper stopped. The
+   * reason is rendered beside it, because "paused" with no reason is not actionable.
+   */
+  SUPPORT_PAUSED: "Support worker has paused",
+  SUPPORT_REWORK: "Support work sent back to the helper",
+  SUPPORT_IN_PROGRESS: "Part of this stage is with a support worker",
 };
 
 const PAGE_SIZE = 25;
@@ -99,7 +131,7 @@ export default function ProductionControlPage() {
 
   // Filters. `draft` is what is typed; `applied` is what was actually queried, so
   // pressing Enter or Apply is what runs a request rather than every keystroke.
-  const [draft, setDraft] = useState({ search: "", stage: "", priority: "", dueWithinDays: "", blockedOnly: false, all: false });
+  const [draft, setDraft] = useState({ search: "", stage: "", priority: "", dueWithinDays: "", blockedOnly: false, supportPausedOnly: false, all: false });
   const [applied, setApplied] = useState(draft);
 
   const queryString = useMemo(() => {
@@ -109,6 +141,7 @@ export default function ProductionControlPage() {
     if (applied.priority) params.set("priority", applied.priority);
     if (applied.dueWithinDays) params.set("dueWithinDays", applied.dueWithinDays);
     if (applied.blockedOnly) params.set("blockedOnly", "1");
+    if (applied.supportPausedOnly) params.set("supportPausedOnly", "1");
     if (applied.all) params.set("all", "1");
     params.set("limit", String(PAGE_SIZE));
     params.set("offset", String(page * PAGE_SIZE));
@@ -212,6 +245,12 @@ export default function ProductionControlPage() {
               <input type="checkbox" checked={draft.blockedOnly} onChange={(event) => apply({ blockedOnly: event.target.checked })} />
               Blocked only
             </label>
+            {/* Narrow to work a support worker has stopped, which is its own question:
+                "Blocked only" also catches inspection queues and unassigned stages. */}
+            <label className="text-xs font-semibold text-slate-600 flex items-center gap-1">
+              <input type="checkbox" checked={draft.supportPausedOnly} onChange={(event) => apply({ supportPausedOnly: event.target.checked })} />
+              Support paused
+            </label>
             <label className="text-xs font-semibold text-slate-600 flex items-center gap-1">
               <input type="checkbox" checked={draft.all} onChange={(event) => apply({ all: event.target.checked })} />
               Include closed
@@ -235,7 +274,7 @@ export default function ProductionControlPage() {
         </div>
         {appliedLate.length > 0 && (
           <p className="mt-2 text-xs text-slate-500">
-            {appliedLate.map((name) => ({ stage: "Current stage", priority: "Priority", blockedOnly: "Blocked only" }[name] ?? name)).join(", ")}{" "}
+            {appliedLate.map((name) => ({ stage: "Current stage", priority: "Priority", blockedOnly: "Blocked only", supportPausedOnly: "Support paused" }[name] ?? name)).join(", ")}{" "}
             is decided from derived figures, so it narrows the {window?.derived ?? 0} most urgent batches
             {window?.capped ? ` (the busiest ${window.cap} - narrow the filters to see further)` : ""}.
           </p>
@@ -312,6 +351,21 @@ export default function ProductionControlPage() {
                           Bottleneck: {stageLabel(row.bottleneck.stage)} holding {row.bottleneck.quantity}
                         </span>
                       )}
+                      {/* The delegation maths, on the board: what was handed out, what has
+                          been accepted, what is still out. A stage's own remaining figure
+                          is not interpretable without it. */}
+                      {row.support.delegated > 0 && (
+                        <span className="text-[11px] px-2 py-0.5 rounded bg-sky-50 text-sky-800 border border-sky-200 font-semibold">
+                          Support: {row.support.delegated} handed out · {row.support.approved} approved · {row.support.outstanding} still out
+                        </span>
+                      )}
+                      {/* The pause is named with its reason and its stage, because that is
+                          the whole point of the lifecycle: a controller can act on it. */}
+                      {row.support.pausedStages.map((paused, index) => (
+                        <span key={`${paused.stage}-${index}`} className="text-[11px] px-2 py-0.5 rounded bg-red-50 text-red-700 border border-red-300 font-semibold">
+                          {stageLabel(paused.stage)} support paused{paused.reason ? `: ${paused.reason}` : ""}
+                        </span>
+                      ))}
                     </div>
                   )}
                 </button>
@@ -324,7 +378,7 @@ export default function ProductionControlPage() {
                     <table className="w-full text-xs">
                       <thead>
                         <tr className="text-left text-slate-500 border-b border-slate-200">
-                          {["#", "Stage", "Method", "Received", "Submitted", "Approved", "Rework", "Rejected", "Remaining", "Awaiting check", "Assigned", "Who holds it"].map((head) => (
+                          {["#", "Stage", "Method", "Received", "Submitted", "Approved", "Rework", "Rejected", "Remaining", "Awaiting check", "Assigned", "Support handed out", "Who holds it"].map((head) => (
                             <th key={head} className="py-1 pr-3 font-semibold whitespace-nowrap">{head}</th>
                           ))}
                         </tr>
@@ -345,6 +399,26 @@ export default function ProductionControlPage() {
                             <td className="py-1.5 pr-3 font-semibold">{stage.remaining}</td>
                             <td className="py-1.5 pr-3">{stage.awaitingInspection || ""}</td>
                             <td className="py-1.5 pr-3">{stage.assigned || ""}</td>
+                            {/* The part of this stage a tailor gave to a helper. Read as
+                                "20 out, 15 accepted, 5 still owed", and in red when the
+                                helper has stopped - which is the state that would otherwise
+                                leave the stage looking merely in progress. */}
+                            <td className="py-1.5 pr-3 whitespace-nowrap">
+                              {/* Narrowed once, into a name, rather than optional-chained
+                                  five times: either this stage has support work to report
+                                  or it has nothing to say. */}
+                              {(() => {
+                                const support = stage.support;
+                                if (!support || support.delegated <= 0) return "";
+                                return (
+                                  <span className={support.paused > 0 ? "font-semibold text-red-700" : "text-slate-600"}>
+                                    {support.delegated} out · {support.approved} ok · {support.outstanding} owed
+                                    {support.paused > 0 ? " · PAUSED" : ""}
+                                    {support.paused > 0 && support.pausedReason ? ` (${support.pausedReason})` : ""}
+                                  </span>
+                                );
+                              })()}
+                            </td>
                             <td className="py-1.5 pr-3 text-slate-600">
                               {stage.workers.length
                                 ? stage.workers.map((worker) => `${worker.name}${worker.quantity ? ` (${worker.quantity})` : ""}`).join(", ")
@@ -357,6 +431,9 @@ export default function ProductionControlPage() {
                     <p className="mt-2 text-[11px] text-slate-500">
                       Ordered {row.ordered} − approved at the final stage {row.finished} = remaining {row.remaining}.
                       Rework and rejected are totals across the whole route.
+                      {row.support.delegated > 0
+                        ? ` Support work: ${row.support.delegated} handed out, ${row.support.approved} accepted, ${row.support.outstanding} still owed.`
+                        : ""}
                       {user?.role === "OWNER" ? " Open the order for cost and profitability." : ""}
                     </p>
                     {user?.role === "OWNER" && (

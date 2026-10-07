@@ -1982,3 +1982,212 @@ forward from an earlier session, not in this codebase. The per-worker `completed
 workers screen is a different concept - operation-level work plus submitted shares, shown beside a
 separate `approved` field - and was inspected and deliberately left alone rather than silently
 redefined.
+
+# 40. IMPLEMENTED: support-work lifecycle, and production routes that say whether they are used
+
+## 40.1 What changed
+
+**Support work has a lifecycle of its own.** `support_assignments.status` could previously say
+where the work is NOW but never how it got there: a helper could submit work they had never
+begun, nothing could express "the helper has stopped", and Production Control therefore showed a
+tailor's stage as ordinary in-progress work while the support that stage depends on was standing
+still. A support assignment now moves **ASSIGNED → STARTED → SUBMITTED → APPROVED** (or REWORK),
+may be **PAUSED** with a written reason and resumed, and may be **CANCELLED**. Every transition is
+appended to `public.support_status_events` with its actor and, where required, its reason.
+
+This is the pattern the schema already used twice — `production_movements` behind a stage's
+quantity counters, `stage_inspections` behind its approved figure. Support work was the one
+production area with no trail. It is not a second history system.
+
+**A route now says whether production would actually use it.** `GET /api/routes` returns
+`usedForNewBatches` and `applicableStages` per row, computed through the same
+`isAutomaticRoute` rule that batch creation uses. Before this, the Routes screen could show a
+product route that production silently ignored — a retired route, one superseded by a default, or
+one of two unflagged routes with nothing to choose between them. The screen and the factory
+disagreed, and the screen was the one that looked authoritative.
+
+**`productId` is now honoured and validated.** `?productId=` absent means every route; empty means
+routes with no product; a number means that product; anything else is a **400** rather than being
+quietly widened to "every route".
+
+## 40.2 Performance
+
+The organisation filter moved **into** `listRoutes` instead of being applied to its result. Every
+route in the database was previously selected and then filtered in JavaScript, which both leaked
+the read and grew with the whole table.
+
+| Endpoint | Before | After |
+| --- | --- | --- |
+| Routes list | 4 statements, **0 rows returned**, 1 unbounded read | 5 statements, 1 row, 0 unbounded |
+| Production orders (Assign) | 9 statements, 14.8 KB, **7 unbounded** | 9 statements, 16.3 KB, **0 unbounded** |
+| Orders list | 7 statements, 7.6 KB, **5 unbounded** | 8 statements, 7.6 KB, **0 unbounded** |
+| Packing | 5 statements, 3 unbounded | 3 statements, 1 unbounded |
+
+A route list returning **0 rows** on a database that had routes is the bug reproduced numerically.
+Assign and Orders are now scoped in SQL — the caller's own organisation and only orders still open
+for production — rather than reading every order, customer, item, product, variant, batch and route
+in the database and filtering in the browser.
+
+The remaining "unbounded" counts on Payments (2) and Expenses (2) are `select count(*)` aggregates
+for the `X-Total-Count` header, not row downloads. `GET /api/dashboard` and `GET /api/reports` are
+unchanged and still read wide; they genuinely summarise every stage, so narrowing them changes what
+the screen means. That is a decision, not an oversight — see 39.5.
+
+## 40.3 The `support` field is nullable, and that is not cosmetic
+
+`StageControl.support` is `StageSupport | null`, not a zero-filled object. An undelegated stage
+carries `null`. This removed **38.8 KB** from the Production Control payload (151.2 KB → 112.4 KB)
+because eight stages no longer each serialise an empty support object.
+
+The consequence matters more than the saving: `src/app/(app)/production/control/page.tsx`
+**re-declares** `StageControl` locally instead of importing it, so `tsc` cannot catch drift between
+the two. It read `stage.support.delegated` directly, which would have thrown on every undelegated
+stage. It now narrows once through the support value before use. **If you change `StageControl`,
+change both declarations** — the compiler will not tell you.
+
+## 40.4 Security
+
+- `GET /api/workers?supportHelpers=1` is gated `ANYONE` rather than `STAFF`, because the point is
+  that a linked Worker may ask who they can hand work to. It returns **only** id, name, specialty,
+  status, payment type and roles — never a pay rate. A Worker with no factory profile gets `[]`,
+  since they can hold no production and therefore have nothing to delegate. Roles resolve through
+  the same effective-roles rule as everywhere else (stored role rows plus the legacy specialty), so
+  the list can never disagree with the Workers screen or with what `POST /api/support-work` accepts.
+  It is handled **before** the `STAFF` gate and returns its own shape; it must not fall through.
+- `POST /api/support-work` refuses to let a tailor hand work to themselves. The rule is about what
+  may be **done**, not what may be **seen**, so listing a tailor among the helpers costs nothing.
+- Lifecycle writes are `PUT /api/support-work` with `{ id, action, reason? }` and validate the move
+  server-side, returning **409** for an illegal one. The client's job is only to send the action and
+  surface the refusal — it does not decide legality.
+
+## 40.5 Schema, data and safety
+
+`drizzle/0011_support_lifecycle.sql` / `deploy/upgrade-support-lifecycle.sql`. Four nullable
+columns on `support_assignments` (`started_at`, `paused_at`, `pause_reason`, `submitted_by_name`),
+one new table, four foreign keys, four indexes. **Nothing is backfilled.** Every existing assignment
+keeps `NULL` and gets no events, because that is the truth about it: the system did not record when
+that helper began. Inventing a start time would put a fabricated timestamp behind a payroll figure.
+
+## 40.6 Regression coverage
+
+`tests/support-lifecycle.test.ts` (29) and `tests/product-route-resolution.test.ts` (19). Three
+existing fixtures — `support-payroll`, `support-cost-allocation`,
+`reassignment-and-report-figures` — were corrected to **start** support work before submitting it,
+because the new lifecycle rightly refuses a submission from a helper who never began. The guard was
+not weakened to suit the fixtures.
+
+One regression test pins the payload optimisation directly: an undelegated stage must have
+`support === null`, not a zeroed object, and exactly 1 of 8 stages may report support.
+
+## 40.7 Known limitations
+
+- `scripts/perf-probe.ts` measures through the real public API. Its "WORKER worker list (helpers)"
+  row still calls `/api/workers?view=slim`, which a Worker is refused (403 → `[]`); the
+  purpose-limited endpoint is `?supportHelpers=1`, covered by tests rather than by the probe. The
+  probe's numbers are the durable record — its text output is written to `/tmp`, outside the repo.
+- `control/page.tsx`'s local `StageControl` duplicate is still a duplicate. Unifying it with the
+  exported type is the correct next step and was not done here, because it touches a screen with no
+  automated coverage of its rendering.
+
+# 41. IMPLEMENTED: removing an order, and clearing test data before go-live
+
+## 41.1 Why this existed to be fixed
+
+Removing an order was one unguarded statement — `delete from orders where id = ?` — which cascaded
+away the order's items, variants, batches, stages, movement ledger, allocations, inspections,
+quality checks, rework, receipts, packing records and deliveries, and left **nothing to read
+afterwards**: no record of who did it, why, or what was lost.
+
+## 41.2 What changed
+
+**Two paths, deliberately different in strength.**
+
+`DELETE /api/orders/:id` (Owner-only) is the ordinary path. It **refuses with 409** when the order
+has real history behind it — any inspected production (approved, reworked *or* rejected), any
+customer payment, or a delivery — and the refusal names what was found. A written reason of at
+least 10 characters is mandatory. Stock is restored from the records being removed **before** they
+are removed, inside the same transaction, so the adjustment and its justification cannot be
+separated by ordering. Empty batches are allowed through, because an abandoned empty batch is
+exactly what an Owner should be able to tidy without an administrative procedure.
+
+**Settings → Test data cleanup** (Owner-only, `GET`/`POST /api/test-data-cleanup`) is the
+deliberate exception, for clearing test records before operations begin. It is *able* to remove an
+order that has approved production and settled money, which is why it is fenced:
+
+1. **Preview first.** `GET ?orderId=` reports every table and row count it would touch. It reads
+   nothing else and removes nothing.
+2. **Typed confirmation.** The Owner must type the school's name and the order number back.
+3. **Written reason.**
+4. **A fingerprint of the exact rows.** If anything changes between preview and execution the server
+   recomputes the digest, sees a different value and refuses. That makes the confirmation
+   single-use **without storing a token**.
+
+Both acts are recorded permanently — `order_deletions` and `test_data_purges` — carrying the actor,
+the reason, the confirmation typed, the counts the **preview promised** beside the counts
+**actually achieved**, and what the purge could not safely undo (payroll already settled for a month
+this order contributed to; any inventory movement that could not be reversed without risking a
+wrong stock figure).
+
+## 41.3 Why not reuse `production_movements`
+
+That ledger records quantity events on a production stage and requires a `production_operations` row
+to hang from. The rows it would describe here are the ones being deleted, so the events would
+cascade away with them and **the trail would delete itself**. A removal has to be recorded somewhere
+that survives the removal.
+
+## 41.4 Security
+
+- Both endpoints are `guard(req, OWNER)`. `findPurgeTarget` gives **one answer** for "does not
+  exist" and "is not yours" — a caller must not be able to discover another organisation's order ids
+  by watching which ones 404 differently. It also checks the customer's organisation, not only the
+  order's.
+- The actor comes **from the session**, never from the request body.
+- Once `findPurgeTarget` has scoped the order, the child counts key on `orderId` alone. That is
+  sound only because the order id was already proven to be the caller's; the comment in
+  `deleteOrderIfSafe` says so, because the next person to add a lookup there will not otherwise know
+  which half of the guard they are relying on.
+
+## 41.5 Schema, data and safety
+
+`drizzle/0012_deletion_and_purge_audit.sql` / `deploy/upgrade-test-data-cleanup.sql`. Two new
+tables, four indexes each, two foreign keys each, **no columns added to any existing table, and no
+data written**. Actor references are `ON DELETE set null`: a person leaving must not erase the
+record of what they removed, and the name columns survive them.
+
+**Run the SQL before the code.** The code inserts an audit row inside the same transaction as the
+removal, so if the tables are missing the removal fails and rolls back — the safe direction, but it
+means order removal is unavailable until the file has run.
+
+## 41.6 Regression coverage
+
+`tests/test-data-cleanup.test.ts` (28) and `tests/start-production-and-list-bounds.test.ts` (10).
+Suite total **278 → 364, 0 failures**, all through the real route handlers.
+
+## 41.7 Two bugs the compiler caught, recorded so they are not reintroduced
+
+- **A plain number interpolated into a Drizzle `sql` template is NOT bound as a value — it is
+  treated as an identifier.** Two string-built subqueries silently counted 0, which disabled the
+  "order has real history" guard entirely: an order with approved production became deletable by a
+  single click. Replaced with real Drizzle joins and `inArray`.
+- **`Promise.all` resolves to a tuple of row-sets.** `const [batchRow] = await Promise.all([db.select(...)])`
+  binds the whole *array*, so `batchRow?.total` is `undefined`, every guard reads 0, and the same
+  deletion becomes possible. It must be `batchRows[0]?.total`. Both are noted in the code and pinned
+  by tests.
+
+## 41.8 Known limitations
+
+- **The atomicity claim is not proven by the suite, and cannot be.** Both acts run as a single
+  `db.transaction`, so on PostgreSQL a failure part-way through leaves the database exactly as it
+  was. The suite runs on **pg-mem, whose adapter does NOT roll back** — verified directly, by
+  throwing inside a transaction after an insert and watching the insert survive. Rather than assert
+  a rollback it cannot produce, the suite asserts the two properties that ARE observable and that the
+  rollback depends on (every refusal happens before any write; stock is restored inside the same
+  transaction, before deletion). **`deploy/upgrade-test-data-cleanup.sql` section 4 is the manual
+  probe to run against a real PostgreSQL before relying on the claim.** Do not delete that probe
+  thinking it redundant — it is the only half of the guarantee that is tested.
+- `purgeHistory` orders `desc` with a `limit`. An earlier version ordered `asc`, limited, then
+  reversed in JavaScript, which returns the **oldest** window once the trail exceeds the limit —
+  silently, and only in production, because no test database has 50 purges in it.
+- Test-data cleanup is a **pre-go-live** tool. It is not a way to correct a live order, and the
+  refusal message on `DELETE /api/orders/:id` says so and points here.
+

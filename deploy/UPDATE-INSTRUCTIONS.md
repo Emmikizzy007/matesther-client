@@ -147,4 +147,43 @@ The same change is recorded for the ORM as `drizzle/0007_variants_routes_and_ext
 
 The same change is recorded for the ORM as `drizzle/0006_production_ledger_and_indexes.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path. Note that the `deploy/` file additionally pre-flights the unique indexes, which the `drizzle/` file does not.
 
+## Release: a real lifecycle for tailor support work
+
+This release adds **one new table**, `public.support_status_events`, and **four new nullable columns** on `public.support_assignments`. All additive.
+
+1. Make a database backup, or confirm your restore plan.
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-support-lifecycle.sql` and Run. It is additive and repeatable. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no new `NOT NULL`, no new default, and no change to any existing column's type or meaning. **It writes no data at all.**
+3. Run the verification query at the bottom of that file. Expect `new_columns = 4`, `support_events_table = 1`, `support_event_indexes = 3`, `support_status_index = 1`, `support_event_fks = 4`, `backfilled_events = 0`, and the `support_assignments` and `support_inspections` counts **unchanged** from before you ran it.
+4. Only then push the new code. **SQL first, code second.**
+
+Nothing is backfilled, deliberately. Every support assignment already in your database keeps `NULL` for all four new columns and gets no events, because that is the truth about it: the system did not record when that helper began. Inventing a start time would put a fabricated timestamp behind a payroll figure.
+
+### What changes for the people using the system
+
+- Support work now moves **ASSIGNED → STARTED → SUBMITTED → APPROVED** (or REWORK), may be **PAUSED** with a written reason and resumed, and may be **CANCELLED**. A helper can no longer submit work they never began.
+- Every one of those moves is recorded in `support_status_events` with the person who made it and, where a reason is required, that reason. This is the same pattern the schema already uses twice — `production_movements` behind a stage's quantity counters, `stage_inspections` behind its approved figure. Support work was the one production area with no trail of its own; this is not a second history system.
+- **Production Control** now shows a stage whose support is paused or still waiting as standing still, instead of displaying it as ordinary in-progress work.
+- A tailor delegating work can now choose from a purpose-built list of eligible helpers rather than the whole staff list. That list is served by `GET /api/workers?supportHelpers=1`, which is open to a linked Worker login and returns **only** id, name, specialty, status, payment type and roles — never a pay rate, never an inactive person, never another company's people.
+
+The same change is recorded for the ORM as `drizzle/0011_support_lifecycle.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
+## Release: removing an order, and clearing test data before go-live
+
+This release adds **two new tables**, `public.order_deletions` and `public.test_data_purges`. It adds **no columns to any existing table** and writes no data.
+
+1. Make a database backup, or confirm your restore plan.
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-test-data-cleanup.sql` and Run. It is additive and repeatable. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, and no change to any existing column's type, default or meaning.
+3. Run the verification query in **section 3**. Expect `audit_tables = 2`, four indexes and two foreign keys on each table, `deletions_rows = 0`, `purges_rows = 0`, and your order, payment and batch counts **unchanged**.
+4. Run the atomicity probe in **section 4**, once. It attempts one insert inside a transaction that is then deliberately aborted, so the row must never land. Expect the block to raise `probe: deliberate abort`, then `rolled_back_insert = 0`. **If that is not 0, stop** — transactions are not rolling back on your server, and neither order removal nor the cleanup may be used until that is understood. The probe leaves no residue and touches no application data.
+5. Only then push the new code. **SQL first, code second.** The code inserts an audit row inside the same transaction as the removal, so deploying it before this file would make order removal fail (and roll back safely) rather than record itself.
+
+### What changes for the people using the system
+
+- **Removing an order is no longer one unguarded cascade.** It was previously `delete from orders where id = ?`, which silently took the items, variants, batches, stages, movement ledger, allocations, inspections, quality checks, rework, receipts, packing records and deliveries with it and left nothing to read afterwards.
+- An order with **real history behind it** — approved, reworked or rejected production, any customer payment, or a delivery — is now **refused** with a 409 that says exactly which history was found. A written reason of at least 10 characters is mandatory, and stock is restored from the records being removed *before* they are removed, inside the same transaction.
+- **Settings → Test data cleanup** (Owner-only) is the deliberate exception, for clearing test records before the business goes live. It **previews** every table and row count first, requires the Owner to type the school's name and the order number back, requires a written reason, and computes a **fingerprint** of the exact rows. If anything changes between preview and confirmation the fingerprint no longer matches and the server refuses — which makes the confirmation single-use without storing a token.
+- Both acts are recorded permanently, including the counts the preview promised beside the counts actually achieved. If those two ever disagree, the record shows it after the fact rather than only at the moment.
+
+The same change is recorded for the ORM as `drizzle/0012_deletion_and_purge_audit.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path. Note that the `deploy/` file additionally contains the verification and atomicity probe, which the `drizzle/` file does not.
+
 **Never run `deploy/full-setup.sql` or `deploy/schema-only.sql` on an existing client project.** Those files are for brand-new empty databases; `full-setup.sql` contains a destructive demo-data reset.

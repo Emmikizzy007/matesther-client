@@ -2,33 +2,71 @@ import { NextResponse } from "next/server";
 import { guard, getSessionUser, OWNER } from "@/lib/authz";
 import { db } from "@/db";
 import { payments, orders, customers } from "@/db/schema";
-import { eq, desc } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { refreshOrderMoney } from "@/lib/server";
 
+/**
+ * GET /api/payments?orderId=&limit=&offset=
+ *
+ * Customer payments, newest first, with the order and school each one belongs to.
+ *
+ * `orderId` is now a WHERE CLAUSE. It used to be applied after the mapping, so asking
+ * for one order's receipts still read every payment, every order and every customer in
+ * the database - and the order page asks exactly that question every time it opens.
+ * The order and customer rows are then fetched for the payments being returned only,
+ * by id, so the enrichment costs what the page costs.
+ *
+ * Still a bare array with the total in `X-Total-Count`, which is how the material and
+ * operation lists already page, so no consumer changes shape.
+ */
 export async function GET(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
   try {
     const { searchParams } = new URL(req.url);
-    const orderId = searchParams.get("orderId");
-    const rows = await db.select().from(payments).orderBy(desc(payments.paymentDate));
-    const [orderRows, customerRows] = await Promise.all([
-      db.select().from(orders),
-      db.select().from(customers),
-    ]);
+    const rawOrderId = searchParams.get("orderId");
+    if (rawOrderId !== null && rawOrderId.trim() !== "" && !/^\d+$/.test(rawOrderId.trim()))
+      return NextResponse.json({ error: "Choose a valid order." }, { status: 400 });
+    const orderId = rawOrderId && /^\d+$/.test(rawOrderId.trim()) ? Number(rawOrderId.trim()) : null;
+    const rawLimit = searchParams.get("limit") ? Number(searchParams.get("limit")) : NaN;
+    const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 500) : 100;
+    const rawOffset = searchParams.get("offset") ? Number(searchParams.get("offset")) : 0;
+    const offset = Number.isSafeInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
+    const where = orderId !== null ? eq(payments.orderId, orderId) : undefined;
+    const [totalRow] = await db.select({ total: sql<number>`count(*)` }).from(payments).where(where);
+    const total = Number(totalRow?.total ?? 0);
+    const rows = total === 0
+      ? []
+      : await db.select().from(payments).where(where)
+          // Newest first, with an id tiebreaker so paging is stable for payments
+          // recorded on the same day - a date alone would let rows swap pages.
+          .orderBy(desc(payments.paymentDate), desc(payments.id))
+          .limit(limit).offset(offset);
+
+    const orderIds = [...new Set(rows.map((row) => row.orderId))];
+    const orderRows = orderIds.length
+      ? await db.select({ id: orders.id, orderNumber: orders.orderNumber, totalAmount: orders.totalAmount, balance: orders.balance, customerId: orders.customerId })
+          .from(orders).where(inArray(orders.id, orderIds))
+      : [];
+    const customerIds = [...new Set(orderRows.map((o) => o.customerId).filter((v): v is number => v !== null))];
+    const customerRows = customerIds.length
+      ? await db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
+      : [];
     const oMap = new Map(orderRows.map((o) => [o.id, o]));
     const cMap = new Map(customerRows.map((c) => [c.id, c]));
-    let data = rows.map((p) => {
+    const data = rows.map((p) => {
       const o = oMap.get(p.orderId);
       return {
         ...p,
         orderNumber: o?.orderNumber ?? "-",
         orderTotal: o?.totalAmount ?? 0,
         balance: o?.balance ?? 0,
-        customer: cMap.get(o?.customerId ?? -1)?.name ?? "-",
+        customer: o?.customerId ? cMap.get(o.customerId)?.name ?? "-" : "-",
       };
     });
-    if (orderId) data = data.filter((d) => d.orderId === Number(orderId));
-    return NextResponse.json(data);
+    return NextResponse.json(data, {
+      headers: { "Cache-Control": "private, no-store", "X-Total-Count": String(total) },
+    });
   } catch (e: any) {
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }

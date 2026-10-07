@@ -196,9 +196,26 @@ export function Field({
 export const inputCls =
   "min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-base outline-none focus:border-matesther-700 focus:ring-2 focus:ring-matesther-700/40 sm:text-sm";
 
+/**
+ * The one button. Renders an <a> through next/link when given an `href`, and a
+ * <button> otherwise.
+ *
+ * WHY `href` EXISTS
+ *   Several actions in this app are navigation, not mutation - "Start Production" on an
+ *   order opens the Assign Production workflow for that order, and a document's "back to
+ *   the order" goes back. Faking navigation with onClick + router.push loses what a real
+ *   link gives for free on the phones this ERP is used on: middle-click and long-press to
+ *   open in a new tab, the destination shown before it is tapped, browser back, and
+ *   working at all before the JavaScript has hydrated.
+ *
+ *   It also keeps the styling in one place, so a link that looks like a button and a
+ *   button are the same component rather than two copies of the same class list drifting
+ *   apart. The tap target and text size are the mobile ones every control here uses.
+ */
 export function Btn({
   children,
   onClick,
+  href,
   variant = "primary",
   type = "button",
   disabled,
@@ -206,6 +223,8 @@ export function Btn({
 }: {
   children: ReactNode;
   onClick?: () => void;
+  /** When present this is a link, not a button. */
+  href?: string;
   variant?: "primary" | "secondary" | "danger" | "ghost" | "gold";
   type?: "button" | "submit";
   disabled?: boolean;
@@ -218,12 +237,28 @@ export function Btn({
     danger: "bg-red-700 hover:bg-red-800 text-white",
     ghost: "text-slate-600 hover:bg-slate-100",
   };
+  const classes = `inline-flex min-h-11 items-center justify-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${styles[variant]} ${className}`;
+  if (href) {
+    // A disabled link is rendered as a button that does nothing, because an <a> with
+    // aria-disabled still navigates: pretending otherwise would be worse than either.
+    if (disabled)
+      return (
+        <button type="button" disabled className={classes}>
+          {children}
+        </button>
+      );
+    return (
+      <Link href={href} onClick={onClick} className={classes}>
+        {children}
+      </Link>
+    );
+  }
   return (
     <button
       type={type}
       onClick={onClick}
       disabled={disabled}
-      className={`inline-flex min-h-11 items-center justify-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${styles[variant]} ${className}`}
+      className={classes}
     >
       {children}
     </button>

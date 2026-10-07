@@ -582,6 +582,33 @@ export const supportAssignments = pgTable("support_assignments", {
   quantityRework: integer("quantity_rework").notNull().default(0),
   quantityRejected: integer("quantity_rejected").notNull().default(0),
   status: text("status").notNull().default("ASSIGNED"),
+  /**
+   * WHEN THE HELPER ACTUALLY BEGAN, and when they stopped.
+   *
+   * `status` says where the work is now. These say how it got there, which is what
+   * Production Control needs in order to report that a tailor's stage is waiting on
+   * support that has been paused since a particular moment - and what makes "the
+   * helper has not started" distinguishable from "the helper is halfway through".
+   *
+   * NULLABLE WITH NO DEFAULT AND NOTHING BACKFILLED. An assignment recorded before
+   * this existed has no start time, and that is the truth about it: inventing one
+   * would put a fabricated timestamp behind a payroll figure. `paused_at` is
+   * cleared on resume, because the trail of every pause is in
+   * `support_status_events` - this column answers only "is it paused right now,
+   * and since when".
+   */
+  startedAt: timestamp("started_at"),
+  pausedAt: timestamp("paused_at"),
+  /** Required by the API when pausing: a pause with no reason is not actionable. */
+  pauseReason: text("pause_reason"),
+  /**
+   * Who submitted the work, by name.
+   *
+   * The submitter is always the support worker - `PUT /api/support-work` refuses
+   * anyone else - but recording it here makes a submission attributable without
+   * walking the event trail, which is what an inspector looks at first.
+   */
+  submittedByName: text("submitted_by_name"),
   assignedAt: timestamp("assigned_at").defaultNow(),
   submittedAt: timestamp("submitted_at"),
   inspectedAt: timestamp("inspected_at"),
@@ -598,7 +625,63 @@ export const supportAssignments = pgTable("support_assignments", {
     index("support_assignments_order_id_idx").on(table.orderId),
     index("support_assignments_allocation_id_idx").on(table.productionAllocationId),
     index("support_assignments_order_variant_id_idx").on(table.orderVariantId),
-    index("support_assignments_order_item_id_idx").on(table.orderItemId)
+    index("support_assignments_order_item_id_idx").on(table.orderItemId),
+    // "Which support work is still open, and which of it is paused?" is asked on
+    // every load of the production control board, so it must not scan the table.
+    index("support_assignments_status_idx").on(table.status)
+  ]
+);
+
+/**
+ * ---------- The support-work lifecycle trail ----------
+ *
+ * APPEND-ONLY, AND THE SAME PATTERN THE CODEBASE ALREADY USES TWICE:
+ * `production_movements` is the trail behind a stage's derived quantity counters,
+ * and `stage_inspections` is the trail behind a stage's approved figure. Support
+ * work was the one production area with no trail of its own - `status` could say
+ * where the work is NOW but never how it got there, so a pause was invisible the
+ * moment the helper resumed, and last month's question was unanswerable.
+ *
+ * One row per transition, carrying who made it and, where a reason is required
+ * (a pause, a cancellation), what that reason was. Rows are never updated and
+ * never deleted; the assignment's own `status`, `started_at` and `paused_at` are
+ * the current-state cache of this trail, exactly as `production_operations`'
+ * counters are of the movement ledger.
+ *
+ * `event_type` is DATA rather than a closed enum, for the reason
+ * `production_movements.event_type` is: a new lifecycle state becomes a code
+ * change plus a row, never a migration to alter a type.
+ */
+export const supportStatusEvents = pgTable("support_status_events", {
+  id: serial("id").primaryKey(),
+  supportAssignmentId: integer("support_assignment_id")
+    .references(() => supportAssignments.id, { onDelete: "cascade" })
+    .notNull(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  /** CREATED, STARTED, PAUSED, RESUMED, SUBMITTED, INSPECTED, CANCELLED. */
+  eventType: text("event_type").notNull(),
+  /** Null on the first event: there was no state before it. */
+  fromStatus: text("from_status"),
+  toStatus: text("to_status").notNull(),
+  /**
+   * WHO moved it. Both halves, exactly as `production_movements` does: the id
+   * survives a rename and the name survives a deleted user. `actor_worker_id` is
+   * the factory profile where the actor has one, so "which of the two people on
+   * this assignment acted" is answerable without joining by name.
+   */
+  actorUserId: integer("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  actorWorkerId: integer("actor_worker_id").references(() => workers.id, { onDelete: "set null" }),
+  actorName: text("actor_name").notNull(),
+  /** Required for a pause and a cancellation; null for a routine transition. */
+  reason: text("reason"),
+  notes: text("notes"),
+  occurredAt: timestamp("occurred_at").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow(),
+},
+  (table) => [
+    index("support_status_events_assignment_id_idx").on(table.supportAssignmentId),
+    index("support_status_events_occurred_at_idx").on(table.occurredAt),
+    index("support_status_events_event_type_idx").on(table.eventType)
   ]
 );
 
@@ -1077,5 +1160,108 @@ export const productionMovements = pgTable("production_movements", {
     index("production_movements_batch_id_idx").on(table.productionBatchId),
     index("production_movements_event_type_idx").on(table.eventType),
     index("production_movements_occurred_at_idx").on(table.occurredAt),
+  ]
+);
+
+// ---------- Audit: order removals ----------
+/**
+ * One row per order removed, kept AFTER the order is gone.
+ *
+ * WHY THIS EXISTS
+ *   Deleting an order used to be a single unguarded statement that cascaded away the
+ *   order's items, variants, batches, stages, movement ledger, allocations,
+ *   inspections, quality checks, rework, receipts, packing records and deliveries -
+ *   and left nothing behind that said it had happened. `production_movements` cannot
+ *   serve as this record, because it hangs from `production_operations`: the events
+ *   would cascade away with the very rows they describe and the trail would delete
+ *   itself. A removal has to be recorded somewhere that survives the removal.
+ *
+ * WHAT IT RECORDS
+ *   Who, why (mandatory - the API refuses without it), which school and order number,
+ *   and what the order held at the moment it went: its money and the size of the
+ *   production behind it. Those figures are what makes "we deleted the test order"
+ *   checkable against "we deleted a live order".
+ *
+ *   `order_id` is a plain integer, deliberately NOT a foreign key: the order it names
+ *   no longer exists by the time this row is read, and a reference would either block
+ *   the deletion or cascade this record away with it.
+ *
+ *   `deleted_by_id` IS a foreign key with `set null`, because the user may still exist
+ *   and may later be deleted; the name column beside it survives them either way. Same
+ *   actor pattern as `payments.recorded_by_*` and `production_movements.actor_*`.
+ */
+export const orderDeletions = pgTable("order_deletions", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  orderId: integer("order_id").notNull(),
+  orderNumber: text("order_number").notNull(),
+  customerName: text("customer_name"),
+  deletedById: integer("deleted_by_id").references(() => users.id, { onDelete: "set null" }),
+  deletedByName: text("deleted_by_name").notNull(),
+  reason: text("reason").notNull(),
+  totalAmount: integer("total_amount"),
+  amountPaid: integer("amount_paid"),
+  batchCount: integer("batch_count"),
+  operationCount: integer("operation_count"),
+  paymentCount: integer("payment_count"),
+  deletedAt: timestamp("deleted_at").defaultNow(),
+},
+  (table) => [
+    index("order_deletions_organization_id_idx").on(table.organizationId),
+    index("order_deletions_order_id_idx").on(table.orderId),
+    index("order_deletions_deleted_by_id_idx").on(table.deletedById),
+    index("order_deletions_deleted_at_idx").on(table.deletedAt)
+  ]
+);
+
+// ---------- Audit: administrative test-data purges ----------
+/**
+ * One row per administrative test-data cleanup.
+ *
+ * A purge is the ONE act in Matesther that may remove an order which has approved
+ * production and settled money behind it, because clearing test records before the
+ * business goes live requires exactly that. An act that strong has to leave a permanent,
+ * specific account of itself - otherwise "the test order was removed" and "a real order
+ * was removed" are the same sentence.
+ *
+ * WHAT IT RECORDS
+ *   who ran it; the school and order number it was pointed at; the confirmation sentence
+ *   they typed (stored, because the control IS that a person wrote the school's name
+ *   rather than clicked past a dialog); their reason; the counts and fingerprint the
+ *   PREVIEW promised; the counts actually removed; and what could not be safely undone -
+ *   payroll already settled for a month this order contributed to, and any inventory
+ *   movement that could not be reversed without risking a wrong stock figure.
+ *
+ *   Storing the preview beside the result is the point: a purge that touched something
+ *   its preview did not show is then visible after the fact, not only at the moment the
+ *   fingerprint check refused it.
+ *
+ *   The count columns are text rather than a second normalised table, because they are a
+ *   snapshot of a shape that varies with what the order happened to touch, and their only
+ *   reader is a person auditing one event. Indexing a per-table count nobody queries
+ *   would be structure for its own sake.
+ */
+export const testDataPurges = pgTable("test_data_purges", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id),
+  orderId: integer("order_id").notNull(),
+  orderNumber: text("order_number").notNull(),
+  customerName: text("customer_name"),
+  confirmedCustomerName: text("confirmed_customer_name").notNull(),
+  reason: text("reason").notNull(),
+  ranById: integer("ran_by_id").references(() => users.id, { onDelete: "set null" }),
+  ranByName: text("ran_by_name").notNull(),
+  previewCounts: text("preview_counts"),
+  previewFingerprint: text("preview_fingerprint").notNull(),
+  resultCounts: text("result_counts"),
+  payrollReport: text("payroll_report"),
+  inventoryReport: text("inventory_report"),
+  ranAt: timestamp("ran_at").defaultNow(),
+},
+  (table) => [
+    index("test_data_purges_organization_id_idx").on(table.organizationId),
+    index("test_data_purges_order_id_idx").on(table.orderId),
+    index("test_data_purges_ran_by_id_idx").on(table.ranById),
+    index("test_data_purges_ran_at_idx").on(table.ranAt)
   ]
 );

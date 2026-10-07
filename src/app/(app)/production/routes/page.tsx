@@ -23,6 +23,13 @@ type RouteStage = { stage: string; method: string; roleRequired: string | null }
 type Route = {
   id: number; name: string; productId: number | null; productName: string | null;
   isDefault: boolean; isActive: boolean; notes: string | null; stages: RouteStage[];
+  /**
+   * Whether a NEW batch would actually follow this route, computed on the server by the
+   * same rule `resolveRoute` uses. The screen shows this rather than inferring it from
+   * the DEFAULT badge, because the two are not the same question: a route can be saved
+   * against a garment and still not be the one used.
+   */
+  usedForNewBatches?: boolean;
 };
 type Product = { id: number; name: string };
 
@@ -33,6 +40,8 @@ export default function ProductionRoutesPage() {
   const isOwner = user?.role === "OWNER";
   const [routes, setRoutes] = useState<Route[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  /** "" = every route; "none" = organisation-level; otherwise a product id as a string. */
+  const [productFilter, setProductFilter] = useState("");
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Route | "new" | null>(null);
   const [draft, setDraft] = useState({ name: "", productId: "", isDefault: false, notes: "", stages: BUILTIN });
@@ -145,6 +154,17 @@ export default function ProductionRoutesPage() {
     finally { setBusy(false); }
   }
 
+  /**
+   * The routes the current filter shows. Filtering a short array in the browser is right
+   * here: the list is already fetched whole for the editor, and a round trip per dropdown
+   * change would be slower than the filter it replaces.
+   */
+  const visibleRoutes = productFilter === ""
+    ? routes
+    : productFilter === "none"
+      ? routes.filter((route) => route.productId === null)
+      : routes.filter((route) => String(route.productId) === productFilter);
+
   return <div className="mx-auto max-w-5xl">
     <PageHeader
       title="Production Routes"
@@ -252,18 +272,66 @@ export default function ProductionRoutesPage() {
     ) : (
       <div className="space-y-3">
         {isOwner && <div className="flex justify-end"><Btn onClick={() => open("new")}><Plus className="h-4 w-4" /> New route</Btn></div>}
+        {/*
+          FILTER BY GARMENT.
+
+          The list is flat and sorted with organisation-level routes first, because a NULL
+          product sorts before any id. With a handful of garments that reads as "the screen
+          only shows organisation defaults" even when every product route is present - which
+          is how this defect was first reported. Filtering to one garment answers the real
+          question ("what does THIS uniform follow?") without scrolling.
+        */}
+        {routes.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="text-xs font-semibold text-slate-600" htmlFor="route-product-filter">Show routes for</label>
+            <select
+              id="route-product-filter"
+              className={`${inputCls} w-auto min-w-[14rem]`}
+              value={productFilter}
+              onChange={(event) => setProductFilter(event.target.value)}
+            >
+              <option value="">Every garment ({routes.length})</option>
+              <option value="none">Organisation-wide defaults ({routes.filter((route) => route.productId === null).length})</option>
+              {products.map((product) => (
+                <option key={product.id} value={String(product.id)}>
+                  {product.name} ({routes.filter((route) => route.productId === product.id).length})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        {routes.length > 0 && visibleRoutes.length === 0 && (
+          <Card><EmptyState title="No routes for that garment" hint="It follows the organisation default if one is flagged, otherwise the Matesther standard eight-stage route. Assign it a route of its own to shorten it, skip a stage, or send one stage out." /></Card>
+        )}
         {routes.length === 0 ? (
           <Card><EmptyState title="No routes defined yet" hint="Every garment currently follows the Matesther standard eight-stage route. Define a route to shorten it, skip a stage, or send one stage out." /></Card>
-        ) : routes.map((route) => (
+        ) : visibleRoutes.map((route) => (
           <Card key={route.id} className="p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0">
                 <p className="text-sm font-bold text-slate-900">
                   {route.name}
-                  {route.isDefault && <span className="ml-2 rounded-full bg-matesther-100 px-2 py-0.5 text-[10px] font-bold text-matesther-800">DEFAULT</span>}
+                  {/* IN USE is the server's own answer, and is the badge that matters: it says
+                      a new batch of this garment really will follow these stages. DEFAULT is
+                      kept beside it because it is the flag that produced that answer. */}
+                  {route.usedForNewBatches && <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-800">IN USE FOR NEW BATCHES</span>}
+                  {route.isDefault && !route.usedForNewBatches && <span className="ml-2 rounded-full bg-matesther-100 px-2 py-0.5 text-[10px] font-bold text-matesther-800">DEFAULT</span>}
                   {!route.isActive && <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">RETIRED</span>}
                 </p>
                 <p className="mt-0.5 text-xs text-slate-500">{route.productName ? `For ${route.productName}` : "For any garment"} • {route.stages.length} stage{route.stages.length === 1 ? "" : "s"}</p>
+                {/* A garment route that is NOT in use is a configuration problem, so it is
+                    named rather than left to be guessed at: either another of the garment's
+                    routes is flagged as its default, or two are competing and neither is. */}
+                {route.productId !== null && route.isActive && !route.usedForNewBatches && (
+                  <p className="mt-1 text-xs font-semibold text-amber-700">
+                    Not used for new batches of {route.productName ?? "this garment"} —{" "}
+                    {routes.some((other) => other.productId === route.productId && other.isActive && other.isDefault && other.id !== route.id)
+                      ? `${routes.find((other) => other.productId === route.productId && other.isActive && other.isDefault)?.name ?? "another route"} is flagged as this garment's default.`
+                      : routes.filter((other) => other.productId === route.productId && other.isActive).length > 1
+                        ? "several of this garment's routes are active and none is flagged as its default, so none can be chosen automatically. Flag one."
+                        : "it is not flagged as the default."}
+                  </p>
+                )}
                 {route.notes && <p className="mt-1 text-xs text-slate-600">{route.notes}</p>}
               </div>
               {isOwner && <div className="flex gap-2">
