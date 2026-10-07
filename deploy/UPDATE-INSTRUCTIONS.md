@@ -24,6 +24,64 @@ Use **one existing email and password**. An inspector who also cuts uniforms nee
 
 This particular release adds no new database fields beyond those already described in `deploy/upgrade-current-client.sql`. If that file has already been applied to the **client** Supabase project, push the updated code to the client GitHub repository and wait for Netlify to publish. If it has **not** been applied, make a backup and run it in the correct client Supabase project **before** deploying this code. It is designed to be repeatable and preserves business records.
 
+## Release: a real lifecycle for tailor support work
+
+This release adds **four nullable columns** to `support_assignments` and **one new append-only table**, `support_status_events`. Both are additive.
+
+1. **Back up the client database first.**
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-support-lifecycle.sql` and Run. It is additive and repeatable: 4 `ADD COLUMN IF NOT EXISTS`, 4 `CREATE INDEX IF NOT EXISTS`, one `CREATE TABLE IF NOT EXISTS` and 4 guarded `ADD CONSTRAINT`. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no change to any existing column's type, default or meaning, and **it writes no data at all** - no backfill, no restatement, and no event invented for work already recorded.
+3. The verification query is at the bottom of the file and runs in the same paste, after the script's own `COMMIT`. Expect `new_columns = 4`, `support_events_table = 1`, `support_event_indexes = 4`, `support_status_index = 1`, `support_event_fks = 4`, and the `support_assignments` and `support_inspections` counts **unchanged** from before you ran it. `backfilled_events` must be **0**: this file never writes a row. `support_event_indexes` is **4**, not 3 - `pg_indexes` also lists `support_status_events_pkey`, the index PostgreSQL creates for the table's primary key. A warning reading `there is already a transaction in progress` is normal if your editor wraps a pasted script in a transaction of its own; it is not an error.
+4. Only then deploy the new application code. **SQL first, code second.** The new code writes these columns and this table, so deploying it first would fail. Existing code ignores columns and tables it does not know about, so running the SQL first is harmless.
+
+### What changes for the people using the system
+
+- Support work now moves **ASSIGNED → STARTED → SUBMITTED → APPROVED** (or **REWORK**), and may be **PAUSED** and resumed from work in hand. The helper starts their own work under **Production → Support Work**; a supervisor cannot put somebody else's pieces in motion for them.
+- **A helper can no longer submit work they never started.** This is the point of the change, and it is the one behaviour that differs for work not yet submitted. A pause requires a written reason, which is stored and shown.
+- **Production → Control now shows support work.** A stage carrying delegated pieces says how many are out, how many are accepted and how many are still owed - and a **paused or rework support operation is reported as blocking**, so the board no longer shows a stage as ordinary work in progress while the support that stage depends on is standing still.
+- Every transition is recorded in `support_status_events` with **the person who made it**, taken from the session. An actor named in a request body is ignored.
+
+### What it deliberately does not do
+
+Nothing already recorded is rewritten. Every existing `support_assignment` keeps `NULL` for all four new columns and gets no events, because that is the truth about it: the system did not record when that helper began. Inventing a start time would put a fabricated timestamp behind a payroll figure. Existing assignments also keep their existing status - `ASSIGNED`, `SUBMITTED`, `APPROVED`, `REWORK` and `CANCELLED` are all still legal states in the new lifecycle, so nothing becomes invalid or unreadable.
+
+The same change is recorded for the ORM as `drizzle/0011_support_lifecycle.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
+## Release: an audited administrative cleanup for test records
+
+This release adds **two new tables**, `order_deletions` and `test_data_purges`. Nothing existing is altered.
+
+1. **Back up the client database first.** This release adds a screen that can remove an order, so the backup is not a formality.
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-test-data-cleanup.sql` and Run, **once**. The file opens its own transaction, creates the objects, commits, and then prints the verification figures - so one paste both applies the upgrade and tells you whether it applied. It is additive and repeatable: 2 `CREATE TABLE IF NOT EXISTS`, 8 `CREATE INDEX IF NOT EXISTS` and 4 guarded `ADD CONSTRAINT`. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no `ALTER` of any existing table, and no backfill. Both tables are created empty, because nothing has been deleted yet that could honestly be recorded. **Nothing in this file raises an error on purpose.** A warning reading `there is already a transaction in progress` is normal if your editor wraps a pasted script in a transaction of its own; it is not an error and it changes nothing.
+3. Read the verification results printed by that same run (they are **section 3** of the file). Expect `audit_tables = 2`, `deletions_indexes = 5`, `purges_indexes = 5`, `deletions_fks = 2`, `purges_fks = 2`, `deletions_columns = 14` and `purges_columns = 15`. **The index figures are 5, not 4**: each table declares `"id" serial PRIMARY KEY`, and `pg_indexes` lists the primary key's own index alongside the four the script creates. Getting 5 means the upgrade worked. Then run the second query in section 3, which reads the new tables directly and so must only be run once `audit_tables = 2`: expect `deletions_rows = 0` and `purges_rows = 0`, with the `orders`, `payments` and `production_batches` counts **unchanged**.
+4. Only then deploy the new application code. **SQL first, code second.** The new code writes to both tables, so deploying it first would fail.
+5. **Optional, and separate:** `deploy/verify-atomicity-probe.sql` proves this server really does undo the writes of a transaction it rolls back - the property both destructive acts in the application depend on, and the one the automated suite cannot test because it runs on pg-mem, which does not roll back. Run it **on its own**, after step 3 has confirmed the tables exist. It is safe, it leaves nothing behind, and **it is not expected to produce an error**: both probes report their verdict as a result row, and the final one reads `PASS - this server rolls back`. If it reports residue, **stop** - transactions are not rolling back on your server, and neither order removal nor the cleanup may be used until that is understood, because both would be able to leave the database half-changed.
+
+Section 5 of the script is not part of the upgrade: it is the queries to run AFTER deploying, which prove the trail is being written and that the counts a preview promised match the counts actually removed.
+
+### Why the probe is a separate file
+
+It used to be the last section of the upgrade script, and that was a defect that cost a production run. The probe proves rollback by aborting on purpose; a migration must never abort. Pasted as part of the whole file, and with no `COMMIT` before it, its `RAISE EXCEPTION 'probe: deliberate abort'` aborted the **one** transaction the entire upgrade was running in and rolled the upgrade back with it. The database was left unchanged and unharmed, which was the safe outcome, but the error gave the person deploying no way to tell from the script whether the tables had been created - it took a catalog query to establish that they had not.
+
+Two things were fixed rather than one. The upgrade now wraps its DDL in an explicit `BEGIN` and `COMMIT`, so its behaviour no longer depends on how a given editor chooses to submit a pasted script; `deploy/upgrade-support-lifecycle.sql` was given the same boundary for the same reason. And the probe moved to its own file, where it can be run deliberately, on its own, and where it reports a verdict instead of an error. A test that is designed to fail must never share a submission with a migration that is designed to succeed. `tests/migration-safety.test.ts` now pins both halves of that: no `RAISE` in either migration file, exactly one `BEGIN`/`COMMIT` pair bounding every DDL statement in each deploy script, verification after the `COMMIT`, and no transaction control at all in the drizzle migrations, where drizzle-kit owns the transaction.
+
+### What changes for the people using the system
+
+- **Settings → Test data** is a new **Owner-only** screen for clearing the test order (Glorious Hope School, 50 garments, ₦150,000) before go-live. A Project Manager, a Worker and any other role are refused by the API before anything is read, so the screen is not merely hidden from them.
+- It works in **two steps that cannot be collapsed**. First a **dry-run preview** that writes nothing and shows every record that would go, the inventory that would be restored and the payroll that would be affected. Then, and only then, an execution that requires the **exact school name and the exact order number typed out**, a written reason of at least ten characters, and an acknowledgement.
+- The preview carries a **fingerprint** of the record ids it counted, recomputed inside the transaction. If anything changed in between, the purge is refused with a 409 and must be previewed again. The same fingerprint makes a **replayed** confirmation refuse, so one authorisation removes one order once.
+- An order belonging to **another organisation** answers 404, indistinguishable from an order that does not exist. Nothing about it is disclosed.
+- **Inventory is restored rather than lost.** Material issued to the order goes back into `materials.current_stock` using the material system's own formula, and a ready-made garment stays a purchase - it is never turned into raw stock. If reversing a purchase would drive a stock figure negative, the purge **refuses** instead of guessing.
+- **Settled payroll is reported and never rewritten.** Worker payments already made for a month the order contributed to are listed for the Owner to see. Payroll has no order column - accrual derives from inspections - so removing the inspections removes the accrual; a payment already banked is a fact and is left alone.
+- **Shared master data is never touched**: customers, products, workers, routes, materials and organisations all survive. Only the order and what belongs to it are removed.
+- Every purge is recorded permanently in `test_data_purges`, and every ordinary order removal in `order_deletions`, each naming the person who did it and the reason they gave.
+- Removing an order the ordinary way now **requires a written reason**, and the orders screen asks for one and shows the server's answer if it refuses.
+
+### What it does NOT do
+
+**It does not weaken the protection you already have.** An order with real approved production and settled payments still cannot be deleted through the ordinary route, and no foreign key was disabled anywhere to make this possible. This is a controlled administrative exception with a typed confirmation, a fingerprint, an audit row and an Owner-only guard - not a general-purpose delete, and not a bypass. It exists to clear one known test order before go-live, and every use of it is recorded.
+
+The same change is recorded for the ORM as `drizzle/0012_deletion_and_purge_audit.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path.
+
 ## Multi-role workers: one person, several roles
 
 This release adds **one new table**, `public.worker_roles`, so a person who cuts and sews is recorded once with two roles instead of twice as two people.
@@ -148,3 +206,26 @@ The same change is recorded for the ORM as `drizzle/0007_variants_routes_and_ext
 The same change is recorded for the ORM as `drizzle/0006_production_ledger_and_indexes.sql`. Do **not** run `drizzle-kit migrate` against production; the SQL Editor route above is the supported path. Note that the `deploy/` file additionally pre-flights the unique indexes, which the `drizzle/` file does not.
 
 **Never run `deploy/full-setup.sql` or `deploy/schema-only.sql` on an existing client project.** Those files are for brand-new empty databases; `full-setup.sql` contains a destructive demo-data reset.
+
+### A brand-new client database needs the whole chain, not just `schema-only.sql`
+
+`deploy/schema-only.sql` is the BASE schema only. It has not been regenerated since roughly
+migration 0003, so on its own it does not create `worker_roles`, `support_assignments`,
+`support_inspections`, `production_movements`, `production_routes`, `production_route_stages`,
+`external_work_orders`, `production_allocations`, `support_status_events`, `order_deletions` or
+`test_data_purges`. A new site built from that file alone will not run.
+
+After `schema-only.sql`, run every `deploy/upgrade-*.sql` in release order - the sections above are
+in that order, newest first, so read them bottom-up - ending with
+`upgrade-support-lifecycle.sql` and `upgrade-test-data-cleanup.sql`. Each is additive and
+repeatable, and each says at the bottom which `drizzle/` migration it corresponds to.
+
+**Do not "fix" `schema-only.sql` by regenerating it from the Drizzle migrations.** It contains ten
+`ENABLE ROW LEVEL SECURITY` / `REVOKE ALL` statements that protect the base tables from
+Supabase's `anon` and `authenticated` API roles, and **no `drizzle/` migration contains any RLS or
+grant statement at all**. Regenerating it from the migrations would produce a complete schema with
+no RLS, which is worse than an incomplete schema with it. Bringing that file current means
+regenerating the tables AND re-applying the RLS block, and deciding whether the tables added since
+(`production_movements`, `production_allocations` and the rest) also need RLS - several of the later
+upgrade scripts add RLS for their own tables and several do not. That is a piece of work in its own
+right, not a side effect of a feature release.

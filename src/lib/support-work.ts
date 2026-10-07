@@ -1,6 +1,6 @@
 import { db } from "@/db";
-import { supportAssignments, supportInspections, workers } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { supportAssignments, supportInspections, supportStatusEvents, workers } from "@/db/schema";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { inspectionEarnings, inspectionPieceRate } from "@/lib/job-pay";
 
 /**
@@ -86,6 +86,67 @@ export async function supportInspectionsFor(assignmentId: number) {
     .where(eq(supportInspections.supportAssignmentId, assignmentId));
 }
 
+/** Accepts the db handle or a transaction handle, like the other lib modules. */
+type Db = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Who moved a support assignment, resolved from the session - never from a body. */
+export type SupportActor = {
+  userId: number | null;
+  workerId: number | null;
+  name: string;
+};
+
+/**
+ * Append one lifecycle event.
+ *
+ * The single write path for the trail, so no caller can record a transition
+ * without recording who made it. Takes the handle it is given, which means a
+ * transition and its event commit together or not at all - an assignment must never
+ * end up PAUSED with no event saying so, or the reverse.
+ */
+export async function recordSupportEvent(
+  handle: Db,
+  entry: {
+    supportAssignmentId: number;
+    organizationId: number | null;
+    eventType: SupportEvent;
+    fromStatus: string | null;
+    toStatus: string;
+    actor: SupportActor;
+    reason?: string | null;
+    notes?: string | null;
+  }
+) {
+  const [event] = await handle
+    .insert(supportStatusEvents)
+    .values({
+      supportAssignmentId: entry.supportAssignmentId,
+      organizationId: entry.organizationId,
+      eventType: entry.eventType,
+      fromStatus: entry.fromStatus,
+      toStatus: entry.toStatus,
+      actorUserId: entry.actor.userId,
+      actorWorkerId: entry.actor.workerId,
+      actorName: entry.actor.name,
+      reason: entry.reason ?? null,
+      notes: entry.notes ?? null,
+    })
+    .returning();
+  return event;
+}
+
+/** The full lifecycle trail for one assignment, oldest first. */
+export async function supportEventsFor(assignmentId: number) {
+  const rows = await db
+    .select()
+    .from(supportStatusEvents)
+    .where(eq(supportStatusEvents.supportAssignmentId, assignmentId));
+  return rows.sort(
+    (a, b) =>
+      (a.occurredAt?.getTime() ?? 0) - (b.occurredAt?.getTime() ?? 0) || a.id - b.id
+  );
+}
+
 /** The worker profile for a support assignment's support worker. */
 export async function supportWorkerProfile(workerId: number) {
   const [person] = await db.select().from(workers).where(eq(workers.id, workerId)).limit(1);
@@ -104,6 +165,337 @@ export function supportPending(assignment: {
 }
 
 /** Statuses a support assignment moves through. */
-export const SUPPORT_STATUSES = ["ASSIGNED", "SUBMITTED", "APPROVED", "REWORK", "CANCELLED"];
+/**
+ * THE SUPPORT-WORK LIFECYCLE.
+ *
+ * It used to be five states with no transitions defined: ASSIGNED, SUBMITTED,
+ * APPROVED, REWORK, CANCELLED. A helper could submit work they had never begun,
+ * nothing could express "the helper has stopped", and Production Control therefore
+ * showed a tailor's stage as ordinary in-progress work while the support it depends
+ * on was standing still.
+ *
+ * The seven states below are the same vocabulary with the missing middle filled in.
+ * ASSIGNED, SUBMITTED, APPROVED, REWORK and CANCELLED keep their exact existing
+ * meaning, so every historical row is still a legal state and nothing is restated.
+ */
+export const SUPPORT_STATUSES = [
+  /** Handed out by the tailor. Nobody has begun. */
+  "ASSIGNED",
+  /** The helper has begun work. */
+  "STARTED",
+  /** The helper has stopped, with a recorded reason. Blocks the parent stage. */
+  "PAUSED",
+  /** Pieces handed back for the tailor to judge. */
+  "SUBMITTED",
+  /** Everything submitted has been judged and at least some was accepted. */
+  "APPROVED",
+  /** Judged, and what remains has to be done again. */
+  "REWORK",
+  /** Withdrawn before any work was submitted. */
+  "CANCELLED",
+] as const;
 
+export type SupportStatus = (typeof SUPPORT_STATUSES)[number];
+
+/**
+ * WHICH TRANSITIONS ARE LEGAL, in one place.
+ *
+ * This is the rule the API enforces; it is not a hint the frontend may ignore. Each
+ * entry is deliberately narrow, because the point is that a caller cannot reach a
+ * state by asking for it:
+ *
+ *   - SUBMITTED is only reachable from STARTED or REWORK, so work can never be
+ *     handed back before it began, and can never be handed back while PAUSED;
+ *   - PAUSED is reachable from ASSIGNED and from STARTED, and from SUBMITTED with
+ *     pieces still unjudged - but never from APPROVED or CANCELLED, which are
+ *     settled. Pausing straight from ASSIGNED is deliberate and has a distinct
+ *     meaning: the tailor who handed the work out has found they cannot give it
+ *     after all, and stops it BEFORE the helper begins rather than letting them
+ *     start work that is about to be withdrawn. Who may do that is an actor rule,
+ *     not a transition rule, and it is enforced separately in the route;
+ *   - APPROVED and REWORK are only reachable from SUBMITTED, so inspection still
+ *     requires something submitted to inspect;
+ *   - CANCELLED is only reachable from ASSIGNED, STARTED or PAUSED. It is NOT
+ *     reachable from SUBMITTED, which preserves the existing rule that submitted
+ *     work must be inspected rather than cancelled away, so history stays intact.
+ *
+ * A state absent from this map as a key has no legal exit except through
+ * inspection, which is how APPROVED, REWORK and CANCELLED behave.
+ */
+export const SUPPORT_TRANSITIONS: Record<SupportStatus, readonly SupportStatus[]> = {
+  ASSIGNED: ["STARTED", "PAUSED", "CANCELLED"],
+  STARTED: ["SUBMITTED", "PAUSED", "CANCELLED"],
+  PAUSED: ["STARTED", "CANCELLED"],
+  /**
+   * SUBMITTED can go back to STARTED, and that is not a mistake. Where the helper
+   * handed back only PART of what was delegated and the tailor has now judged every
+   * piece handed back, the work is not finished - the helper still owes the rest - so
+   * the assignment returns to the helper rather than being marked APPROVED. Treating
+   * it as approved is what made "10 delegated, 4 handed back, 4 judged" read as a
+   * completed assignment with 6 pieces missing.
+   */
+  SUBMITTED: ["STARTED", "APPROVED", "REWORK", "PAUSED"],
+  REWORK: ["STARTED", "SUBMITTED"],
+  APPROVED: [],
+  CANCELLED: [],
+};
+
+/**
+ * The state an inspection produces.
+ *
+ * One rule, in one place, because it has to agree with the transition check that
+ * runs before the write and with the row that gets written. It answers three
+ * questions in order:
+ *
+ *   1. Are pieces still handed back and unjudged? Then nothing is settled yet and the
+ *      assignment stays SUBMITTED - a partial inspection is not a terminal state.
+ *   2. Does the helper still owe pieces they were never asked about, or were sent
+ *      back? Then the work goes to (or stays at) STARTED, because it is the helper's
+ *      turn again and the tailor has nothing left to judge.
+ *   3. Everything delegated has been handed back and judged. Then it is REWORK if
+ *      not one piece was accepted, and APPROVED otherwise.
+ *
+ * `settled` is approved + rework + rejected, and `delegated` is what was handed out.
+ * Comparing against `delegated` rather than against `submitted` is the whole fix:
+ * an assignment is finished when everything GIVEN OUT has been accounted for, not
+ * when everything handed back so far has been judged.
+ */
+export function supportStatusAfterInspection(input: {
+  quantityAssigned: number;
+  quantitySubmitted: number;
+  quantityApproved: number;
+  quantityRejected: number;
+  quantityRework: number;
+}): SupportStatus {
+  const settled = input.quantityApproved + input.quantityRejected + input.quantityRework;
+  const unjudged = Math.max(0, input.quantitySubmitted - settled);
+  if (unjudged > 0) return "SUBMITTED";
+  const outstanding = Math.max(0, input.quantityAssigned - settled);
+  if (outstanding > 0) return "STARTED";
+  return input.quantityRework > 0 && input.quantityApproved === 0 ? "REWORK" : "APPROVED";
+}
+
+/** The lifecycle trail's event vocabulary. Data, not a closed enum. */
+export const SUPPORT_EVENTS = {
+  CREATED: "CREATED",
+  STARTED: "STARTED",
+  PAUSED: "PAUSED",
+  RESUMED: "RESUMED",
+  SUBMITTED: "SUBMITTED",
+  INSPECTED: "INSPECTED",
+  CANCELLED: "CANCELLED",
+} as const;
+
+export type SupportEvent = (typeof SUPPORT_EVENTS)[keyof typeof SUPPORT_EVENTS];
+
+/** The action word a caller uses, mapped to the state it produces. */
+export const SUPPORT_ACTIONS = {
+  start: "STARTED",
+  pause: "PAUSED",
+  resume: "STARTED",
+  cancel: "CANCELLED",
+} as const;
+
+export type SupportAction = keyof typeof SUPPORT_ACTIONS;
+
+/**
+ * Is this transition legal?
+ *
+ * Returns the reason it is not, rather than a bare false, because the answer has to
+ * reach a person on a phone who needs to know what to do instead. An unknown
+ * current status is refused rather than treated as permissive: a row in a state
+ * this code does not recognise must not become a way through the machine.
+ */
+export function supportTransitionError(
+  from: string,
+  to: string
+): string | null {
+  if (!SUPPORT_STATUSES.includes(to as SupportStatus))
+    return `${to} is not a support-work state.`;
+  const allowed = SUPPORT_TRANSITIONS[from as SupportStatus];
+  if (!allowed)
+    return `Support work in state ${from} cannot be changed. Ask the Owner to look at it.`;
+  // Staying where it already is is not a transition. A partial inspection leaves the
+  // assignment SUBMITTED, and refusing that as "cannot move to SUBMITTED" would make
+  // an ordinary second judgement of the remaining pieces impossible.
+  if (from === to) return null;
+  if (!allowed.includes(to as SupportStatus)) {
+    // Named refusals for the cases that matter, so the message says what to do.
+    if (to === "SUBMITTED" && from === "ASSIGNED")
+      return "Start the work before submitting it. Pieces cannot be handed back before anyone began.";
+    if (to === "SUBMITTED" && from === "PAUSED")
+      return "This support work is paused. Resume it before submitting pieces.";
+    if (from === "PAUSED")
+      return "This support work is paused. Resume it first.";
+    if (to === "CANCELLED" && from === "SUBMITTED")
+      return "Work has already been submitted. Inspect it instead of cancelling, so the history stays intact.";
+    if (!allowed.length)
+      return `Support work that is ${from} is finished and cannot be changed.`;
+    return `Support work that is ${from} cannot move to ${to}.`;
+  }
+  return null;
+}
+
+/**
+ * The states that mean the support work is still live - pieces are out with the
+ * helper or awaiting judgement, and the parent stage is still depending on it.
+ *
+ * ASSIGNED counts, because work handed out and never begun is still work the stage
+ * is waiting on; that is precisely the case a control board must not hide.
+ */
+export const OPEN_SUPPORT_STATUSES: readonly string[] = [
+  "ASSIGNED", "STARTED", "PAUSED", "SUBMITTED", "REWORK",
+];
+
+/** The states that mean the helper is NOT currently working: a visible block. */
+export const BLOCKING_SUPPORT_STATUSES: readonly string[] = ["PAUSED", "REWORK"];
+
+/** Is this status still live? Accepts a nullable column value. */
+export function isOpenSupportStatus(status: string | null | undefined): boolean {
+  return OPEN_SUPPORT_STATUSES.includes(String(status ?? ""));
+}
+
+/** Is this status a block on the parent stage? */
+export function isBlockingSupportStatus(status: string | null | undefined): boolean {
+  return BLOCKING_SUPPORT_STATUSES.includes(String(status ?? ""));
+}
+
+/**
+ * How a support status reads on a board, in the same vocabulary the production
+ * board already uses, so a controller does not have to translate between screens.
+ */
+export const SUPPORT_STATUS_LABELS: Record<string, string> = {
+  ASSIGNED: "NOT STARTED",
+  STARTED: "IN PROGRESS",
+  PAUSED: "PAUSED",
+  SUBMITTED: "AWAITING INSPECTION",
+  APPROVED: "APPROVED",
+  REWORK: "REWORK",
+  CANCELLED: "CANCELLED",
+};
+
+/* -------------------------------------------------------------------------- */
+/* Support work as part of the production chain.                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What one stage owes to support work, in one figure set.
+ *
+ * A tailor who hands 20 of their 50 pieces to a helper has not stopped owning those
+ * 20: they are still the tailor's stage, still the tailor's responsibility, and the
+ * stage cannot finish until the helper's part comes back and is accepted. So the
+ * board has to be able to say, for a stage: how much was delegated, how much of it
+ * has been accepted, how much is still out, and whether the helper has stopped.
+ */
+export type StageSupport = {
+  /** Pieces handed out to helpers on this stage. Cancelled hand-overs do not count. */
+  delegated: number;
+  /** Pieces a helper handed back and the tailor accepted. */
+  approved: number;
+  /** Pieces sent back to a helper to do again. */
+  rework: number;
+  /** Pieces a helper could not save. */
+  rejected: number;
+  /** Delegated and not yet settled - still out with a helper or unjudged. */
+  outstanding: number;
+  /** Live hand-overs on this stage, whatever their state. */
+  active: number;
+  /** Hand-overs where the helper has stopped, which is what blocks the stage. */
+  paused: number;
+  /** The most recent pause reason, so the board can say WHY rather than only that. */
+  pausedReason: string | null;
+  /** Hand-overs sent back for rework and not yet returned. */
+  reworkOpen: number;
+  /** True when something on this stage is stopped or sent back. */
+  blocking: boolean;
+};
+
+export const EMPTY_STAGE_SUPPORT: StageSupport = {
+  delegated: 0, approved: 0, rework: 0, rejected: 0, outstanding: 0,
+  active: 0, paused: 0, pausedReason: null, reworkOpen: 0, blocking: false,
+};
+
+/** Accepts the db handle or a transaction handle, like the other lib modules. */
+type SupportDb = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Support work for many stages in ONE query.
+ *
+ * Grouped in SQL by stage and state rather than read row by row and folded in
+ * JavaScript, because the control board derives up to a thousand batches at a time
+ * and a per-stage or per-assignment query there would be an N+1 across the largest
+ * screen in the system. Cancelled hand-overs are excluded in the WHERE clause, so
+ * they never inflate a delegated figure; a paused one is still delegated, because
+ * the pieces really were given out and really are still owed.
+ *
+ * Support work handed out against a share that has no parent stage job is not
+ * attributed to any stage here - it has no stage to be part of - but it remains
+ * fully visible on the support-work screen and in payroll, which is where its own
+ * money is settled.
+ */
+export async function supportByOperation(
+  handle: SupportDb,
+  operationIds: number[]
+): Promise<Map<number, StageSupport>> {
+  const out = new Map<number, StageSupport>();
+  if (!operationIds.length) return out;
+  const rows = await handle
+    .select({
+      operationId: supportAssignments.productionOperationId,
+      status: supportAssignments.status,
+      delegated: sql<number>`coalesce(sum(${supportAssignments.quantityAssigned}), 0)`,
+      approved: sql<number>`coalesce(sum(${supportAssignments.quantityApproved}), 0)`,
+      rework: sql<number>`coalesce(sum(${supportAssignments.quantityRework}), 0)`,
+      rejected: sql<number>`coalesce(sum(${supportAssignments.quantityRejected}), 0)`,
+      pausedAt: sql<number>`max(${supportAssignments.pausedAt})`,
+      reason: sql<string | null>`max(${supportAssignments.pauseReason})`,
+      assignments: sql<number>`count(*)`,
+    })
+    .from(supportAssignments)
+    .where(and(
+      inArray(supportAssignments.productionOperationId, operationIds),
+      sql`${supportAssignments.status} <> 'CANCELLED'`
+    ))
+    .groupBy(supportAssignments.productionOperationId, supportAssignments.status);
+
+  for (const row of rows) {
+    const operationId = Number(row.operationId);
+    const current = out.get(operationId) ?? { ...EMPTY_STAGE_SUPPORT };
+    const delegated = Number(row.delegated) || 0;
+    const approved = Number(row.approved) || 0;
+    const rework = Number(row.rework) || 0;
+    const rejected = Number(row.rejected) || 0;
+    current.delegated += delegated;
+    current.approved += approved;
+    current.rework += rework;
+    current.rejected += rejected;
+    // Settled means judged: accepted, sent back or written off. Anything delegated
+    // beyond that is still out with a helper or still waiting for the tailor.
+    current.outstanding += Math.max(0, delegated - approved - rework - rejected);
+    current.active += Number(row.assignments) || 0;
+    if (row.status === "PAUSED") {
+      current.paused += Number(row.assignments) || 0;
+      if (row.reason) current.pausedReason = String(row.reason);
+    }
+    if (row.status === "REWORK") current.reworkOpen += Number(row.assignments) || 0;
+    out.set(operationId, current);
+  }
+  for (const value of out.values()) {
+    value.blocking = value.paused > 0 || value.reworkOpen > 0;
+  }
+  return out;
+}
+
+/**
+ * There is deliberately NO "support for one stage, or the empty set" helper here.
+ *
+ * One existed, and it was the reason the production control board grew by 48 KB the day
+ * support work was added to it: it turned "this stage has no support work" into a real
+ * object carrying ten zeros, for every stage of every batch on the board, and most stages
+ * of most batches have no support work at all. Callers now read the map directly and get
+ * `undefined`, which serialises to no key at all.
+ *
+ * `EMPTY_STAGE_SUPPORT` stays, but only as the accumulator a grouped row starts from
+ * inside `supportByOperation` - it is never handed back as an answer.
+ */
 export { supportAssignments, supportInspections };

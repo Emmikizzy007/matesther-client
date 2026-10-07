@@ -28,7 +28,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { api, expectStatus, createOwner, createStaff, createWorker, createOrder } from "./support/harness";
+import { api, expectStatus, createOwner, createStaff, createWorker, createOrder, startSupport, pauseSupport, resumeSupport, } from "./support/harness";
 import { currentMonth } from "@/lib/payroll";
 import { SUPPORT_ROLE } from "@/lib/format";
 
@@ -170,6 +170,8 @@ test("100 approved at 300 with 18 delegated at 30 costs the order 30,000 of labo
   assert.equal(assignment.assignedByWorkerId, tailorA.id, "The tailor who holds it is who handed it out");
   assert.equal(assignment.pieceRate, 30, "The helper's rate is snapshotted on the assignment");
 
+  // The lifecycle requires work to have begun before it is handed back.
+  await startSupport(weaver.login, assignment.id);
   await expectStatus(
     await api("PUT", "/api/support-work", { cookie: weaver.login, body: { id: assignment.id, submitQty: 18 } }),
     200, "The helper submits the 18 woven pieces"
@@ -228,6 +230,8 @@ test("unapproved delegated pieces pay the helper nothing and deduct nothing from
   const assignment = await expectStatus(
     await delegate(tailorA.login, weaver.id, allocation.id, 20, 30), 201, "Delegate 20 pieces"
   );
+  // The lifecycle requires work to have begun before it is handed back.
+  await startSupport(weaver.login, assignment.id);
   await expectStatus(
     await api("PUT", "/api/support-work", { cookie: weaver.login, body: { id: assignment.id, submitQty: 20 } }),
     200, "The helper submits 20"
@@ -270,6 +274,8 @@ test("a monthly-paid tailor has nothing to deduct from, so the helper's pay stan
   const assignment = await expectStatus(
     await delegate(salariedLogin, weaver.id, allocation.id, 18, 30), 201, "Delegate 18 pieces"
   );
+  // The lifecycle requires work to have begun before it is handed back.
+  await startSupport(weaver.login, assignment.id);
   await expectStatus(
     await api("PUT", "/api/support-work", { cookie: weaver.login, body: { id: assignment.id, submitQty: 18 } }),
     200, "The helper submits"
@@ -319,6 +325,8 @@ test("a deduction with no commission to come out of is held, never made negative
     }),
     201, "The tailor records 10 pieces of taping handed to the helper"
   );
+  // The lifecycle requires work to have begun before it is handed back.
+  await startSupport(weaver.login, assignment.id);
   await expectStatus(
     await api("PUT", "/api/support-work", { cookie: weaver.login, body: { id: assignment.id, submitQty: 10 } }),
     200, "The helper submits"

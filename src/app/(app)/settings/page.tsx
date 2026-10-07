@@ -205,6 +205,30 @@ export default function SettingsPage() {
             </Card>
           </div>
 
+          {/*
+            The administrative door to removing test business data.
+
+            It lives here rather than on the Orders screen because it is not an order
+            action: it is a database administration act with a preview, two typed
+            confirmations and a permanent record, and it must not sit one click from the
+            list somebody edits orders in. Owner-only by role, and the API behind it
+            refuses any other role before it reads anything.
+          */}
+          <Card className="border-red-200">
+            <CardHeader
+              title="Test-data cleanup"
+              subtitle="Permanently remove a test order and the records belonging to it, after a preview and two typed confirmations"
+              action={<Btn variant="danger" href="/settings/test-data">Open cleanup</Btn>}
+            />
+            <p className="px-5 pb-4 text-xs leading-relaxed text-slate-600">
+              Orders with approved production, customer payments or deliveries cannot be deleted from the Orders list — that protection
+              stays. If such an order is TEST data that must be cleared before operations begin, this tool shows exactly what will be
+              removed, requires the school name and order number to be typed back, reports any payroll already settled and any stock
+              adjustment, and records the cleanup permanently against your name. Shared records — schools, garments, workers, routes,
+              materials — are never touched.
+            </p>
+          </Card>
+
           <Card>
             <CardHeader
               title="Uniform Catalogue"

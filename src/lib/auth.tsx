@@ -8,6 +8,17 @@ export interface SessionUser {
   name: string;
   email: string;
   role: Role;
+  /**
+   * The caller's OWN factory profile, resolved server-side, or null when they have
+   * none. Present so a screen can tell a tailor holding production from a helper
+   * without asking for a staff-only list - both are the WORKER role.
+   *
+   * Optional because the login response does not carry it; only /api/auth/me does.
+   * Nothing decided from it is trusted: every action it enables is re-authorised on
+   * the server, so a forged value in a browser buys nothing.
+   */
+  workerId?: number | null;
+  workerName?: string | null;
 }
 
 type AuthContextType = {
@@ -51,6 +62,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       name: result.name,
       email: result.email,
       role: result.role,
+      // The login route does not resolve a factory profile, so these stay unset
+      // until /api/auth/me is read on the next load. Deliberately not fetched here:
+      // signing in should not wait on it, and no screen needs it before first paint.
+      workerId: result.workerId ?? null,
+      workerName: result.workerName ?? null,
     };
     setUser(account);
     router.replace("/dashboard");

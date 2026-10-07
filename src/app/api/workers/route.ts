@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import { and, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { workers, users, productionOperations, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime } from "@/db/schema";
-import { guard, getSessionUser, OWNER, STAFF } from "@/lib/authz";
+import { guard, getSessionUser, getLinkedWorkerId, ANYONE, OWNER, STAFF } from "@/lib/authz";
+import { SUPPORT_ROLE, hasRole } from "@/lib/format";
 import { allocatedTotalsByWorker, operationIdsWithAllocations } from "@/lib/production-allocation";
 import {
   normaliseRoles,
@@ -47,7 +48,79 @@ const SLIM_COLUMNS = {
   isInspector: workers.isInspector,
 };
 
+/**
+ * `?supportHelpers=1` - WHO A TAILOR MAY HAND WORK TO, and nothing else.
+ *
+ * WHY THIS EXISTS
+ *   A tailor handing out support work has to choose a helper, so they need to know
+ *   which of their colleagues hold the Support Worker role. `GET /api/workers` is
+ *   STAFF-only - correctly, because it carries phone numbers, pay rates, departments
+ *   and per-worker production and earnings totals - and the support screen was
+ *   swallowing that 403 with `.catch(() => [])`. The helper dropdown was therefore
+ *   always empty for a tailor, the form could never be completed, and the feature
+ *   looked broken from the factory floor even though `POST /api/support-work` had
+ *   permitted a tailor all along.
+ *
+ *   The fix is NOT to open the workers list to every Worker. It is this view: a
+ *   purpose-limited answer to the one question the workflow actually asks.
+ *
+ * WHAT IT RETURNS, AND WHAT IT DELIBERATELY DOES NOT
+ *   id, name, roles, paymentType and status - exactly what the picker needs, and
+ *   exactly what it needs in order to tell a PER_PIECE helper (who must be offered an
+ *   agreed rate) from a salaried one. No phone number, no pay rate, no department, no
+ *   job title, no production totals, no earnings, no payroll history: a tailor is not
+ *   entitled to a colleague's private terms, and this endpoint cannot be widened into
+ *   the staff list by adding a parameter, because it selects five columns and returns
+ *   only people who hold the Support Worker role.
+ *
+ *   A tailor may of course appear here themselves if they hold that role. `POST
+ *   /api/support-work` refuses to let them hand work to themselves, so listing them
+ *   costs nothing and keeps the rule about what may be DONE rather than about what
+ *   may be SEEN.
+ */
+async function supportHelperList(req: Request) {
+  // ANYONE rather than STAFF: the whole point is that a linked Worker may ask.
+  const denied = await guard(req, ANYONE);
+  if (denied) return denied;
+  const session = await getSessionUser(req);
+  if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
+  // A Worker with no factory profile of their own can hold no production, so they can
+  // have nothing to delegate from. Refusing is the same answer the support screen
+  // already gives them, rather than a list of colleagues they cannot hand work to.
+  if (session.role === "WORKER" && (await getLinkedWorkerId(session)) === null)
+    return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
+  const rows = await db
+    .select({
+      id: workers.id,
+      name: workers.name,
+      specialty: workers.specialty,
+      status: workers.status,
+      paymentType: workers.paymentType,
+      organizationId: workers.organizationId,
+    })
+    .from(workers)
+    .where(and(
+      eq(workers.status, "ACTIVE"),
+      // Organisation isolation in the query: another company's people are never read.
+      session.organizationId === null ? undefined : eq(workers.organizationId, session.organizationId),
+    ));
+  // Roles are resolved through the same effective-roles rule as everywhere else -
+  // stored role rows plus the legacy specialty - so this list can never disagree with
+  // what the Workers screen shows or with what POST /api/support-work will accept.
+  const roleMap = await rolesByWorker();
+  const helpers = rows
+    .filter((person) => hasRole(roleMap.get(person.id) ?? [person.specialty], SUPPORT_ROLE))
+    .map(({ organizationId, ...person }) => ({
+      ...person,
+      roles: roleMap.get(person.id) ?? [person.specialty],
+    }));
+  return NextResponse.json(helpers, { headers: { "Cache-Control": "private, no-store" } });
+}
+
 export async function GET(req: Request) {
+  // Handled before the STAFF gate, because it has its own narrower gate and its own
+  // narrower answer: it must not fall through to the staff-shaped response below.
+  if (new URL(req.url).searchParams.get("supportHelpers") === "1") return supportHelperList(req);
   const denied = await guard(req, STAFF);
   if (denied) return denied;
   try {

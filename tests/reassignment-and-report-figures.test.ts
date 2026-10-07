@@ -44,8 +44,7 @@ import {
   createOwner,
   createStaff,
   createWorker,
-  createOrder,
-} from "./support/harness";
+  createOrder, startSupport, pauseSupport, resumeSupport, } from "./support/harness";
 
 let n = 0;
 const unique = (prefix: string) => `${prefix} ${Date.now().toString(36)}${(n += 1)}`;
@@ -162,6 +161,8 @@ test("a transfer leaves the original tailor's earnings and support deduction exa
   assert.equal(assignment.productionAllocationId, share.id, "The support work names the exact share it came from");
   assert.equal(assignment.orderVariantId, w.variant.id, "and inherits the exact variant rather than retyping it");
   assert.equal(assignment.stage, "SEWING", "and the stage");
+  // The lifecycle requires work to have begun before it is handed back.
+  await startSupport(helper.login, assignment.id);
   await expectStatus(
     await api("PUT", "/api/support-work", { cookie: helper.login, body: { id: assignment.id, submitQty: 18 } }),
     200, "The helper returns all 18"
@@ -360,6 +361,8 @@ test("a helper's dashboard names the real school and order, not a generic suppor
     }),
     201, "Hand 20 pieces of taping to the helper"
   );
+  // The lifecycle requires work to have begun before it is handed back.
+  await startSupport(helper.login, assignment.id);
   await expectStatus(
     await api("PUT", "/api/support-work", { cookie: helper.login, body: { id: assignment.id, submitQty: 20 } }),
     200, "The helper returns all 20"

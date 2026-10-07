@@ -42,7 +42,6 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
 
   // modals
   const [opModal, setOpModal] = useState<any>(null);
-  const [batchModal, setBatchModal] = useState(false);
   const [payModal, setPayModal] = useState(false);
   const [expModal, setExpModal] = useState(false);
   const [purModal, setPurModal] = useState(false);
@@ -62,8 +61,6 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
   const [formErr, setFormErr] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const emptyBatchForm = () => ({ quantity: "", orderItemId: "", size: "", color: "", workerId: "", cuttingRate: "", tailorId: "", sewingRate: "", expectedCompletionDate: "" });
-  const [batchForm, setBatchForm] = useState(emptyBatchForm);
   const [payForm, setPayForm] = useState({ amount: "", paymentDate: new Date().toISOString().slice(0, 10), paymentMethod: "Bank Transfer", reference: "", notes: "" });
   const [expForm, setExpForm] = useState({ category: "Labour", description: "", amount: "", expenseDate: new Date().toISOString().slice(0, 10), notes: "" });
   const [purForm, setPurForm] = useState({ materialId: "", supplier: "", quantity: "", unitCost: "", purchaseDate: new Date().toISOString().slice(0, 10), notes: "" });
@@ -212,7 +209,24 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
         <div className="flex flex-wrap gap-2 items-center">
           <Badge status={order.status} />
           <Btn variant="secondary" onClick={() => { setFormErr(""); setEditModal(true); }}><Pencil className="w-4 h-4" /> Edit</Btn>
-          <Btn variant="gold" onClick={() => { setFormErr(""); setBatchModal(true); }}><Plus className="w-4 h-4" /> Start Production</Btn>
+          {/*
+            START PRODUCTION OPENS THE ASSIGN PRODUCTION WORKFLOW, FOR THIS ORDER.
+
+            It used to open a second batch-creation dialog on this page. That dialog was
+            a duplicate of /production/assign and a worse one: it offered only a Cutter
+            and a Tailor, took the size as free text, and promised "the eight production
+            stages are created automatically" - which is not true for a polo bought in
+            cut-and-sew, a ready-made cardigan, or a garment whose monogramming goes out
+            to a vendor. Assign Production already resolves the garment's own route, shows
+            the exact variants with what is still available on each, gates every stage by
+            the role it needs, and applies the cutter-supervisor restriction.
+
+            So this is a link, not a modal: one workflow, reached with the order already
+            chosen. The order id travels in the query string and is re-validated by
+            GET /api/production-orders?id= against the caller's organisation - it selects
+            what to show, and authorises nothing.
+          */}
+          <Btn variant="gold" href={`/production/assign?orderId=${id}`}><Plus className="w-4 h-4" /> Start Production</Btn>
         </div>
       </div>
 
@@ -385,7 +399,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
       {tab === "production" && (
         <div className="space-y-4">
           {batches.length === 0 && (
-            <Card><EmptyState title="Production has not started" hint="Start Production creates all eight stages for a garment, size and colour batch." /></Card>
+            <Card><EmptyState title="Production has not started" hint="Start Production opens Assign Production for this order, where you pick the exact garment, size and colour, the route it follows and who does each stage." /></Card>
           )}
           {batches.map((b: any) => (
             <Card key={b.id}>
@@ -789,75 +803,6 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
         )}
       </Modal>
 
-      {/* Start production - agree rates for this garment, size and colour */}
-      <Modal open={batchModal} onClose={() => setBatchModal(false)} title="Start Production - assign a batch" wide>
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            const r = await post("/api/batches", {
-              orderId: Number(id), quantity: Number(batchForm.quantity), orderItemId: Number(batchForm.orderItemId),
-              size: batchForm.size, color: batchForm.color, workerId: batchForm.workerId || null,
-              cuttingRate: batchForm.cuttingRate === "" ? null : Number(batchForm.cuttingRate),
-              tailorId: batchForm.tailorId || null, sewingRate: batchForm.sewingRate === "" ? null : Number(batchForm.sewingRate),
-              expectedCompletionDate: batchForm.expectedCompletionDate || null,
-            });
-            if (r) { setBatchModal(false); setBatchForm(emptyBatchForm()); setTab("production"); load(); }
-          }}
-          className="grid gap-4 sm:grid-cols-2"
-        >
-          <p className="sm:col-span-2 rounded-lg bg-matesther-50 p-3 text-xs text-matesther-800">Create a separate batch for each garment size and colour. This keeps quantity, assigned worker and agreed piecework rate together. The eight production stages are created automatically.</p>
-          <Field label="Uniform item *">
-            <select required value={batchForm.orderItemId} onChange={(e) => {
-              const item = items.find((x: any) => String(x.id) === e.target.value);
-              setBatchForm((current) => ({ ...current, orderItemId: e.target.value, size: "", quantity: item ? String(item.quantity) : "" }));
-            }} className={inputCls}>
-              <option value="">Choose garment</option>
-              {items.map((item: any) => <option key={item.id} value={item.id}>{item.productName} ({item.quantity} ordered)</option>)}
-            </select>
-          </Field>
-          <Field label="Size for this batch">
-            {(sizesData[Number(batchForm.orderItemId)] ?? []).length ? (
-              <select value={batchForm.size} required={!!batchForm.tailorId} onChange={(e) => {
-                const size = (sizesData[Number(batchForm.orderItemId)] ?? []).find((row: any) => row.size === e.target.value);
-                const allocated = batches.filter((batch: any) => batch.orderItemId === Number(batchForm.orderItemId) && batch.size === e.target.value && batch.status !== "CANCELLED").reduce((sum: number, batch: any) => sum + batch.quantity, 0);
-                setBatchForm((current) => ({ ...current, size: e.target.value, quantity: size ? String(Math.max(0, size.quantity - allocated)) : current.quantity }));
-              }} className={inputCls}>
-                <option value="">Choose size</option>
-                {(sizesData[Number(batchForm.orderItemId)] ?? []).map((row: any) => <option key={row.id} value={row.size}>{row.size}: {row.quantity} ordered</option>)}
-              </select>
-            ) : <input value={batchForm.size} onChange={(e) => setBatchForm({ ...batchForm, size: e.target.value })} className={inputCls} placeholder="e.g. S, M or age 6 (optional)" />}
-          </Field>
-          <Field label="Colour / house colour">
-            <input list="matesther-colours" value={batchForm.color} onChange={(e) => setBatchForm({ ...batchForm, color: e.target.value })} className={inputCls} placeholder="e.g. Navy blue" />
-            <datalist id="matesther-colours"><option value="Navy blue"/><option value="White"/><option value="Grey"/><option value="Maroon"/><option value="Red"/><option value="Green"/><option value="Yellow"/></datalist>
-          </Field>
-          <Field label="Quantity in this batch *"><input type="number" min="1" step="1" required value={batchForm.quantity} onChange={(e) => setBatchForm({ ...batchForm, quantity: e.target.value })} className={inputCls} /></Field>
-          <div className="sm:col-span-2 mt-1 border-t border-slate-100 pt-4 text-xs font-bold uppercase tracking-wide text-matesther-800">Cutting assignment</div>
-          <Field label="Cutter">
-            <select value={batchForm.workerId} onChange={(e) => setBatchForm({ ...batchForm, workerId: e.target.value, cuttingRate: "" })} className={inputCls}>
-              <option value="">Assign later</option>
-              {workers.filter((w) => w.status === "ACTIVE" && personHoldsRole(w, "Cutter")).map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
-            </select>
-          </Field>
-          {workers.find((w) => String(w.id) === batchForm.workerId)?.paymentType === "PER_PIECE" && <Field label="Agreed cutting pay per garment (₦) *">
-            <input type="number" min="1" step="1" required value={batchForm.cuttingRate} onChange={(e) => setBatchForm({ ...batchForm, cuttingRate: e.target.value })} className={inputCls} />
-          </Field>}
-          <div className="sm:col-span-2 mt-1 border-t border-slate-100 pt-4 text-xs font-bold uppercase tracking-wide text-matesther-800">Sewing assignment</div>
-          <Field label="Tailor">
-            <select value={batchForm.tailorId} onChange={(e) => setBatchForm({ ...batchForm, tailorId: e.target.value, sewingRate: "" })} className={inputCls}>
-              <option value="">Assign after cutting</option>
-              {workers.filter((w) => w.status === "ACTIVE" && personHoldsRole(w, "Tailor")).map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
-            </select>
-          </Field>
-          {workers.find((w) => String(w.id) === batchForm.tailorId)?.paymentType === "PER_PIECE" && <Field label="Agreed sewing pay per garment (₦) *">
-            <input type="number" min="1" step="1" required value={batchForm.sewingRate} onChange={(e) => setBatchForm({ ...batchForm, sewingRate: e.target.value })} className={inputCls} />
-          </Field>}
-          {batchForm.tailorId && <p className="sm:col-span-2 text-xs text-slate-500">The Tailor sees this batch's selected size and colour. Sewing becomes ready when approved pieces move from Cutting.</p>}
-          <Field label="Target completion date"><input type="date" value={batchForm.expectedCompletionDate} onChange={(e) => setBatchForm({ ...batchForm, expectedCompletionDate: e.target.value })} className={inputCls} /></Field>
-          {formErr && <p className="sm:col-span-2 text-sm text-red-600" role="alert">{formErr}</p>}
-          <div className="sm:col-span-2 flex justify-end gap-2"><Btn variant="secondary" onClick={() => setBatchModal(false)}>Cancel</Btn><Btn type="submit" disabled={saving}>{saving ? "Creating..." : "Start batch"}</Btn></div>
-        </form>
-      </Modal>
 
       {/* Payment */}
       <Modal open={payModal} onClose={() => setPayModal(false)} title="Record Customer Payment">

@@ -55,6 +55,7 @@ import * as orderSizesRoute from "@/app/api/order-sizes/route";
 import * as materialPurchasesRoute from "@/app/api/material-purchases/route";
 import * as materialUsageRoute from "@/app/api/material-usage/route";
 import * as allocationsRoute from "@/app/api/allocations/route";
+import * as testDataCleanupRoute from "@/app/api/test-data-cleanup/route";
 
 export const HOST = "matesther.test";
 export const ORIGIN = `http://${HOST}`;
@@ -143,6 +144,16 @@ const ROUTES: Record<string, Handler> = {
   "PUT /api/material-usage": materialUsageRoute.PUT,
   "POST /api/ready-made": readyMadeRoute.POST,
   "PUT /api/ready-made": readyMadeRoute.PUT,
+  /**
+   * The administrative test-data cleanup: preview, history and execution.
+   *
+   * Registered because a destructive act that is Owner-only, confirmation-gated and
+   * fingerprint-checked is exactly the kind of control that has to be proven by a test
+   * rather than described in a comment. There is no DELETE method on it: a purge is a
+   * POST with typed confirmations, not something a stray verb can trigger.
+   */
+  "GET /api/test-data-cleanup": testDataCleanupRoute.GET,
+  "POST /api/test-data-cleanup": testDataCleanupRoute.POST,
 };
 
 /** Parameterised routes, matched in order. */
@@ -396,4 +407,66 @@ export async function createOrder(
     customerId: customer.data.id,
     productId: product.data.id,
   };
+}
+
+/**
+ * Begin a support assignment, as the helper who holds it.
+ *
+ * WHY TESTS CALL THIS BEFORE SUBMITTING
+ *   Support work now has a real lifecycle: ASSIGNED -> STARTED -> SUBMITTED ->
+ *   APPROVED / REWORK, with PAUSED reachable from work in hand. `PUT
+ *   /api/support-work` refuses a submission from ASSIGNED with 409, because pieces
+ *   cannot be handed back before anybody began - that rule is the reason the
+ *   lifecycle exists, and it is asserted directly in tests/support-lifecycle.test.ts.
+ *
+ *   Every pre-existing fixture below was written when a submission was the first
+ *   thing a helper did. Each one now starts the work first, which is the real
+ *   workflow rather than a workaround: the helper is told about the work, begins it,
+ *   and then hands pieces back.
+ *
+ * Only the support worker may start their own work - a supervisor cannot put
+ * somebody's pieces in motion for them - so this takes the helper's own cookie.
+ */
+export async function startSupport(
+  helperCookie: string,
+  id: number,
+  label = "The support worker starts the work"
+): Promise<any> {
+  const started = await api("PUT", "/api/support-work", {
+    cookie: helperCookie,
+    body: { id, action: "start" },
+  });
+  return expectStatus(started, 200, label);
+}
+
+/**
+ * Pause a support assignment with a reason, and return the updated row.
+ *
+ * The reason is mandatory server-side: a pause Production Control cannot explain is
+ * a pause a controller cannot act on.
+ */
+export async function pauseSupport(
+  cookie: string,
+  id: number,
+  reason: string,
+  label = "The support work is paused"
+): Promise<any> {
+  const paused = await api("PUT", "/api/support-work", {
+    cookie,
+    body: { id, action: "pause", reason },
+  });
+  return expectStatus(paused, 200, label);
+}
+
+/** Resume a paused support assignment, as the helper who holds it. */
+export async function resumeSupport(
+  helperCookie: string,
+  id: number,
+  label = "The support worker resumes the work"
+): Promise<any> {
+  const resumed = await api("PUT", "/api/support-work", {
+    cookie: helperCookie,
+    body: { id, action: "resume" },
+  });
+  return expectStatus(resumed, 200, label);
 }
