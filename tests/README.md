@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 198 tests in about 80 seconds. No server, no `DATABASE_URL`, no network,
+Runs 376 tests in about 4 minutes. No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists
@@ -41,6 +41,11 @@ place and untouched.
 | `support-payroll.test.ts` | Tailor support work paid on approved pieces only, the ban on approving your own support work (including a supervisor who also does the work), assignment and inspection history preserved, salaried non-production staff, the payroll breakdown and payment status, Owner-only payroll and payment sheet, and duplicate-payment prevention |
 | `order-lifecycle-and-attention.test.ts` | One order end to end, derived and never typed. `orderFulfilment` reports ordered / released / approved / remaining / packed / delivered / ready-for-delivery / complete from the ledger and the packing and delivery records, with `complete` derived and returned BESIDE `statusSaysComplete` so a status set by hand without the production to back it is visible rather than trusted - a test marks a 100-piece order COMPLETED with 40 unmade and asserts the two are reported as disagreeing, not reconciled silently. Packing and delivery are bounded by APPROVED PRODUCTION: packing used to accept any positive number against any order id (and not check the order existed), and delivery was bounded only by what was ordered, so a hundred garments could ship with sixty made. The ceiling follows the ledger as more is approved, an order that never entered production keeps the ordered ceiling it always had, and a packing record against an order that does not exist is a 404 with nothing written. Then the attention list (shape, severity ordering, staff-only, rework and shortage and status-mismatch alerts), purchase pagination and filtering, a forged `paidBy` ignored on a payment, and one authoritative profit: dashboard and reports agree for the same book, the card reconciles against its own revenue, the dashboard's gap between the two formulas equals the sum of the per-order gaps the reports screen shows, and on an order with no expenses that gap is exactly the labour the legacy formula omitted |
 | `variant-completion-and-actor.test.ts` | Two things nobody may simply assert. **A variant's completed count:** approved production at the LAST stage of each batch's own frozen route decides wherever the variant has any live batch - including when the ledger says zero, which is the regression that mattered, because the old rule (`derived > 0 ? derived : recorded`) let a number somebody typed survive whenever production had approved nothing, so twenty pieces awaiting inspection or every piece rejected still showed as finished. Submitted, uninspected, rework and rejected quantities complete nothing; a middle stage completes nothing while a batch routed CUTTING -> IRONING contributes its IRONING approvals; two batches of one variant add up once each; different sizes and different colours never mix; several workers sharing one stage do not double-count, judged through the existing attribution mechanism; partial production reports exactly what was approved; and a variant with no production at all keeps the recorded figure rather than being quietly zeroed. **The actor:** a receipt, a packing record and a delivery each name the signed-in user, a forged actor in the request body is ignored on all three, a Worker and a Project Manager are refused on all three whatever actor they claim, and the migration itself is asserted nullable, default-free and free of any data statement |
+| `product-route-resolution.test.ts` | Which route a new batch actually follows, from the direction that exposed the defect. A route saved against a garment is returned by `GET /api/routes` and used by production — the two server-side causes of "the history appears to show organization-default routes" were `listRoutes(productId ?? null)` turning "no filter" into "routes whose product IS NULL", so every product route was silently dropped, and `resolveRoute` requiring `is_default = true` on a product route, so an assigned-but-unflagged route was invisible and the organisation default won. Also: an organisation default never overriding an explicitly assigned product route, `PUT /api/routes` honouring a `productId` so a route can be moved onto a garment after creation, the explicit-`routeId` path checking ownership, `GET /api/production-orders` reporting a `defaultRouteId` the resolver would actually pick (active, owned, and the generic route as a named fallback rather than `null`), cross-organisation routes and products refused, and a batch's route staying frozen so a later edit to the route cannot rewrite history already produced against it |
+| `support-lifecycle.test.ts` | Support work as a lifecycle rather than a quantity. ASSIGNED → STARTED → SUBMITTED → APPROVED / REWORK, with PAUSED reachable from work in hand and RESUMED back out of it, every move server-enforced: no submitting before anybody started (409), no submitting or being inspected while paused, no self-approval, no over-delegation past what the stage holds, no handing out another tailor's work, and a pause requiring a written reason. `supportStatusAfterInspection` compares against the quantity ASSIGNED rather than the quantity submitted, so ten pieces delegated, four handed back and four judged is partial work and not an approval. Every transition appends to `support_status_events` with the actor who made it, a forged actor in the body ignored in favour of the session, and a Production Control board that reports a paused support operation as blocking rather than showing the stage as ordinary work in progress |
+| `test-data-cleanup.test.ts` | The administrative test-data purge, and everything that stops it being a general-purpose delete. Owner-only with the guard before any read, a foreign organisation's order indistinguishable from a nonexistent one (404 either way), the exact school name and order number typed to confirm, a reason of at least ten characters, a dry-run preview that writes nothing, a SHA-256 fingerprint over the sorted per-table id sets recomputed inside the transaction so a stale preview and a replayed one are both 409. Inventory is restored with the material routes' own formula and refuses rather than guessing when reversing a purchase would drive stock negative, ready-made garments stay purchases and never become raw stock, settled payroll is reported and never rewritten, and shared master data — customers, products, workers, routes, materials, organisations — is never touched. The ordinary protection against deleting an order with approved production and payments is asserted to still hold |
+| `start-production-and-list-bounds.test.ts` | Two things that are easy to get subtly wrong. **Start Production** on an order opens the existing Assign Production workflow with that order preselected — one assignment interface, not a second one — and the assignment is revalidated server-side, so an `orderId` belonging to another organisation or to no order at all preselects nothing. **List bounds:** the orders, payments, packing and expenses lists filter, search and page in SQL rather than reading whole tables into the process and filtering in JavaScript, `X-Total-Count` carrying the unpaginated total so a client can page without a second request, and a search term never widening the result past the signed-in organisation |
+| `migration-safety.test.ts` | The two migrations this release adds, held mechanically to the promise every file in `deploy/` makes in prose: additive, repeatable, and writing no data. No `DROP`, `TRUNCATE`, `RENAME`, `DELETE`, `UPDATE` or `INSERT` outside a comment; every statement a guarded DDL form or a read-only verification query; a runnable verification `SELECT` present in each deploy script and actually naming the tables it created; no drizzle `--> statement-breakpoint` marker leaked into a file meant to be pasted into the SQL Editor; both migrations registered in the journal in order with a snapshot each; both upgrade scripts applied TWICE against the migrated database with the table set unchanged, the new tables still empty and a real order created through the API still intact afterwards; and `CREATE TABLE IF NOT EXISTS` proven a genuine no-op on a fresh in-memory database, which is the only place pg-mem can run the guarded form at all |
 
 ## How it works
 
@@ -53,7 +58,7 @@ Nothing in the suite re-implements, copies or fakes application logic. A test
 that calls `api("POST", "/api/inspections", ...)` executes the actual
 inspection route against the actual data layer.
 
-### Two pg-mem traps worth knowing before you write a query
+### pg-mem traps worth knowing before you write a query
 
 **`IS NOT NULL` combined with `IN (...)` on a nullable column returns no rows.** Not an error —
 silently empty. `and(isNotNull(t.orderId), inArray(t.orderId, ids))` is also redundant SQL,
@@ -68,6 +73,43 @@ you suspect the arithmetic.**
 `reports.totals`, `reports.production` — therefore accumulate. Assert on the specific row
 (`workers.find(w => w.workerId === id).piecework`) rather than on a global total, or on an
 invariant that holds for any set of rows (`remaining === received - approved - rejected`).
+
+**Transactions do not roll back.** An `insert` followed by a `throw` inside
+`db.transaction(async (tx) => ...)` leaves BOTH the row and every other write the
+transaction made. This was verified directly rather than assumed. Any test that claims
+"the transaction rolled back" is therefore claiming something pg-mem cannot demonstrate
+in either direction, so this suite does not: `tests/test-data-cleanup.test.ts` says so at
+the top instead of faking a rollback assertion, and asserts the ordering and the guards
+that a rollback would have backed up.
+
+**No `pg_indexes`, no `pg_tables`, no `pg_constraint`, and `::regclass` will not cast.**
+Index counts and foreign-key counts cannot be asserted here at all. `information_schema.tables`
+IS emulated, so table presence can be. A deploy script whose verification `SELECT` reads
+those catalogues is still correct PostgreSQL — it just cannot be *run* by a test, so
+`tests/migration-safety.test.ts` skips those statements explicitly and says why, rather
+than silently skipping everything.
+
+**`CREATE TABLE IF NOT EXISTS` is not honoured for a table that already exists** — it
+errors with an unread-AST complaint instead of skipping. `CREATE INDEX IF NOT EXISTS` and
+`ADD COLUMN IF NOT EXISTS` ARE both honoured, which is why migration 0006 can re-declare
+every index in the schema. Do not "fix" this by stripping `IF NOT EXISTS` from index
+creation: that was tried and it breaks 0006. To test the table guard, use a genuinely
+fresh `newDb()` — see the last test in `tests/migration-safety.test.ts`.
+
+**Inline column constraints are not parsed.** `CREATE TABLE t ("id" serial PRIMARY KEY NOT NULL)`
+fails on the `PRIMARY KEY` and `NOT NULL` column constraints. pg-mem also cannot resolve a
+correlated `EXISTS` that references a column of the outer query, which is why order search
+joins `customers` and uses two `ilike` predicates rather than an `EXISTS` subquery.
+
+**`sql` templates interpolate numbers as identifiers, not bound values.** Building a
+subquery by string interpolation silently counts zero rows instead of failing. Use real
+Drizzle joins and `inArray`, and read a `count(*)` result as `rows[0]?.total` — destructuring
+`const [a, b] = await Promise.all([selectA, selectB])` binds whole ARRAYS, so `a?.total` is
+`undefined` and every guard built on it reads zero. That single mistake once made an order
+with approved production deletable, and it was typecheck that caught it.
+
+**A btree index cannot enumerate `NOT IN (...)` on an indexed column.** Two `ne()`
+predicates express the same thing and work.
 
 ## Important caveats
 

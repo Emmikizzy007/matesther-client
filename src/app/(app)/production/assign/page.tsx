@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { Suspense, useCallback, useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { ArrowRight, CheckCircle2, Factory, Plus, Scissors } from "lucide-react";
 import { Btn, Card, Field, Loading, PageHeader, inputCls } from "@/components/ui";
 import { fmtDate, methodLabel, personHoldsRole, stageLabel, STAGES, STAGE_ROLES, PRODUCTION_METHODS } from "@/lib/format";
@@ -35,7 +36,11 @@ type ProductionOrder = {
     id: number; name: string; productId: number | null; quantity: number;
     variants: Variant[]; sizes: { size: string | null; quantity: number }[];
     assigned: { batchId: number; size: string | null; color: string | null; quantity: number; route: string | null }[];
+    /** The route a NEW batch of this garment would follow, resolved server-side. */
     defaultRouteId: number | null;
+    defaultRouteName: string | null;
+    /** True when that route is the organisation-wide default rather than this garment's own. */
+    defaultRouteIsGeneric: boolean;
   }[];
 };
 type Worker = { id: number; name: string; specialty: string; roles?: string[]; paymentType: string; status: string };
@@ -52,6 +57,30 @@ const newForm = (): Form => ({ orderId: "", itemId: "", variantId: "", quantity:
 const BUILTIN: RouteStage[] = STAGES.map((stage) => ({ stage, method: "INTERNAL", roleRequired: null }));
 
 export default function AssignProductionPage() {
+  // `useSearchParams` reads the query string during render, which opts this route into
+  // dynamic rendering; Next.js requires it to sit inside a Suspense boundary so the
+  // shell can paint first. The fallback is the same spinner the page already shows while
+  // it loads its catalogue, so nothing new appears.
+  return (
+    <Suspense fallback={<div className="mx-auto max-w-4xl"><Card><Loading label="Loading assignment options..." /></Card></div>}>
+      <AssignProduction />
+    </Suspense>
+  );
+}
+
+function AssignProduction() {
+  const searchParams = useSearchParams();
+  /**
+   * The order this screen was opened FOR, when it was opened from a school's order page.
+   *
+   * It is a preselection, not an authorisation: the value comes from a query string
+   * anybody can type, and everything it does is decide which row of the catalogue is
+   * chosen in the dropdown. The catalogue itself is fetched from
+   * GET /api/production-orders, which scopes to the caller's organisation and refuses a
+   * completed or cancelled order, so an id that is not this caller's, or not open for
+   * production, simply is not in the list and nothing gets preselected.
+   */
+  const requestedOrderId = (searchParams.get("orderId") ?? "").trim();
   const [orders, setOrders] = useState<ProductionOrder[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
@@ -65,14 +94,54 @@ export default function AssignProductionPage() {
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
 
-  async function load() {
+  /*
+   * The loader, memoised on the one reactive value it reads.
+   *
+   * WHY useCallback AND NOT useEffectEvent
+   *   `useEffectEvent` is the hook designed for "read the latest value without making it a
+   *   dependency", and it is stable in React 19. It is the WRONG tool here for a concrete
+   *   reason: a function it returns may only be called from inside an effect, and the
+   *   eslint plugin makes calling one from anywhere else an error. This loader is called
+   *   from three places - the effect below, the save handler once a batch is created, and
+   *   the Refresh button beside an error - so an effect-event would either break two call
+   *   sites or force a second copy of the loader.
+   *
+   * WHY THIS DOES NOT LOOP OR OVER-FETCH
+   *   `requestedOrderId` is a string primitive read off the query string, so it compares by
+   *   value: the memo identity is stable across every render of the same URL and changes
+   *   only when the URL changes. Everything else `load` touches is a setState function
+   *   (stable by guarantee), a module-level constant, or a pure helper. `[load]` below is
+   *   therefore exactly as selective as `[requestedOrderId]` was, and the fetch runs on
+   *   mount and on a genuine URL change - never on an unrelated re-render.
+   *
+   * Declaring it here also removes the missing-dependency warning the previous shape had,
+   * without suppressing anything and without moving the loader inside the effect, which
+   * would have broken the two event-handler call sites.
+   */
+  const load = useCallback(async function load() {
     setLoading(true);
     try {
+      /* ---- the catalogue ----
+       *
+       * The FULL open-order catalogue is fetched even when this screen was opened for one
+       * particular order, and that is deliberate. Preselecting an order must not cost the
+       * operator the ability to change their mind: arriving here from a school's order page
+       * and finding a dropdown with one entry in it is a worse screen than the one that made
+       * them hunt through the list in the first place.
+       *
+       * What makes that affordable is that the endpoint is now scoped in SQL - the caller's
+       * own organisation and only orders still open for production - rather than reading
+       * every order, customer, item, product, variant, batch and route in the database and
+       * filtering in JavaScript, which is what it did before. `?id=` remains available for a
+       * caller that genuinely wants one order, and is what the tests use.
+       */
       const [orderResponse, workerResponse, accessResponse, routeResponse] = await Promise.all([
         fetch("/api/production-orders", { cache: "no-store" }),
         fetch("/api/workers?view=slim", { cache: "no-store" }),
         fetch("/api/production-access", { cache: "no-store" }),
-        fetch("/api/routes", { cache: "no-store" }),
+        // Only routes still in use are offered, and the filter is applied in SQL rather
+        // than to a full list in the browser.
+        fetch("/api/routes?activeOnly=1", { cache: "no-store" }),
       ]);
       const [orderData, workerData, accessData, routeData] = await Promise.all([
         orderResponse.json(), workerResponse.json(), accessResponse.json(), routeResponse.json(),
@@ -81,14 +150,29 @@ export default function AssignProductionPage() {
         throw new Error(orderData.error || workerData.error || accessData.error || "Could not load assignment options.");
       const cuttingAllowed = accessData.canAssignCutting === true;
       setCanAssignCutting(cuttingAllowed);
-      setOrders(Array.isArray(orderData) ? orderData : []);
+      const catalogue: ProductionOrder[] = Array.isArray(orderData) ? orderData : [];
+      setOrders(catalogue);
       setWorkers(Array.isArray(workerData) ? workerData : []);
       setRoutes(Array.isArray(routeData) ? routeData.filter((route: Route) => route.isActive) : []);
+      // Preselect the order the caller came from, and its due date as the target, so
+      // "Start Production" lands here with the work already chosen rather than with a
+      // dropdown to hunt through. Silently does nothing when the order is not in the
+      // catalogue - not this caller's, or not open for production - because guessing a
+      // different order would be worse than asking.
+      if (/^\d+$/.test(requestedOrderId)) {
+        const wanted = catalogue.find((entry) => String(entry.id) === requestedOrderId);
+        if (wanted) {
+          setForm({ ...newForm(), orderId: String(wanted.id), expectedCompletionDate: wanted.dueDate ?? "" });
+          if (wanted.items.length === 1) setForm((current) => ({ ...current, itemId: String(wanted.items[0].id) }));
+        } else {
+          setError("That order is not available for production - it may be completed, cancelled, or not yours to see. Choose another below.");
+        }
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load assignment options.");
     } finally { setLoading(false); }
-  }
-  useEffect(() => { void load(); }, []);
+  }, [requestedOrderId]);
+  useEffect(() => { void load(); }, [load]);
 
   const order = orders.find((record) => String(record.id) === form.orderId);
   const item = order?.items.find((record) => String(record.id) === form.itemId);
@@ -181,6 +265,20 @@ export default function AssignProductionPage() {
           </p>
         </div>
         <form onSubmit={submit} className="space-y-5 p-4 sm:p-6">
+          {/* Arriving from a school's order page, the order is already chosen - so say so,
+              rather than leaving the operator to notice a dropdown was pre-filled. */}
+          {/^\d+$/.test(requestedOrderId) && order && (
+            <p className="flex flex-wrap items-center gap-2 rounded-lg border border-matesther-200 bg-matesther-50 px-3 py-2 text-xs text-matesther-900">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              <span>
+                Opened for <strong>{order.customer}</strong> · {order.orderNumber}
+                {order.dueDate ? ` · due ${order.dueDate}` : ""}
+              </span>
+              <Link href={`/orders/${order.id}`} className="ml-auto font-semibold text-matesther-700 hover:underline">
+                Back to this order
+              </Link>
+            </p>
+          )}
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="1. School order *"><select className={inputCls} required value={form.orderId} onChange={(event) => {
               const chosen = orders.find((entry) => String(entry.id) === event.target.value);
@@ -252,6 +350,37 @@ export default function AssignProductionPage() {
               ))}
               <option value="custom">Build a one-off route for this batch…</option>
             </select>
+
+            {/*
+              SAY WHERE THE DEFAULT CAME FROM.
+
+              A garment route that is silently ignored is indistinguishable from a garment
+              route that was never saved, which is exactly how the product-route defect was
+              first noticed: the stages shown were the organization default's and nothing on
+              screen said so. This line names the route the batch will actually follow and
+              why, using the same `isAutomaticRoute` rule the server resolves with - so the
+              three cases read differently, and a garment with two competing unflagged routes
+              says so instead of picking one at random.
+            */}
+            {item && (
+              <p className="mt-2 text-xs text-slate-500">
+                {item.defaultRouteId ? (
+                  <>
+                    New batches of <strong>{item.name}</strong> follow{" "}
+                    <strong>{item.defaultRouteName ?? "this garment's own route"}</strong>
+                    {item.defaultRouteIsGeneric ? ", the organisation-wide default, because this garment has no route of its own." : ", the route assigned to this garment."}
+                  </>
+                ) : (
+                  <>
+                    <strong>{item.name}</strong> has no route assigned, so new batches follow{" "}
+                    {routes.some((route) => !route.productId && route.isDefault)
+                      ? <>the organisation default, <strong>{routes.find((route) => !route.productId && route.isDefault)?.name}</strong>.</>
+                      : <>Matesther's standard eight-stage route.</>}{" "}
+                    <Link href="/production/routes" className="font-semibold text-matesther-700 hover:underline">Assign one</Link>
+                  </>
+                )}
+              </p>
+            )}
 
             {form.routeChoice === "custom" && (
               <div className="mt-3 space-y-2">

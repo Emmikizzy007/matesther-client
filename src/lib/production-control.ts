@@ -15,6 +15,7 @@ import {
 } from "@/db/schema";
 import { deriveQuantitiesBulk, detailOrZero } from "@/lib/production-ledger";
 import { allocationsByOperation, workerNames } from "@/lib/production-allocation";
+import { supportByOperation, type StageSupport } from "@/lib/support-work";
 
 /**
  * ROUTE-AWARE PRODUCTION CONTROL.
@@ -69,6 +70,15 @@ export type ControlFilters = {
   stage?: string | null;
   priority?: number | null;
   blockedOnly?: boolean;
+  /**
+   * Only batches whose support work has stopped.
+   *
+   * Derived rather than pushed into SQL, because "paused" is a property of the
+   * support rows behind a batch's stages and the board already derives the window in
+   * one pass - so this names itself in `appliedAfterDerivation` like the other
+   * derived filters, and the UI can say the list is narrowed.
+   */
+  supportPausedOnly?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -94,6 +104,22 @@ export type StageControl = {
   workers: StageWorker[];
   /** Dispatches sent out and not yet accounted for. */
   openDispatches: number;
+  /**
+   * Support work handed out from this stage - or null when the stage has none.
+   *
+   * A stage's own counters describe what the stage holds; they say nothing about the
+   * part of it a tailor gave to a helper. Without this the board reported a stage as
+   * ordinary in-progress work while the support it was waiting on had stopped, which
+   * is precisely the case a controller has to see.
+   *
+   * NULL RATHER THAN A ZEROED OBJECT, deliberately. Most stages of most batches have no
+   * support work at all, and emitting ten zero fields for each of them added 48 KB to a
+   * full board without saying anything - which is how a feature that makes the board
+   * more useful made it slower to load. A stage nobody delegated from carries no support
+   * object; a stage that was delegated from carries the real figures, including once
+   * they are all settled, because "20 handed out, 20 accepted" is still worth showing.
+   */
+  support: StageSupport | null;
   isCurrent: boolean;
 };
 
@@ -131,6 +157,23 @@ export type ControlRow = {
   rejected: number;
   /** The incomplete stage holding the most work - where this batch is piling up. */
   bottleneck: { position: number; stage: string; quantity: number } | null;
+  /**
+   * This batch's support work, rolled up across its whole route.
+   *
+   * "50 assigned, 20 delegated, 15 approved, 5 still out" has to be one answer on the
+   * board and one answer on the support screen, so it is summed here from the same
+   * per-stage figures rather than derived twice. `pausedStages` names the stages a
+   * helper has stopped on, because a controller acts on a stage, not on a count.
+   */
+  support: {
+    delegated: number;
+    approved: number;
+    outstanding: number;
+    paused: number;
+    reworkOpen: number;
+    blocking: boolean;
+    pausedStages: { stage: string; reason: string | null }[];
+  };
   flags: string[];
   stuck: boolean;
   priority: number;
@@ -219,14 +262,37 @@ export function flagsFor(input: {
   if (stage.awaitingInspection > 0) flags.push("AWAITING_INSPECTION");
   if (stage.rework > 0 && stage.remaining > 0) flags.push("REWORK_PENDING");
   if (stage.openDispatches > 0) flags.push("OUTSOURCED_WAITING");
+  /* ---- support work is part of this stage, not a side note ----
+   *
+   * A helper who has stopped is a hard block: the tailor cannot finish the stage
+   * until those pieces come back, so the batch must not read as merely in progress.
+   * Pieces handed back for the helper to redo are the same kind of block. Delegated
+   * work that is simply still in hand is NOT a block - it is normal production - but
+   * it is reported, because "20 of these 50 are with a helper" is what makes the
+   * stage's own remaining figure interpretable.
+   */
+  const support = stage.support;
+  if (support) {
+    if (support.paused > 0) flags.push("SUPPORT_PAUSED");
+    if (support.reworkOpen > 0) flags.push("SUPPORT_REWORK");
+    if (support.outstanding > 0) flags.push("SUPPORT_IN_PROGRESS");
+  }
   if (stage.received > 0 && stage.assigned <= 0 && stage.workers.length === 0 && stage.openDispatches === 0)
     flags.push("UNASSIGNED");
   return flags;
 }
 
-/** Flags that mean work exists but is not moving. */
+/**
+ * Flags that mean work exists but is not moving.
+ *
+ * SUPPORT_PAUSED and SUPPORT_REWORK are blocking: the stage is waiting on somebody
+ * else and cannot complete. SUPPORT_IN_PROGRESS deliberately is NOT - a helper
+ * working is production happening, and calling it a block would put every delegated
+ * garment on the stuck list and make the list mean nothing.
+ */
 const BLOCKING_FLAGS = new Set([
   "AWAITING_INSPECTION", "REWORK_PENDING", "OUTSOURCED_WAITING", "UNASSIGNED", "WAITING_UPSTREAM", "NO_ROUTE",
+  "SUPPORT_PAUSED", "SUPPORT_REWORK",
 ]);
 
 export function isStuck(flags: string[], remaining: number): boolean {
@@ -363,8 +429,14 @@ export async function productionControl(
     .orderBy(asc(productionOperations.productionBatchId), asc(productionOperations.routePosition), asc(productionOperations.id));
   const operationIds = operations.map((row) => row.id);
 
-  // ---- 3. the ledger, the shares and the open dispatches: three more queries ----
-  const [ledger, allocations, dispatchRows] = await Promise.all([
+  /* ---- 3. the ledger, the shares, the open dispatches and the support work ----
+   *
+   * Four queries for the whole window, run together. Support work joins here rather
+   * than in a later pass so that it costs ONE statement however many batches the
+   * window holds: it is aggregated in SQL by stage and state, never read assignment
+   * by assignment.
+   */
+  const [ledger, allocations, dispatchRows, support] = await Promise.all([
     deriveQuantitiesBulk(db, operationIds),
     allocationsByOperation(operationIds),
     operationIds.length
@@ -376,6 +448,7 @@ export async function productionControl(
           .where(and(inArray(externalWorkOrders.productionOperationId, operationIds), eq(externalWorkOrders.status, "SENT")))
           .groupBy(externalWorkOrders.productionOperationId)
       : Promise.resolve([] as { operationId: number; open: number }[]),
+    supportByOperation(db, operationIds),
   ]);
   // Every worker named on any share in the window, in one further query - so the
   // statement count stays constant however many batches the window holds.
@@ -457,6 +530,7 @@ export async function productionControl(
         assigned,
         workers,
         openDispatches: openDispatches.get(operation.id) ?? 0,
+        support: support.get(operation.id) ?? null,
         isCurrent: false,
       };
     });
@@ -506,6 +580,24 @@ export async function productionControl(
       rework: stages.reduce((sum, stage) => sum + stage.rework, 0),
       rejected: stages.reduce((sum, stage) => sum + stage.rejected, 0),
       bottleneck: bottleneckOf(stages),
+      support: (() => {
+        // `stage.support` is null on a stage nobody delegated from, so every read goes
+        // through the narrowed list rather than assuming an object is there.
+        const delegated = stages.filter(
+          (stage): stage is (typeof stage & { support: StageSupport }) => stage.support !== null
+        );
+        return {
+          delegated: delegated.reduce((sum, stage) => sum + stage.support.delegated, 0),
+          approved: delegated.reduce((sum, stage) => sum + stage.support.approved, 0),
+          outstanding: delegated.reduce((sum, stage) => sum + stage.support.outstanding, 0),
+          paused: delegated.reduce((sum, stage) => sum + stage.support.paused, 0),
+          reworkOpen: delegated.reduce((sum, stage) => sum + stage.support.reworkOpen, 0),
+          blocking: delegated.some((stage) => stage.support.blocking),
+          pausedStages: delegated
+            .filter((stage) => stage.support.paused > 0)
+            .map((stage) => ({ stage: stage.stage, reason: stage.support.pausedReason })),
+        };
+      })(),
       flags,
       stuck,
       priority: priority.rank,
@@ -529,6 +621,10 @@ export async function productionControl(
   if (filters.blockedOnly) {
     appliedAfterDerivation.push("blockedOnly");
     rows = rows.filter((row) => row.stuck);
+  }
+  if (filters.supportPausedOnly) {
+    appliedAfterDerivation.push("supportPausedOnly");
+    rows = rows.filter((row) => row.support.paused > 0);
   }
   // Most urgent first, then soonest due, then oldest batch. Deterministic, so paging
   // through the same filters always shows the same rows in the same order.
@@ -575,6 +671,12 @@ export function rollUpByOrder(rows: ControlRow[]) {
     priorityLabel: string;
     stuck: boolean;
     flags: string[];
+    /** Support work across every batch of this order, summed from the batch rows. */
+    support: {
+      delegated: number; approved: number; outstanding: number;
+      paused: number; reworkOpen: number; blocking: boolean;
+      pausedStages: { stage: string; reason: string | null }[];
+    };
   }>();
   for (const row of rows) {
     const found = byOrder.get(row.orderId) ?? {
@@ -586,6 +688,10 @@ export function rollUpByOrder(rows: ControlRow[]) {
       ordered: 0, finished: 0, remaining: 0, assigned: 0, awaitingInspection: 0,
       rework: 0, rejected: 0, batches: 0, stages: [],
       priority: 6, priorityLabel: "COMPLETE", stuck: false, flags: [] as string[],
+      support: {
+        delegated: 0, approved: 0, outstanding: 0, paused: 0, reworkOpen: 0,
+        blocking: false, pausedStages: [] as { stage: string; reason: string | null }[],
+      },
     };
     found.ordered += row.ordered;
     found.finished += row.finished;
@@ -603,6 +709,18 @@ export function rollUpByOrder(rows: ControlRow[]) {
     }
     if (row.stuck) found.stuck = true;
     for (const flag of row.flags) if (!found.flags.includes(flag)) found.flags.push(flag);
+    // Support work rolls up the same way: summed where it is a quantity, and the
+    // order is as blocked as any batch whose helper has stopped.
+    found.support.delegated += row.support.delegated;
+    found.support.approved += row.support.approved;
+    found.support.outstanding += row.support.outstanding;
+    found.support.paused += row.support.paused;
+    found.support.reworkOpen += row.support.reworkOpen;
+    if (row.support.blocking) found.support.blocking = true;
+    for (const paused of row.support.pausedStages) {
+      if (!found.support.pausedStages.some((entry) => entry.stage === paused.stage && entry.reason === paused.reason))
+        found.support.pausedStages.push(paused);
+    }
     byOrder.set(row.orderId, found);
   }
   return [...byOrder.values()]
@@ -640,6 +758,22 @@ export type OrderFulfilment = {
   awaitingInspection: number;
   rework: number;
   rejected: number;
+  /**
+   * Support work handed out from this order's stages.
+   *
+   * The order page and the control board read the SAME rollup, so "20 delegated, 15
+   * approved, 5 still out" cannot differ between them - which matters because one of
+   * those screens is the Owner's and one is the production manager's.
+   */
+  support: {
+    delegated: number;
+    approved: number;
+    outstanding: number;
+    paused: number;
+    reworkOpen: number;
+    blocking: boolean;
+    pausedStages: { stage: string; reason: string | null }[];
+  };
   packed: number;
   delivered: number;
   /** Approved and not yet shipped: what is genuinely ready to go out. */
@@ -720,6 +854,10 @@ export async function orderFulfilment(orderId: number): Promise<OrderFulfilment 
     awaitingInspection: rolled?.awaitingInspection ?? 0,
     rework: rolled?.rework ?? 0,
     rejected: rolled?.rejected ?? 0,
+    support: rolled?.support ?? {
+      delegated: 0, approved: 0, outstanding: 0, paused: 0, reworkOpen: 0,
+      blocking: false, pausedStages: [],
+    },
     packed,
     delivered,
     readyForDelivery: Math.max(0, approved - delivered),

@@ -1982,3 +1982,368 @@ forward from an earlier session, not in this codebase. The per-worker `completed
 workers screen is a different concept - operation-level work plus submitted shares, shown beside a
 separate `approved` field - and was inspected and deliberately left alone rather than silently
 redefined.
+
+# 40. IMPLEMENTED: support-work lifecycle, route resolution, list bounds and audited test-data cleanup
+
+Fifteen requirements were taken in one pass. This section records what a future reader must not
+redo or undo. Nothing here is a second system: every item extends a mechanism the codebase
+already had, and where an existing rule was in the way the rule was kept and the defect behind it
+was fixed instead.
+
+## 40.1 The two defects that were reported as one, and were not the UI's fault
+
+The report was "product-specific routes are ignored; the history appears to show
+organization-default routes." Two independent server-side causes, neither visible from the screen
+that was blamed:
+
+1. `listRoutes(productId?: number | null)` decided "no filter" by testing `productId === undefined`,
+   and every caller passed `productId ?? null`. So `null` — intended as "every route" — became the
+   filter "routes whose `product_id` IS NULL", and `GET /api/routes` returned **only**
+   organisation-level routes. Reproduced directly: a route existed in the database with
+   `productId: 1` and the endpoint returned `[]`. Fixed by replacing the positional argument with a
+   named `RouteFilter` object, so "absent" and "explicitly null" can no longer be confused.
+2. `resolveRoute` looked for a product route with `is_default = true`. A route saved against a
+   garment WITHOUT that flag was invisible to it, so the organisation default won — an organisation
+   default silently overriding an explicitly assigned product route, which is the exact thing
+   requirement 7 forbids.
+
+Alongside them: `PUT /api/routes` accepted a `productId` and dropped it, so a route could never be
+moved onto a garment after creation; `resolveRoute`'s explicit-`routeId` path did not check
+ownership at all; and `GET /api/production-orders` reported `defaultRouteId` as "the first route
+whose product matches", which could be a retired route, an unflagged one the resolver would never
+pick, or another organisation's. It now reports an active, owned route the resolver would actually
+choose, falling back to the generic route as a named `defaultRouteName` /
+`defaultRouteIsGeneric` rather than as `null` — because `null` there meant the organisation default
+was never surfaced at all.
+
+Historical production is untouched by all of this: a batch freezes its route at creation, so a
+later edit to a route cannot rewrite what was already produced against it.
+
+## 40.2 What changed
+
+**Support work has a lifecycle** (`src/lib/support-work.ts`, `PUT /api/support-work`).
+ASSIGNED → STARTED → SUBMITTED → APPROVED / REWORK, with PAUSED reachable from work in hand and
+RESUMED back out of it. `SUPPORT_TRANSITIONS` is the table of legal moves and
+`supportTransitionError` is the one place that consults it, so a rule cannot be satisfied in one
+handler and forgotten in another. Enforced server-side: no submitting before anybody started (409),
+no submitting or being inspected while paused, no self-approval, no over-delegation past what the
+stage holds, no handing out another tailor's work, and a pause requires a written reason.
+
+`supportStatusAfterInspection` compares against the quantity **ASSIGNED**, not the quantity
+submitted. The first version compared against submitted, so "10 delegated, 4 handed back, 4 judged"
+reported APPROVED with six pieces missing. A `SUBMITTED → STARTED` move exists for a partial
+inspection, and `from === to` returns null, because a partial inspection is not a move.
+
+**Production Control shows support work and respects its state** (`src/lib/production-control.ts`).
+`supportByOperation()` answers for every stage in ONE grouped query rather than one per stage.
+`flagsFor` raises `SUPPORT_PAUSED`, `SUPPORT_REWORK` and `SUPPORT_IN_PROGRESS`, and the first two
+are in `BLOCKING_FLAGS` — so a paused support operation stops the board showing that stage as
+ordinary work in progress, which is requirement 3. `?supportPausedOnly=1` filters to them.
+
+**A tailor can hand out support work from their own production** (`GET /api/workers?supportHelpers=1`,
+`/api/auth/me`). `/api/auth/me` now returns `workerId` and `workerName`, so a WORKER session knows
+which production record it is without a second lookup or a name match in the browser. The helper
+picker returns five columns, is org-scoped, and is filtered to the Support-Worker role. This is
+bounded by what the caller holds, not by granting all workers a permission they should not have.
+
+**Start Production opens the existing Assign Production workflow** (`src/app/(app)/orders/[id]/page.tsx`,
+`production/assign/page.tsx`). The order page's button is now `href=/production/assign?orderId=…`
+via the `Btn` component's new `href` prop, and the 69-line duplicate batch modal that used to sit
+behind it was **deleted** along with its `batchModal` / `batchForm` / `emptyBatchForm` state. One
+assignment interface, not two. The assign page reads `orderId` from `useSearchParams()` inside a
+`Suspense` boundary, preselects the order, and shows the resolved route's provenance. The
+preselection is revalidated server-side: an `orderId` belonging to another organisation, or to no
+order at all, preselects nothing.
+
+**Lists are bounded in SQL** (`GET /api/orders`, `/api/payments`, `/api/packing`, `/api/expenses`,
+`/api/production-orders`, `/api/routes`). Filtering, searching and paging moved into the WHERE
+clause; `X-Total-Count` carries the unpaginated total so a client can page without a second
+request. `POST /api/orders` now takes its organisation from the session rather than a hardcoded `1`,
+checks the customer belongs to that organisation, creates the order and its items in one
+transaction, and derives `nextOrderNumber()` from the max sequence with a bounded retry on a unique
+collision.
+
+**Administrative test-data cleanup** (`src/lib/test-data-cleanup.ts`,
+`src/app/api/test-data-cleanup/route.ts`, `src/app/(app)/settings/test-data/page.tsx`). See 40.4.
+
+## 40.3 Performance: what was measured, and what the numbers do and do not say
+
+`scripts/perf-probe.ts` drives the REAL route handlers through `tests/support/harness.ts` against
+the real Drizzle layer on pg-mem, and reports three figures per endpoint: SQL statements executed
+(one round trip each against a real database), rows returned, and bytes of JSON that reached the
+browser — plus every full-table SELECT with no WHERE clause, because those get worse on their own
+as the business grows. Statement counting lives in the driver shim behind `global.__PGMEM_COUNT__`,
+so no application code is instrumented and the numbers describe the code that ships.
+
+**The evidence is committed, because a before/after claim whose "before" only ever existed in a
+terminal scrollback is a memory and not evidence:**
+
+- `scripts/perf-report-baseline.txt` — measured on UNTOUCHED code, in a throwaway git worktree at
+  the commit this branch started from, with only the probe and the counting shim copied in.
+- `scripts/perf-report.txt` — the same probe, the same dataset, on the current code.
+
+Both report the identical dataset: **24 orders, 36 batches, 72 inspections, 36 support
+assignments.** That equality is what makes the comparison fair, and getting it was not free — see
+40.7.
+
+| Endpoint | Before | After | Change |
+| --- | --- | --- | --- |
+| Orders list | 7 stmts, 7.6 KB, **5** full-table reads | 8 stmts, 7.6 KB, **0** | every unbounded read removed; one extra statement is the count for `X-Total-Count` |
+| Production orders (assign) | 9 stmts, 14.8 KB, **7** full-table reads | 9 stmts, 16.3 KB, **0** | every unbounded read removed at no statement cost; +1.5 KB is the route provenance the screen now shows |
+| Routes list | 4 stmts, **0 rows**, 1 full-table read | 5 stmts, **1 row**, 0 | this is the 40.1 defect measured: the product route was in the database and the endpoint returned nothing |
+| Payments list | 5 stmts, 6.4 KB, 3 full reads | 6 stmts, 6.4 KB, 2 | the third read was the `orderId` filter, now SQL |
+| Packing list | 5 stmts, 3 full reads | 3 stmts, 1 full read | fewer statements AND fewer unbounded reads |
+| Expenses list | 5 stmts, 5.1 KB, 3 full reads | 6 stmts, 5.1 KB, 2 | `category` pushed into the WHERE clause |
+| Production control board | 12 stmts, 103.1 KB | 13 stmts, 117.7 KB | +14.6 KB is **new feature** — support figures and lifecycle state the board never returned before |
+| Support work list | 12 stmts, 28.1 KB | 12 stmts, 34.8 KB | +6.7 KB is the lifecycle fields and the pause reasons |
+| **Total, 27 calls** | **277 stmts, 547.2 KB, 80 unbounded reads** | **282 stmts, 598.7 KB, 63 unbounded reads** | |
+
+Read honestly: **unbounded full-table reads fell from 80 to 63**, and the three list screens a
+person actually pages through now do all their filtering in the database. Statements rose by five
+and payload by 51 KB, and both increases are accounted for rather than waved away — four of the
+five statements are pagination counts that buy an `X-Total-Count` header, and the payload growth is
+data these screens did not previously return at all. Nothing was made smaller by returning less.
+
+**The support payload, measured separately, because the table above cannot show it.** Adding
+support figures to the board grew it from 103.1 KB to 151.6 KB — a 48 KB, 47% increase — of which
+almost none was support work. A helper named `stageSupportOrEmpty` turned "this stage has no
+support work" into a real object carrying ten zeros, for every stage of every batch, and most
+stages of most batches have no support work. `ControlRow.support` is now `StageSupport | null`,
+the helper is **deleted** rather than left exported for the next caller to rediscover, and the same
+dataset now produces 117.7 KB instead of 151.6 KB — **33.9 KB, 22%, recovered**, with every support
+figure still present. The one UI site that read `stage.support` unguarded was a latent crash on any
+stage without support work, and is now guarded.
+
+What is deliberately **not** claimed: no millisecond figure in either report is a latency
+measurement. pg-mem has no network, no planner and no disk. The statement count transfers to real
+PostgreSQL because one statement is one round trip; the timings do not.
+
+## 40.4 The test-data cleanup, and what stops it being a delete button
+
+`Settings → Test data` exists to clear one known test order (Glorious Hope School, 50 garments,
+₦150,000) before go-live. It is a controlled administrative exception, never a general-purpose
+bypass, and the ordinary protection against deleting an order with real approved production and
+settled payments is **untouched and still asserted by test**.
+
+- **OWNER-only, with the guard before any read.** A Project Manager, a Worker and every other role
+  is refused without the order being looked at, so nothing about it is disclosed to them.
+- **Org isolation returns 404**, indistinguishable from an order that does not exist.
+- **Two steps that cannot be collapsed.** A dry-run preview that writes nothing, then an execution
+  requiring the school's name and the order's number typed out, a written reason of at least ten
+  characters, and an acknowledgement. The name comparison is `trim().toLowerCase()` on both sides;
+  the order number must match exactly. Both are re-checked **inside the transaction**, against the
+  order as it is at that moment.
+- **A SHA-256 fingerprint** over the sorted per-table id sets, recomputed inside the transaction.
+  A stale preview is 409 and must be taken again. The same fingerprint makes a **replayed**
+  confirmation refuse, so one authorisation removes one order once.
+- **Deletes are by explicit id lists, children before parents**, inside a single `db.transaction`.
+  This matters because `support_assignments` is `ON DELETE SET NULL` and `material_usage` has no
+  cascade at all — a blind parent delete would have orphaned both.
+- **Inventory is restored, not lost**, using the material routes' own formula
+  (`issued ?? used + returned + wasted`, minus what was returned), applied atomically as
+  `greatest(0, coalesce(stock,0) + delta)`. If reversing a purchase would drive a stock figure
+  negative — because the material has since been used on other orders — the purge **refuses with
+  409** rather than forcing it to zero, which would hide a real shortage.
+- **Ready-made garments stay purchases** in both directions and never become raw stock. A finished
+  uniform is not a raw material.
+- **Settled payroll is reported and never rewritten.** Payroll has no order column — accrual derives
+  from `stage_inspections` and `support_inspections` — so removing those removes the accrual. A
+  payment already banked is a fact, and is listed for the Owner rather than altered.
+- **Shared master data is never touched**: customers, products, workers, routes, materials and
+  organisations all survive.
+- **Every act is recorded permanently.** `test_data_purges` stores the confirmation typed, the
+  counts the preview promised beside the counts achieved, and the payroll and inventory reports.
+  `order_deletions` stores every ordinary removal. The actor comes from the session; an actor named
+  in the request body is ignored, and that is tested.
+- `DELETE /api/orders/:id` now **requires `?reason=`** and goes through `deleteOrderIfSafe`. The
+  orders screen asks for a reason and surfaces the server's answer if it refuses.
+
+## 40.5 Schema, migrations and deployment
+
+Two migrations, both **additive, idempotent, with no NOT NULL, no default, no backfill and no data
+write of any kind**:
+
+- `drizzle/0011_support_lifecycle.sql` → `deploy/upgrade-support-lifecycle.sql`. Four nullable
+  columns on `support_assignments` (`started_at`, `paused_at`, `pause_reason`,
+  `submitted_by_name`), `support_assignments_status_idx`, and the append-only
+  `support_status_events`.
+- `drizzle/0012_deletion_and_purge_audit.sql` → `deploy/upgrade-test-data-cleanup.sql`. The
+  `order_deletions` and `test_data_purges` audit tables, four indexes each.
+
+`drizzle/meta/_journal.json` has 13 contiguous entries (0000–0012) with 13 snapshots, and
+`npx drizzle-kit generate` reports "No schema changes, nothing to migrate" — so `src/db/schema.ts`
+and the migration files agree.
+
+0011 deliberately does **not** backfill a start time, a pause or an event onto existing support
+assignments. Every row already in the database keeps NULL for all four columns, because that is the
+truth about it: the system did not record when that helper began. Inventing a start time would put
+a fabricated timestamp behind a payroll figure. Existing assignments keep their existing status —
+ASSIGNED, SUBMITTED, APPROVED, REWORK and CANCELLED are all still legal states — so nothing
+recorded becomes invalid. One behaviour does change for work not yet submitted: it must now be
+STARTED first, which is the point of the change, and nothing historical is rewritten to make that
+apply retroactively.
+
+`deploy/UPDATE-INSTRUCTIONS.md` has a release section for each, in the house format: back up, paste
+the SQL, run the verification query and compare the counts, then deploy the code. **SQL first, code
+second.** Do not run `drizzle-kit migrate` against production.
+
+## 40.6 Regression coverage
+
+**376 tests, 0 failures**, up from 278 at the start of this run. `npx tsc --noEmit` clean.
+`npm run build` succeeds and emits both new routes (`/api/test-data-cleanup`,
+`/settings/test-data`). All through the real route handlers; no application logic is
+re-implemented, copied or faked anywhere in the suite.
+
+98 tests were added, in five files:
+
+- `tests/support-lifecycle.test.ts` — 29
+- `tests/test-data-cleanup.test.ts` — 28
+- `tests/product-route-resolution.test.ts` — 19
+- `tests/migration-safety.test.ts` — 12
+- `tests/start-production-and-list-bounds.test.ts` — 10
+
+`tests/migration-safety.test.ts` is new in kind rather than in subject: it holds the two migrations
+mechanically to the promise every file in `deploy/` makes only in prose. No `DROP`, `TRUNCATE`,
+`RENAME`, `DELETE`, `UPDATE` or `INSERT` outside a comment; every statement a guarded DDL form or a
+read-only verification query; a runnable verification SELECT present and naming the tables it
+created; no drizzle `--> statement-breakpoint` marker leaked into a file meant to be pasted into
+the SQL Editor; both upgrade scripts applied **twice** against the migrated database with the table
+set unchanged, the new tables still empty and a real order created through the API still intact.
+Until now that promise was a comment, and a comment cannot fail a build.
+
+Four existing fixtures were **corrected rather than the guards being weakened**:
+`tests/support-payroll.test.ts`, `tests/support-cost-allocation.test.ts` and
+`tests/reassignment-and-report-figures.test.ts` now start support work before submitting it, which
+is the real workflow rather than a workaround; `tests/production-control.test.ts`'s `stageControl()`
+fixture gained the `support` field. No test was deleted, and no assertion was relaxed to make
+anything pass.
+
+## 40.7 Known limitations, and things that are NOT verified
+
+Stated plainly, because an unverified claim in this file is worse than none:
+
+- **Transactional atomicity is not demonstrated by the suite, and cannot be.** pg-mem does not roll
+  back: an insert followed by a throw inside `db.transaction` leaves both the row and the stock
+  update. This was verified directly rather than assumed. `tests/test-data-cleanup.test.ts` says so
+  at the top and asserts the ordering, the fingerprint and the guards that a rollback would have
+  backed up, instead of faking a rollback assertion. The single-transaction structure is real in
+  the code; only its failure behaviour is unproven here.
+- **The performance probe was itself defective, and the defect flattered the results.** It submitted
+  a stage before starting it and asked a stage for more pieces than the previous stage had approved,
+  so every support handout was correctly refused and the probe built a dataset with **zero support
+  assignments** — then reported a payload figure for support work anyway. The "151.2 KB" recorded
+  during this run was measured on that empty set, which is why it is not quoted above as a before
+  figure. Three separate causes had to be fixed before the probe produced real support work: a
+  PENDING stage cannot be submitted against, a stage may only submit what the previous stage had
+  approved, and the operation list was read before the ledger moved so `quantityRemaining` was
+  stale at zero. All three are now comments in the probe, because each one looks like a reasonable
+  thing to do.
+- **`deploy/schema-only.sql` and `deploy/full-setup.sql` are stale, and were already stale before
+  this run.** Neither contains `worker_roles`, `support_assignments`, `production_routes`,
+  `production_route_stages`, `production_allocations`, `external_work_orders` or
+  `production_movements` — so they have been missing tables since roughly migrations 0004–0006, not
+  because of anything added here. **This release's DDL was deliberately NOT appended to them**:
+  adding two tables to a file that is already seven short would make it look current when it is
+  not, which is more dangerous than leaving it visibly old. A brand-new database should be built
+  from the migrations in order. Fixing those two files properly is a decision for the business, not
+  a side effect of this task.
+- **`GET /api/dashboard` still reads `productionOperations` whole** (33 statements, 17 unbounded
+  reads, unchanged). It genuinely summarises every stage, so the rows cannot be reduced without
+  changing what the screen means. Same for `/api/reports` (25 statements, 14 unbounded reads). Both
+  are reported rather than quietly narrowed — narrowing them was investigated and would have
+  changed the figures the screens show.
+- **Lint is at the baseline: 33 problems, 29 errors, 4 warnings — the same four warnings the
+  untouched code produces.** Measured by linting a throwaway worktree at the baseline commit and
+  diffing, not by inspection. The 29 `react-hooks/set-state-in-effect` errors are the repository's
+  established data-loading pattern (`useEffect(load, [deps])` appears on nearly every page) and none
+  were added; three sit in files this work rewrote, because rewriting a page in this codebase means
+  writing the pattern the codebase uses.
+
+  An earlier state of this work left `production/assign/page.tsx` one warning worse than baseline
+  (`exhaustive-deps` for `load`) and recorded it here as an accepted cost. **That was settled rather
+  than accepted**, by wrapping the loader in `useCallback([requestedOrderId])` and giving the effect
+  `[load]`. `requestedOrderId` is a string primitive read off the query string, so the memo identity
+  is stable across renders of the same URL: the effect still runs on mount and on a genuine URL
+  change, never on an unrelated re-render, and both other call sites — the save handler and the
+  Refresh button — keep working unchanged.
+
+  `useEffectEvent` was investigated first and **rejected for a concrete reason**: it is stable in
+  React 19.2 and is the hook designed for exactly this, but a function it returns may only be called
+  from inside an effect, and `eslint-plugin-react-hooks` makes calling one elsewhere an error. This
+  loader is called from three places, so an effect-event would have broken two of them or forced a
+  second copy of the loader. No eslint suppression was added anywhere; this codebase has none and the
+  first one should not be spent on a hook warning.
+- **The end-to-end workflows are verified through the API, not through a browser.** All four (tailor
+  support lifecycle, school-order start-production, product-route resolution, test-data cleanup) are
+  driven through the real route handlers by the tests above, which is genuine verification of the
+  server-side rules. No headless browser was run, so pixel-level rendering and client-side routing
+  are covered by the successful production build and by reading the components, not by an automated
+  click-through.
+
+## 40.8 What a production-readiness review found afterwards, and what was done about it
+
+This pass happened after the work above was believed finished, and it found one real defect. It is
+recorded separately because the distinction between "introduced here" and "already there" is the
+only thing that makes the list usable.
+
+**FIXED — cross-organisation access to support work.** `PUT /api/support-work` looked its
+assignment up by id alone, with no organisation predicate. Every actor rule on that route is derived
+from identity — the caller's own linked worker record against the assignment's — *except*
+`isSupervisor`, which is derived from the login ROLE alone, and a role says nothing about which
+company you belong to. So an OWNER or PRODUCTION_MANAGER of one organisation could name an
+assignment id belonging to another and inspect it, and inspection is what approves pieces and
+therefore what makes them payable. Pausing and cancelling were reachable the same way, and
+`GET /api/support-work/inspections` disclosed another organisation's inspection history — piece
+rates and rework — to any supervisor, because its Worker branch checks participation and its
+supervisor path checked nothing.
+
+Both now resolve the assignment and refuse with **404** when it belongs to a different organisation,
+so probing ids cannot distinguish "not yours" from "does not exist". A legacy row with no
+organisation at all is not refused, matching `ownedBy` in `src/lib/production-route.ts`. This was
+**pre-existing** — the identical unscoped lookup is at the baseline commit — but it is fixed here
+because the lifecycle put three more supervisor-reachable actions behind the same lookup.
+`tests/support-lifecycle.test.ts` pins it, and the test was verified to fail without the fix (a
+foreign Owner gets **201** and the pieces become payable) and pass with it.
+
+**FIXED — `GET /api/routes` could fail open.** It scoped with `session?.organizationId ?? null`, and
+`null` is the value that means "apply NO organisation scope". `guard(req, STAFF)` had already
+returned 401, so it was not reachable, but it depended on that rather than enforcing it. The route
+now asks for the session and refuses without one, exactly as POST, PUT and DELETE on the same file
+already did.
+
+**FIXED — a comment that contradicted the rule it documented.** `SUPPORT_TRANSITIONS` said PAUSED
+was reachable only from work "actually in hand … never from ASSIGNED", while the map itself allows
+`ASSIGNED → PAUSED` and a test asserts it. The map is right and the comment was wrong: pausing
+straight from ASSIGNED is how a tailor stops work they have found they cannot give, before a helper
+starts it. A wrong comment on a security rule is how the next person "fixes" correct code, so the
+comment was corrected rather than the behaviour.
+
+**NOT CHANGED, deliberately — organisation scoping is inconsistent across the API, and it is
+pre-existing.** Six read endpoints are guarded by ROLE but carry **no organisation predicate at
+all**, at baseline and now: `/api/payments` (OWNER), `/api/packing` (OWNER), `/api/expenses`
+(OWNER), `/api/reports` (OWNER), `/api/production-control` (STAFF) and `/api/dashboard` (ANYONE, so
+every signed-in role). Each of them has zero references to `organizationId` in the whole file. Nothing
+this work did removed a predicate from any route — verified by counting `organizationId` references
+per route before and after, where every changed route kept or gained them — and the three list
+endpoints that were rewritten for pagination were not given scoping they never had.
+
+The reason this is reported rather than fixed in the same pass: **`payments` has no
+`organization_id` column**, so scoping it means joining or subquerying `orders` on every financial
+read, and doing that correctly across four endpoints plus their tests is a change to money-reporting
+paths that deserves its own review rather than tagging along with a feature release.
+
+It is also **not currently exploitable**, and the reason is itself the thing to flag: eight
+endpoints hardcode `organizationId: 1` when *creating* records — `auth/setup`, `users`, `workers`,
+`products`, `customers`, `materials`, `material-purchases` and `expenses` — so every user and every
+record belongs to organisation 1 and there is no second organisation to be isolated from. The
+application is single-organisation in fact while being multi-organisation in shape. **Enabling a
+second organisation without first scoping those six read endpoints would expose one company's
+payments, packing, expenses, reports, whole production board and dashboard to the other's Owner —
+and the dashboard to any signed-in user at all.** That is the order the work has to happen in, and
+it is the single most important thing on this list.
+
+**NOT CHANGED — `deploy/schema-only.sql` is load-bearing and must not be regenerated from the
+migrations.** See 40.7 and the note at the foot of `deploy/UPDATE-INSTRUCTIONS.md`: it carries ten
+`ENABLE ROW LEVEL SECURITY` / `REVOKE ALL` statements and no `drizzle/` migration contains any RLS
+or grant statement at all, so regenerating it would trade an incomplete schema for a complete one
+with no row-level security.

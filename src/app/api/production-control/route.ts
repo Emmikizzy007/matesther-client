@@ -14,6 +14,7 @@ export const dynamic = "force-dynamic";
  *   ?stage=           only batches whose CURRENT route stage is this one
  *   ?priority=        1 OVERDUE, 2 DUE SOON, 3 BLOCKED, 4 SCHEDULED, 5 NORMAL, 6 COMPLETE
  *   ?blockedOnly=1    only batches where work exists but nothing is moving
+ *   ?supportPausedOnly=1  only batches whose support work has stopped
  *   ?all=1            include COMPLETED and CANCELLED orders too
  *   ?limit=&offset=   paging
  *
@@ -47,6 +48,7 @@ export async function GET(req: Request) {
       stage: query.get("stage"),
       priority: number("priority"),
       blockedOnly: query.get("blockedOnly") === "1",
+      supportPausedOnly: query.get("supportPausedOnly") === "1",
       limit: number("limit") ?? undefined,
       offset: number("offset") ?? undefined,
     };

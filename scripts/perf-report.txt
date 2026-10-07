@@ -1,0 +1,156 @@
+# MATESTHER PERFORMANCE EVIDENCE — the "after" half of a before/after claim.
+#
+# REGENERATE (deterministic; the dataset is built through the real public API each run):
+#   PERF_OUT=scripts/perf-report.txt npx tsx --require ./tests/support/preload.cjs scripts/perf-probe.ts
+#
+# WHAT THE COLUMNS MEAN
+#   STMTS   SQL statements executed to answer the request. This is the figure that
+#           transfers to a real PostgreSQL, because one statement is one round trip.
+#   ROWS    rows in the JSON response body.
+#   PAYLOAD bytes of JSON that reached the browser.
+#   UNBOUNDED READS  full-table SELECTs with no WHERE clause. These are the ones that get
+#           worse on their own as the business grows, which is why they are named.
+#
+# WHAT THIS IS NOT
+#   Not a PostgreSQL benchmark. pg-mem has no network, no planner and no disk, so nothing
+#   here is a latency measurement and no millisecond figure should be quoted as one.
+#
+# PROVENANCE OF THE DATASET — read this before comparing two runs.
+#   The line below states the dataset. Two runs are only comparable if that line matches.
+#   This report was produced after scripts/perf-probe.ts was fixed to build support work
+#   correctly; earlier runs of the same probe reported "0 support assignments" because the
+#   probe submitted a stage before starting it and asked for more pieces than the previous
+#   stage had approved, so every handout was correctly refused. Any measurement taken
+#   before that fix measured an empty support set and must not be compared with this one.
+#   See section 40 of PROJECT_CONTEXT.md for the numbers on both sides of that correction.
+#
+
+DATASET: 24 orders, 36 batches, 72 inspections, 36 support assignments
+
+ENDPOINT                                STMTS   ROWS     PAYLOAD  UNBOUNDED READS
+--------------------------------------------------------------------------------------------------------------
+Orders list                                 8     24      7.6 KB
+Order detail (one)                         29      -      2.7 KB  3 full-table SELECT(s)
+Production orders (assign screen)           9     24     16.3 KB
+Routes list                                 5      1      0.7 KB
+Workers (slim)                              5      4      0.6 KB  2 full-table SELECT(s)
+Allocations (live, capped)                  3      0      0.0 KB
+Operations                                  6    100     81.5 KB  2 full-table SELECT(s)
+Production control board                   13      -    117.7 KB
+Support work list                          12     36     34.8 KB  2 full-table SELECT(s)
+Inspection queue                            8     72     26.2 KB  1 full-table SELECT(s)
+Payments list                               6     24      6.4 KB  2 full-table SELECT(s)
+Packing list                                3      0      0.0 KB  1 full-table SELECT(s)
+Expenses list                               6     24      5.1 KB  2 full-table SELECT(s)
+Material purchases                          4      0      0.0 KB  2 full-table SELECT(s)
+Material usage                              6     36     14.9 KB  2 full-table SELECT(s)
+Dashboard                                  33      -     12.8 KB  17 full-table SELECT(s)
+Reports                                    25      -     23.7 KB  14 full-table SELECT(s)
+Attention                                  17      -      0.3 KB
+Payroll                                    13      -      2.2 KB  6 full-table SELECT(s)
+Payment sheet                              12      -      0.5 KB  4 full-table SELECT(s)
+WORKER support work list                   13     36     34.8 KB
+WORKER own allocations                      4      0      0.0 KB
+WORKER operations                           7     36     31.2 KB
+WORKER worker list (helpers)                2      -      0.0 KB
+PM production control                      13      -    117.7 KB
+PM inspection queue                         8     72     26.2 KB  1 full-table SELECT(s)
+PM support work                            12     36     34.8 KB  2 full-table SELECT(s)
+--------------------------------------------------------------------------------------------------------------
+TOTAL across 27 endpoint calls: 282 statements, 598.7 KB of JSON
+
+MOST STATEMENTS:
+    33  Dashboard  (/api/dashboard)
+    29  Order detail (one)  (/api/orders/1)
+    25  Reports  (/api/reports)
+    17  Attention  (/api/attention)
+    13  Production control board  (/api/production-control?limit=100)
+
+LARGEST PAYLOADS:
+    117.7 KB  Production control board  (/api/production-control?limit=100)
+    117.7 KB  PM production control  (/api/production-control?limit=100)
+     81.5 KB  Operations  (/api/operations?limit=100)
+     34.8 KB  Support work list  (/api/support-work)
+     34.8 KB  WORKER support work list  (/api/support-work)
+
+ENDPOINTS WITH FULL-TABLE SELECTs: 16
+  Order detail (one) (/api/orders/1)
+      select "id", "organization_id", "name", "description", "category", "selling_price", "creat
+      select "id", "organization_id", "name", "phone", "specialty", "department", "job_title", "
+      select "id", "organization_id", "name", "category", "unit", "current_stock", "reorder_leve
+  Workers (slim) (/api/workers?view=slim)
+      select "id", "specialty" from "workers"
+      select "worker_id", "role", "is_primary" from "worker_roles"
+  Operations (/api/operations?limit=100)
+      select count(*) from "production_operations" left join "production_batches" on "production
+      select "production_operations"."id", "production_operations"."production_batch_id", "produ
+  Support work list (/api/support-work)
+      select count(*) from "support_assignments"
+      select "id", "organization_id", "assigned_by_worker_id", "worker_id", "production_operatio
+  Inspection queue (/api/inspections)
+      select "id", "production_operation_id", "worker_id", "inspected_by", "piece_rate", "quanti
+  Payments list (/api/payments)
+      select count(*) from "payments"
+      select "id", "order_id", "amount", "payment_date", "payment_method", "reference", "notes",
+  Packing list (/api/packing)
+      select count(*) from "packing_records"
+  Expenses list (/api/expenses)
+      select count(*) from "expenses"
+      select "id", "organization_id", "order_id", "category", "description", "amount", "expense_
+  Material purchases (/api/material-purchases?limit=50)
+      select count(*) from "material_purchases"
+      select "id", "organization_id", "material_id", "supplier", "quantity", "unit_cost", "total
+  Material usage (/api/material-usage?limit=50)
+      select count(*) from "material_usage"
+      select "id", "order_id", "production_operation_id", "material_id", "quantity_used", "quant
+  Dashboard (/api/dashboard)
+      select "id", "order_number", "status", "order_date", "due_date", "total_amount", "balance"
+      select "id", "name" from "customers"
+      select "id", "order_id", "product_id", "quantity" from "order_items"
+      select "id", "order_id", "order_item_id", "batch_number", "quantity", "size", "color", "st
+      select "id", "production_batch_id", "stage", "route_position", "route_stage_id", "method",
+      select "id", "name", "specialty", "status" from "workers"
+      select "id", "description", "category", "amount", "expense_date", "order_id" from "expense
+      select "id", "amount", "payment_date", "payment_method", "reference", "order_id" from "pay
+      select "id", "name", "unit", "current_stock", "reorder_level", "unit_cost" from "materials
+      select coalesce(sum("total_cost"), 0) from "material_purchases"
+      select "used_at", "total_cost" from "material_usage"
+      select "id", "production_operation_id", "worker_id", "inspected_by", "piece_rate", "quanti
+      select "id", "name" from "products"
+      select "id", "specialty" from "workers"
+      select "worker_id", "role", "is_primary" from "worker_roles"
+      select min("inspected_at") from "support_inspections"
+      select "id", "organization_id", "name", "phone", "specialty", "department", "job_title", "
+  Reports (/api/reports)
+      select coalesce("stage_inspections"."worker_id", "production_operations"."worker_id"), coa
+      select "id", "order_number", "customer_id", "status", "total_amount" from "orders"
+      select "id", "name" from "customers"
+      select "id", "name", "specialty", "payment_type", "payment_rate", "status" from "workers"
+      select "id", "name", "unit", "category", "current_stock", "unit_cost" from "materials"
+      select "order_id", coalesce(sum("quantity"), 0) from "order_items" group by "order_items".
+      select count(*)::int from "production_batches"
+      select "stage", count(*)::int, coalesce(sum("quantity_received"), 0), coalesce(sum("quanti
+      select "worker_id", count(*)::int, coalesce(sum("quantity_received"), 0), coalesce(sum("qu
+      select "material_id", coalesce(sum("quantity"), 0) from "material_purchases" group by "mat
+      select "material_id", coalesce(sum("quantity_used"), 0) from "material_usage" group by "ma
+      select "order_id", coalesce(sum("total_cost"), 0) from "material_usage" group by "material
+      select "order_id", coalesce(sum("amount"), 0) from "expenses" group by "expenses"."order_i
+      select "category", coalesce(sum("amount"), 0), count(*)::int from "expenses" group by "exp
+  Payroll (/api/payroll)
+      select "id", "specialty" from "workers"
+      select "worker_id", "role", "is_primary" from "worker_roles"
+      select min("inspected_at") from "support_inspections"
+      select "id", "organization_id", "name", "phone", "specialty", "department", "job_title", "
+      select "id", "worker_id", "payment_date", "period_month", "piecework_amount", "support_amo
+      select "id", "worker_id", "worked_on", "hours", "amount", "category", "notes", "created_at
+  Payment sheet (/api/payment-sheet?month=2026-09)
+      select "id", "specialty" from "workers"
+      select "worker_id", "role", "is_primary" from "worker_roles"
+      select min("inspected_at") from "support_inspections"
+      select "id", "organization_id", "name", "phone", "specialty", "department", "job_title", "
+  PM inspection queue (/api/inspections)
+      select "id", "production_operation_id", "worker_id", "inspected_by", "piece_rate", "quanti
+  PM support work (/api/support-work)
+      select count(*) from "support_assignments"
+      select "id", "organization_id", "assigned_by_worker_id", "worker_id", "production_operatio
+

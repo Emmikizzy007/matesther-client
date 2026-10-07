@@ -26,8 +26,7 @@ import {
   createOwner,
   createStaff,
   createWorker,
-  createOrder,
-} from "./support/harness";
+  createOrder, startSupport, pauseSupport, resumeSupport, } from "./support/harness";
 import { currentMonth } from "@/lib/payroll";
 import { SUPPORT_ROLE } from "@/lib/format";
 
@@ -78,8 +77,26 @@ async function assignSupport(
   return created.data;
 }
 
-/** The helper returns completed work. */
-async function submitSupport(cookie: string, id: number, quantity: number) {
+/**
+ * The helper returns completed work.
+ *
+ * Starting the work first is not a formality: the lifecycle refuses a submission
+ * from ASSIGNED, because pieces cannot be handed back before anybody began. This
+ * helper is the one place these fixtures submit, so it is the one place that has to
+ * model the real sequence - begin, then hand back.
+ *
+ * `currentStatus` exists for the append-only history fixture, which submits a SECOND
+ * time while the assignment is still SUBMITTED with pieces unjudged. Starting again
+ * from there is not a legal move - the work never stopped - so that call passes the
+ * status it knows the row is in and the start is skipped. The default reproduces a
+ * first submission from ASSIGNED, which does have to start.
+ */
+async function submitSupport(cookie: string, id: number, quantity: number, currentStatus = "ASSIGNED") {
+  if (currentStatus === "ASSIGNED" || currentStatus === "PAUSED" || currentStatus === "REWORK") {
+    // PAUSED and REWORK cannot be submitted from either, and the API says so; the
+    // start is attempted so the refusal is the API's own words, not a guess here.
+    await startSupport(cookie, id);
+  }
   const result = await api("PUT", "/api/support-work", { cookie, body: { id, submitQty: quantity } });
   await expectStatus(result, 200, "Submit support work");
   return result.data;
@@ -163,7 +180,10 @@ test("a supervisor who does support work cannot approve their own support work",
 
   const assignment = await assignSupport(tailorLogin.cookie, supervisorWorker.id, { quantity: 9, rate: 400 });
 
-  // They may submit their own work...
+  // They may submit their own work... having begun it, as the lifecycle requires.
+  // Starting is the support worker's own act, so it is the supervisor's own login
+  // that does it here - which is the point of this fixture.
+  await startSupport(supervisor.cookie, assignment.id, "A supervisor starts their own support work");
   const submitted = await api("PUT", "/api/support-work", {
     cookie: supervisor.cookie,
     body: { id: assignment.id, submitQty: 9 },
@@ -307,7 +327,9 @@ test("support-work inspections are an append-only history, never overwritten", a
     201,
     "First inspection"
   );
-  await submitSupport(helperLogin.cookie, assignment.id, 6);
+  // Six pieces are still unjudged, so the assignment is SUBMITTED rather than REWORK:
+  // the helper hands the rest back without the work ever having stopped.
+  await submitSupport(helperLogin.cookie, assignment.id, 6, "SUBMITTED");
   await expectStatus(
     await api("PUT", "/api/support-work", {
       cookie: tailorLogin.cookie,

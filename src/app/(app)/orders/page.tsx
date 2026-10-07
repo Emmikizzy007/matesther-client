@@ -21,6 +21,19 @@ interface Item { productId: string; quantity: string; unitPrice: string; notes: 
 
 const blankItem = (): Item => ({ productId: "", quantity: "", unitPrice: "", notes: "" });
 
+/** How many orders one page of the list shows. */
+const PAGE_SIZE = 25;
+
+/**
+ * How long to stop typing before a search is actually sent.
+ *
+ * The search is server-side now, so every keystroke would otherwise be a request -
+ * and on a phone on a poor connection that is both slow and wasteful. Debouncing keeps
+ * it to one request per pause in typing, which is what the previous client-side filter
+ * cost the network (nothing) while costing the database everything.
+ */
+const SEARCH_DEBOUNCE_MS = 300;
+
 export default function OrdersPage() {
   const [rows, setRows] = useState<any[]>([]);
   const [customers, setCustomers] = useState<any[]>([]);
@@ -28,27 +41,63 @@ export default function OrdersPage() {
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
+  /** What was actually queried, as opposed to what is currently typed. */
+  const [applied, setApplied] = useState({ search: "", status: "" });
+  const [page, setPage] = useState(0);
+  const [total, setTotal] = useState(0);
   const [modal, setModal] = useState(false);
   const [form, setForm] = useState({ customerId: "", orderDate: new Date().toISOString().slice(0, 10), dueDate: "", notes: "" });
   const [items, setItems] = useState<Item[]>([blankItem()]);
   const [err, setErr] = useState("");
   const [saving, setSaving] = useState(false);
 
+  /**
+   * One page of orders, filtered in the DATABASE.
+   *
+   * This screen used to download every order in the business - with every order item,
+   * batch and production operation behind it - and then filter that in the browser on
+   * every keystroke. It now asks for one page with the search and status already
+   * applied, and reads the matching total from `X-Total-Count` so the pager knows how
+   * many pages exist without a second request.
+   *
+   * The catalogue for the New Order form (schools and garments) is fetched once and
+   * kept, because it is genuinely needed whole to build an order and is small.
+   */
   function load() {
     setLoading(true);
+    const params = new URLSearchParams();
+    if (applied.search) params.set("search", applied.search);
+    if (applied.status) params.set("status", applied.status);
+    params.set("limit", String(PAGE_SIZE));
+    params.set("offset", String(page * PAGE_SIZE));
     Promise.all([
-      fetch("/api/orders", { cache: "no-store" }).then((r) => r.json()),
+      fetch(`/api/orders?${params.toString()}`, { cache: "no-store" }),
       fetch("/api/customers", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/products", { cache: "no-store" }).then((r) => r.json()),
     ])
-      .then(([o, c, p]) => {
-        setRows(Array.isArray(o) ? o : []);
+      .then(async ([orderResponse, c, p]) => {
+        const list = await orderResponse.json();
+        setRows(Array.isArray(list) ? list : []);
+        setTotal(Number(orderResponse.headers.get("X-Total-Count")) || (Array.isArray(list) ? list.length : 0));
         setCustomers(Array.isArray(c) ? c : []);
         setProducts(Array.isArray(p) ? p : []);
       })
+      .catch(() => setErr("Could not load orders."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  useEffect(load, [applied, page]);
+
+  // Send the search once typing pauses, and go back to the first page when it changes:
+  // page 3 of a narrower search is very often empty, which reads as "no orders found".
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setPage(0);
+      setApplied((current) => (current.search === q.trim() ? current : { ...current, search: q.trim() }));
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [q]);
+
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   function pickProduct(idx: number, pid: string) {
     const p = products.find((x) => String(x.id) === pid);
@@ -96,19 +145,46 @@ export default function OrdersPage() {
     }
   }
 
+  /**
+   * Remove an order, with a written reason.
+   *
+   * The reason is not decoration: it is stored permanently beside the removal, in a record
+   * that outlives the order. And the server's answer is shown verbatim rather than as
+   * "Failed to delete", because the useful case is the refusal - it says which history is
+   * in the way and where to go if this really is test data that has to be cleared.
+   *
+   * The old confirm() promised this would remove "its production, payments and delivery
+   * records". It no longer can: an order with inspected production, a payment or a
+   * delivery is refused here, and clearing one is the administrative cleanup's job.
+   */
   async function del(id: number, num: string) {
-    if (!confirm(`Delete order ${num}? This removes its production, payments and delivery records.`)) return;
-    const res = await fetch(`/api/orders/${id}`, { method: "DELETE" });
-    if (!res.ok) alert("Failed to delete");
-    else load();
+    const reason = prompt(
+      `Remove order ${num}?\n\nThis works only if the order has no inspected production, no customer payment and no delivery behind it. `
+      + `Anything else is refused, so a real order's records cannot be destroyed from this list.\n\nReason (recorded permanently):`
+    );
+    if (reason === null) return;
+    if (reason.trim().length < 10) {
+      setErr("Give a reason of at least 10 characters. It is recorded permanently beside the removal.");
+      return;
+    }
+    setErr("");
+    const res = await fetch(`/api/orders/${id}?reason=${encodeURIComponent(reason.trim())}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setErr(data.error || "Could not remove this order.");
+      return;
+    }
+    load();
   }
 
-  const filtered = rows.filter(
-    (o) =>
-      (!status || o.status === status) &&
-      (o.orderNumber.toLowerCase().includes(q.toLowerCase()) ||
-        o.customer.toLowerCase().includes(q.toLowerCase()))
-  );
+  /**
+   * The rows to draw are the page the server returned.
+   *
+   * There is deliberately no second filter here: re-filtering a server-filtered page in
+   * the browser is how a list ends up showing fewer rows than the pager says exist, and
+   * the search already ran where the data is.
+   */
+  const filtered = rows;
 
   return (
     <div>
@@ -121,12 +197,15 @@ export default function OrdersPage() {
           </Btn>
         }
       />
+      {err && !modal && (
+        <div role="alert" className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{err}</div>
+      )}
       <Card className="mb-4 p-3 flex flex-wrap gap-3">
         <div className="relative flex-1 min-w-[200px]">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search order number or school…" className={`${inputCls} pl-9`} />
         </div>
-        <select value={status} onChange={(e) => setStatus(e.target.value)} className={`${inputCls} w-auto`}>
+        <select value={status} onChange={(e) => { setStatus(e.target.value); setPage(0); setApplied((current) => ({ ...current, status: e.target.value })); }} className={`${inputCls} w-auto`}>
           <option value="">All statuses</option>
           <option value="PENDING">Pending</option>
           <option value="IN_PROGRESS">In Progress</option>
@@ -140,7 +219,10 @@ export default function OrdersPage() {
         {loading ? (
           <Loading />
         ) : filtered.length === 0 ? (
-          <EmptyState title="No orders found" hint="Create your first uniform order." />
+          <EmptyState
+            title={applied.search || applied.status ? "No orders match this search" : "No orders found"}
+            hint={applied.search || applied.status ? "Clear the search or status filter to see every order." : "Create your first uniform order."}
+          />
         ) : (
           <div className="overflow-x-auto slim-scroll">
             <table className="w-full text-sm min-w-[1050px]">
@@ -193,6 +275,21 @@ export default function OrdersPage() {
           </div>
         )}
       </Card>
+
+      {/* The pager reads the server's own total, so it says how many orders MATCH the
+          current search rather than how many happen to be on this page. */}
+      {!loading && total > PAGE_SIZE && (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-sm">
+          <span className="text-slate-600">
+            Showing {page * PAGE_SIZE + 1}–{Math.min(total, (page + 1) * PAGE_SIZE)} of {total} orders
+          </span>
+          <div className="flex items-center gap-2">
+            <Btn variant="ghost" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}>Previous</Btn>
+            <span className="px-2 py-1 text-slate-600">Page {page + 1} of {pageCount}</span>
+            <Btn variant="ghost" disabled={page + 1 >= pageCount} onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}>Next</Btn>
+          </div>
+        </div>
+      )}
 
       <Modal open={modal} onClose={() => setModal(false)} title="New Uniform Order" wide>
         <form onSubmit={save} className="space-y-4">
