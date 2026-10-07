@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 378 tests in about 4 minutes. No server, no `DATABASE_URL`, no network,
+Runs 386 tests in about 4 minutes. No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists
@@ -45,7 +45,7 @@ place and untouched.
 | `support-lifecycle.test.ts` | Support work as a lifecycle rather than a quantity. ASSIGNED → STARTED → SUBMITTED → APPROVED / REWORK, with PAUSED reachable from work in hand and RESUMED back out of it, every move server-enforced: no submitting before anybody started (409), no submitting or being inspected while paused, no self-approval, no over-delegation past what the stage holds, no handing out another tailor's work, and a pause requiring a written reason. `supportStatusAfterInspection` compares against the quantity ASSIGNED rather than the quantity submitted, so ten pieces delegated, four handed back and four judged is partial work and not an approval. Every transition appends to `support_status_events` with the actor who made it, a forged actor in the body ignored in favour of the session, and a Production Control board that reports a paused support operation as blocking rather than showing the stage as ordinary work in progress |
 | `test-data-cleanup.test.ts` | The administrative test-data purge, and everything that stops it being a general-purpose delete. Owner-only with the guard before any read, a foreign organisation's order indistinguishable from a nonexistent one (404 either way), the exact school name and order number typed to confirm, a reason of at least ten characters, a dry-run preview that writes nothing, a SHA-256 fingerprint over the sorted per-table id sets recomputed inside the transaction so a stale preview and a replayed one are both 409. Inventory is restored with the material routes' own formula and refuses rather than guessing when reversing a purchase would drive stock negative, ready-made garments stay purchases and never become raw stock, settled payroll is reported and never rewritten, and shared master data — customers, products, workers, routes, materials, organisations — is never touched. The ordinary protection against deleting an order with approved production and payments is asserted to still hold |
 | `start-production-and-list-bounds.test.ts` | Two things that are easy to get subtly wrong. **Start Production** on an order opens the existing Assign Production workflow with that order preselected — one assignment interface, not a second one — and the assignment is revalidated server-side, so an `orderId` belonging to another organisation or to no order at all preselects nothing. **List bounds:** the orders, payments, packing and expenses lists filter, search and page in SQL rather than reading whole tables into the process and filtering in JavaScript, `X-Total-Count` carrying the unpaginated total so a client can page without a second request, and a search term never widening the result past the signed-in organisation |
-| `migration-safety.test.ts` | The two migrations this release adds, held mechanically to the promise every file in `deploy/` makes in prose: additive, repeatable, and writing no data. No `DROP`, `TRUNCATE`, `RENAME`, `DELETE`, `UPDATE` or `INSERT` outside a comment; every statement a guarded DDL form or a read-only verification query; a runnable verification `SELECT` present in each deploy script and actually naming the tables it created; no drizzle `--> statement-breakpoint` marker leaked into a file meant to be pasted into the SQL Editor; both migrations registered in the journal in order with a snapshot each; both upgrade scripts applied TWICE against the migrated database with the table set unchanged, the new tables still empty and a real order created through the API still intact afterwards; and `CREATE TABLE IF NOT EXISTS` proven a genuine no-op on a fresh in-memory database, which is the only place pg-mem can run the guarded form at all |
+| `migration-safety.test.ts` | The two migrations this release adds, held mechanically to the promise every file in `deploy/` makes in prose: additive, repeatable, and writing no data. No `DROP`, `TRUNCATE`, `RENAME`, `DELETE`, `UPDATE` or `INSERT` outside a comment; **no `RAISE` of any kind, because a migration must never fail on purpose**; every statement a guarded DDL form, explicit transaction control or a read-only verification query; **exactly one `BEGIN;`/`COMMIT;` pair per deploy script, bounding every DDL statement, with the first verification query AFTER the `COMMIT`, and no transaction control at all in the drizzle migrations, where drizzle-kit owns the transaction**; a runnable verification `SELECT` present in each deploy script and actually naming the tables it created; no drizzle `--> statement-breakpoint` marker leaked into a file meant to be pasted into the SQL Editor; both migrations registered in the journal in order with a snapshot each; both upgrade scripts applied TWICE against the migrated database with the table set unchanged, the new tables still empty and a real order created through the API still intact afterwards; `CREATE TABLE IF NOT EXISTS` proven a genuine no-op on a fresh in-memory database, which is the only place pg-mem can run the guarded form at all; the documented index and column counts pinned at 5, 5, 14 and 15 so a verification figure cannot silently drift back to one less than the truth; and the **separate** atomicity probe file held to its own contract — present, labelled not-a-migration and optional, pointed at by both migration files so it cannot be orphaned again, inserting only into the audit table it undoes, `ROLLBACK` after `INSERT`, no `COMMIT` and no DDL, its deliberate abort caught by an `EXCEPTION` handler so it cannot halt a SQL editor, and still raising loudly on a genuine rollback failure; and **each deploy script compared against its drizzle migration statement by statement and by object inventory** — tables, indexes, new columns, foreign keys, foreign-key *targets* and `ON DELETE` behaviour — because the two files are applied by different tools and nothing else would catch them drifting apart |
 
 ## How it works
 
@@ -82,12 +82,23 @@ in either direction, so this suite does not: `tests/test-data-cleanup.test.ts` s
 the top instead of faking a rollback assertion, and asserts the ordering and the guards
 that a rollback would have backed up.
 
-**No `pg_indexes`, no `pg_tables`, no `pg_constraint`, and `::regclass` will not cast.**
+**No `pg_indexes`, no `pg_tables`, no `pg_constraint`, no `pg_class`, and `::regclass` will not cast.**
 Index counts and foreign-key counts cannot be asserted here at all. `information_schema.tables`
 IS emulated, so table presence can be. A deploy script whose verification `SELECT` reads
 those catalogues is still correct PostgreSQL — it just cannot be *run* by a test, so
 `tests/migration-safety.test.ts` skips those statements explicitly and says why, rather
 than silently skipping everything.
+
+That test also skips two further kinds of statement on purpose, and both are asserted
+textually instead. It skips the `BEGIN;`/`COMMIT;` the deploy scripts now carry, because
+it runs a *filtered subset* of each script's statements and would otherwise open a
+transaction it could not close in the right place — and pg-mem does not roll back anyway,
+so executing them would prove nothing. And it skips the read-only verification `SELECT`s,
+which are for a person to read in the SQL Editor after an upgrade: they are not part of the
+schema change, they return rows (and `none()` accepts none), and several read catalogues
+pg-mem has no equivalent of. Transaction ownership and the verification queries' content
+are both checked as text, which is the honest way to test a property pg-mem does not
+implement.
 
 **`CREATE TABLE IF NOT EXISTS` is not honoured for a table that already exists** — it
 errors with an unread-AST complaint instead of skipping. `CREATE INDEX IF NOT EXISTS` and

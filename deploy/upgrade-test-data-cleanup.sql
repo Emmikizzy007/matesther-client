@@ -2,6 +2,18 @@
 -- Make a backup first (pg_dump, or your host's snapshot). Run this in the SQL Editor
 -- of the project used by your CLIENT site. Safe to run more than once.
 --
+-- HOW TO RUN IT
+--   Paste this WHOLE file into the SQL Editor and press Run, once. It applies the
+--   upgrade, commits it, and then prints the verification figures, so a single paste
+--   both does the work and tells you whether the work is right. Nothing in this file
+--   is designed to fail, and nothing in it raises an error on purpose.
+--
+--   One warning is normal and can be ignored: if your editor already wraps a pasted
+--   script in a transaction of its own, the explicit BEGIN below reports
+--   `WARNING: there is already a transaction in progress`. That is the editor's
+--   transaction and this file's transaction being the same one. It is not an error
+--   and it changes nothing.
+--
 -- WHAT THIS DOES
 --   1. Creates public.order_deletions: one row per order removed, carrying who removed
 --      it, why, the school and order number it was, and the money and production
@@ -11,8 +23,31 @@
 --      preview promised, and what the purge actually removed.
 --   3. Indexes both by order and by actor, so "what happened to this order" and "what
 --      has this person removed" are both direct lookups.
---   4. Adds nothing to any existing table. No column, no index, no constraint on a
+--   4. Adds the four foreign keys, guarded so a second run skips them.
+--   5. Adds nothing to any existing table. No column, no index, no constraint on a
 --      table that already exists.
+--
+-- WHY THIS FILE OPEN ITS OWN TRANSACTION
+--   It used not to, and that was a real defect. Without an explicit BEGIN and COMMIT
+--   the transactional behaviour of a pasted script is decided by the client rather than
+--   by the file: PostgreSQL runs the statements of one multi-statement query in a single
+--   implicit transaction block, so whether the objects survived depended on how the
+--   editor chose to submit them.
+--
+--   That ambiguity cost a production run. This file previously ended with an atomicity
+--   probe - a deliberate `RAISE EXCEPTION` meant to prove that an aborted transaction
+--   undoes its own writes. Pasted as part of the whole file, and with no COMMIT before
+--   it, the probe aborted the ONE transaction everything else was in and rolled the
+--   entire upgrade back with it. The database was left unchanged and unharmed, which was
+--   the safe outcome, but the person deploying saw an error and had no way to tell from
+--   the script alone whether the tables had been created.
+--
+--   Both halves of that are now fixed. The schema changes are wrapped in an explicit
+--   BEGIN and COMMIT, so they are applied and committed the same way in every client,
+--   and no statement in this file can fail on purpose. The probe still exists, because
+--   the property it tests is still worth testing, but it lives in its own file -
+--   deploy/verify-atomicity-probe.sql - which is optional, is run separately, is run
+--   AFTER this upgrade, and produces its verdict without raising an error.
 --
 -- WHY
 --   Removing an order was previously one unguarded statement - `delete from orders
@@ -43,23 +78,35 @@
 --   Every statement is CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS or a
 --   guarded ADD CONSTRAINT. There is no DROP, no TRUNCATE, no DELETE, no RENAME, no
 --   change to any existing column's type, default or meaning, and no update to any
---   existing row. IT WRITES NO DATA AT ALL: both tables are created empty, because
---   nothing has been deleted yet that could honestly be recorded.
+--   existing row. Nothing is written to any table that already exists, and both new
+--   tables are created empty, because nothing has been deleted yet that could honestly
+--   be recorded. Against an already-upgraded database this whole file is a no-op that
+--   reports the same figures again.
 --
---   Section 4 at the bottom is a self-contained atomicity PROBE. It attempts one insert
---   inside a transaction that is deliberately aborted, which proves on your actual
---   server that a failed cleanup leaves the database untouched. It leaves no residue.
+--   `order_deletions.order_id` deliberately has NO foreign key. The trail has to
+--   survive the row it describes, and a foreign key would either block the removal or
+--   cascade the record away with it.
 --
--- ORDER OF WORK
---   Run this file BEFORE deploying the code that writes to these tables. The code
---   inserts an audit row inside the same transaction as the removal, so if the tables
---   are missing the removal fails and rolls back - which is the safe direction, but it
---   means order removal is unavailable until this file has run.
+-- ORDER OF WORK (as always): run this SQL FIRST, then deploy the new code. The new
+-- code writes to both tables, so deploying it first would fail. Existing code ignores
+-- tables it does not know about, so running this first is harmless.
 --
--- This file is the deploy-script twin of drizzle/0012_deletion_and_purge_audit.sql.
+-- The same change is recorded for the ORM as drizzle/0012_deletion_and_purge_audit.sql.
+-- Do NOT run `drizzle-kit migrate` against production; the SQL Editor route above is
+-- the supported path. That migration carries no BEGIN or COMMIT of its own, because
+-- drizzle-kit owns the transaction when it applies a migration - which is also why this
+-- file, which a person applies by hand, has to own it itself.
+--
 -- If you manage the database with drizzle-kit, run `drizzle-kit migrate` instead of
--- sections 1 and 2, then still run section 3 (verification) and section 4 (the
--- atomicity probe), which the migration does not perform.
+-- sections 1 and 2, then still run section 3 (verification).
+
+-- ---------------------------------------------------------------------------
+-- THE UPGRADE. One transaction: either every object below is created, or none
+-- of them is. COMMIT follows the last foreign key, before any verification, so
+-- the queries in section 3 read committed objects even in an editor that
+-- submits a pasted script as a single statement batch.
+-- ---------------------------------------------------------------------------
+BEGIN;
 
 -- ---------------------------------------------------------------------------
 -- 1. ORDER REMOVALS
@@ -144,99 +191,110 @@ BEGIN
   END IF;
 END $$;
 
+COMMIT;
+
 -- ---------------------------------------------------------------------------
--- 3. VERIFICATION - run this after the upgrade. It changes nothing.
+-- 3. VERIFICATION - this runs after the COMMIT above, so it reads committed
+--    objects. It changes nothing. Paste the whole file and these figures are
+--    printed for you; you do not have to run this section separately.
 --
 -- EXPECT:
---   audit_tables          = 2
---   deletions_indexes     = 4
---   purges_indexes        = 4
---   deletions_fks         = 2
---   purges_fks            = 2
---   deletions_rows        = 0    (nothing is written by this file)
---   purges_rows           = 0
---   orders / payments / production_batches = UNCHANGED from before you ran this file
+--   audit_tables       = 2
+--   deletions_indexes  = 5
+--   purges_indexes     = 5
+--   deletions_fks      = 2
+--   purges_fks         = 2
+--   deletions_columns  = 14
+--   purges_columns     = 15
+--
+-- WHY THE INDEX FIGURES ARE 5 AND NOT 4
+--   An earlier revision of this file said 4, and that was wrong in a way that would
+--   have made a correct upgrade look like a broken one. Each table declares
+--   `"id" serial PRIMARY KEY`, and PostgreSQL backs a primary key with its own index -
+--   `order_deletions_pkey` and `test_data_purges_pkey`. `pg_indexes` lists those too,
+--   so the honest count is the four indexes created below plus the primary key: 5.
+--   Getting 5 means the upgrade worked.
+--
+-- These queries read the catalogues by name rather than casting to `::regclass` or
+-- selecting from the new tables, so they return zeros instead of raising
+-- `relation ... does not exist` if the upgrade somehow did not apply. A verification
+-- step that can fail with a second, unrelated error is no use to the person reading it.
 -- ---------------------------------------------------------------------------
 SELECT
-  (SELECT count(*) FROM information_schema.tables
-    WHERE table_schema = 'public'
-      AND table_name IN ('order_deletions','test_data_purges'))                  AS audit_tables,
+  (SELECT count(*) FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+      AND c.relname IN ('order_deletions','test_data_purges'))                     AS audit_tables,
   (SELECT count(*) FROM pg_indexes
-    WHERE schemaname = 'public' AND tablename = 'order_deletions')                AS deletions_indexes,
+    WHERE schemaname = 'public' AND tablename = 'order_deletions')                 AS deletions_indexes,
   (SELECT count(*) FROM pg_indexes
-    WHERE schemaname = 'public' AND tablename = 'test_data_purges')               AS purges_indexes,
-  (SELECT count(*) FROM pg_constraint
-    WHERE conrelid = 'public.order_deletions'::regclass AND contype = 'f')        AS deletions_fks,
-  (SELECT count(*) FROM pg_constraint
-    WHERE conrelid = 'public.test_data_purges'::regclass AND contype = 'f')       AS purges_fks,
-  (SELECT count(*) FROM public.order_deletions)                                   AS deletions_rows,
-  (SELECT count(*) FROM public.test_data_purges)                                  AS purges_rows,
-  (SELECT count(*) FROM public.orders)                                            AS orders,
-  (SELECT count(*) FROM public.payments)                                          AS payments,
-  (SELECT count(*) FROM public.production_batches)                                AS production_batches;
+    WHERE schemaname = 'public' AND tablename = 'test_data_purges')                AS purges_indexes,
+  (SELECT count(*) FROM pg_constraint con
+     JOIN pg_class c ON c.oid = con.conrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relname = 'order_deletions'
+      AND con.contype = 'f')                                                       AS deletions_fks,
+  (SELECT count(*) FROM pg_constraint con
+     JOIN pg_class c ON c.oid = con.conrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relname = 'test_data_purges'
+      AND con.contype = 'f')                                                       AS purges_fks,
+  (SELECT count(*) FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'order_deletions')              AS deletions_columns,
+  (SELECT count(*) FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'test_data_purges')             AS purges_columns;
+
+-- Run this second query ONLY once the one above reports audit_tables = 2, because it
+-- reads the new tables directly and would raise if they were not there.
+--
+-- EXPECT:
+--   deletions_rows = 0 and purges_rows = 0   (this file writes no data at all)
+--   orders / payments / production_batches   = UNCHANGED from before you ran this file
+SELECT
+  (SELECT count(*) FROM public.order_deletions)                                    AS deletions_rows,
+  (SELECT count(*) FROM public.test_data_purges)                                   AS purges_rows,
+  (SELECT count(*) FROM public.orders)                                             AS orders,
+  (SELECT count(*) FROM public.payments)                                           AS payments,
+  (SELECT count(*) FROM public.production_batches)                                 AS production_batches;
+
+-- The foreign keys, spelled out rather than counted. EXPECT two rows per table:
+-- `organization_id` ON DELETE NO ACTION, and the actor reference ON DELETE SET NULL,
+-- so a person leaving does not erase the record of what they removed. There is
+-- deliberately NO foreign key on either `order_id`.
+SELECT c.relname AS table_name, con.conname, pg_get_constraintdef(con.oid) AS definition
+  FROM pg_constraint con
+  JOIN pg_class c ON c.oid = con.conrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public'
+   AND c.relname IN ('order_deletions','test_data_purges')
+   AND con.contype = 'f'
+ ORDER BY c.relname, con.conname;
 
 -- Both tables must be empty and every new column present, with the NOT NULLs the API
--- relies on (an audit row without a reason or an actor name is not an audit row):
---   SELECT column_name, is_nullable, column_default FROM information_schema.columns
---    WHERE table_schema = 'public' AND table_name IN ('order_deletions','test_data_purges')
---    ORDER BY table_name, ordinal_position;
+-- relies on (an audit row without a reason or an actor name is not an audit row).
+-- EXPECT 14 rows for order_deletions and 15 for test_data_purges; NOT NULL on
+-- id, order_id, order_number, deleted_by_name and reason in the first, and on
+-- id, order_id, order_number, confirmed_customer_name, reason, ran_by_name and
+-- preview_fingerprint in the second; a default only on each `id` and each timestamp.
+SELECT table_name, ordinal_position, column_name, data_type, is_nullable, column_default
+  FROM information_schema.columns
+ WHERE table_schema = 'public'
+   AND table_name IN ('order_deletions','test_data_purges')
+ ORDER BY table_name, ordinal_position;
 
 -- ---------------------------------------------------------------------------
--- 4. ATOMICITY PROBE - run this ONCE, before relying on the cleanup.
+-- 4. OPTIONAL, SEPARATE, AND NOT PART OF THIS UPGRADE
 --
--- WHY THIS IS HERE
---   Both destructive acts run as a single database transaction, so on PostgreSQL a
---   failure part-way through must leave the database exactly as it was. The automated
---   suite cannot demonstrate that: it runs on pg-mem, whose adapter does NOT roll back
---   (verified directly, by throwing inside a transaction after an insert and watching
---   the insert survive). The suite therefore asserts the two properties that ARE
---   observable and that the rollback depends on - every refusal happens before any
---   write, and stock is restored from the records being removed inside the same
---   transaction, before they are deleted. This probe covers the remaining half on a
---   real server.
+-- deploy/verify-atomicity-probe.sql proves that this server really does undo the
+-- writes of a transaction it rolls back - the property both destructive acts in the
+-- application depend on, and the one the automated suite cannot test because it runs
+-- on pg-mem, which does not roll back.
 --
--- WHAT IT TOUCHES
---   Nothing. It attempts one INSERT into public.order_deletions inside a transaction
---   that is then deliberately aborted, so the row must never land - and proving that it
---   does not land IS the test. A rolled-back insert needs no cleanup, so the probe
---   leaves no residue and cannot orphan a row. No application data is read, updated or
---   deleted, and no temporary object is created.
---
---   (An earlier draft of this probe used a TEMP table with ON COMMIT DROP. That was
---   wrong: the abort that proves rollback also drops the table, so the query meant to
---   count the surviving rows would fail on a relation that no longer exists. Writing to
---   the real audit table instead is both simpler and a truer test - it is the same table
---   the cleanup writes to.)
---
--- EXPECT, in order:
---   a. the DO block raises:            probe: deliberate abort
---   b. rolled_back_insert  = 0         the aborted transaction undid its own insert
---   c. purge_rows          = 0         nothing else was written anywhere
---
--- If (b) is anything other than 0, STOP: transactions are not rolling back on this
--- server, and neither order removal nor the test-data cleanup may be used until that is
--- understood - both would be able to leave the database half-changed.
+-- It is a SEPARATE file on purpose. Run it only after this upgrade has been applied
+-- and verified, and run it on its own. It is safe and it leaves nothing behind, but it
+-- is a test, not a schema change, and mixing a test into a migration is what made the
+-- previous revision of this file roll itself back.
 -- ---------------------------------------------------------------------------
-DO $$
-BEGIN
-  -- Every NOT NULL column without a default is supplied, so this INSERT is valid and
-  -- the only reason it can fail to appear is the rollback under test.
-  INSERT INTO public.order_deletions
-    (order_id, order_number, deleted_by_name, reason)
-  VALUES
-    (0, 'PROBE-ROLLED-BACK', 'atomicity probe',
-     'This row was inserted inside a transaction that was then deliberately aborted. If you can read it, rollback is not working.');
-  RAISE EXCEPTION 'probe: deliberate abort';
-END $$;
--- Some SQL editors stop at the first error. If yours did, that error IS step (a): it is
--- the probe behaving correctly, not a failure of the upgrade. Re-run from the SELECT
--- below rather than re-running the whole file.
-
-SELECT
-  (SELECT count(*) FROM public.order_deletions
-    WHERE order_number = 'PROBE-ROLLED-BACK') AS rolled_back_insert,
-  (SELECT count(*) FROM public.order_deletions) AS deletion_rows,
-  (SELECT count(*) FROM public.test_data_purges) AS purge_rows;
 
 -- ---------------------------------------------------------------------------
 -- 5. AFTER DEPLOYING THE CODE - the trail working end to end.

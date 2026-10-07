@@ -50,6 +50,25 @@
 --   TABLE statements inside the DO block and runs them directly against a database that
 --   is always created empty, where the guard could never fire. The resulting schema is
 --   identical. This is the arrangement migrations 0003 through 0011 rely on.
+--
+-- NOTE ON TRANSACTIONS
+--   This file deliberately contains no BEGIN, COMMIT or ROLLBACK. drizzle-kit owns the
+--   transaction when it applies a migration, and a migration that opened or closed one
+--   of its own would fight the tool applying it. The hand-run equivalent,
+--   deploy/upgrade-test-data-cleanup.sql, DOES wrap its DDL in an explicit BEGIN and
+--   COMMIT, because there a person is applying it through a SQL editor and the
+--   transactional behaviour would otherwise be decided by that editor rather than by the
+--   file. The two files describe the same objects; only who owns the transaction
+--   differs, and it has to differ.
+--
+-- NOTE ON THE ATOMICITY PROBE
+--   There is none here, and there must never be one. A probe proves rollback by
+--   deliberately aborting, and a migration is not allowed to abort. The probe lives in
+--   deploy/verify-atomicity-probe.sql, which is optional, is run separately, and is run
+--   after the upgrade. An earlier revision put the probe at the end of the deploy
+--   script; pasted as one submission with no COMMIT before it, it rolled the entire
+--   upgrade back. Keep the test that is designed to fail out of the migration that is
+--   designed to succeed.
 
 -- ---------------------------------------------------------------------------
 -- 1. ORDER REMOVALS
@@ -135,16 +154,34 @@ BEGIN
 END $$;
 
 -- ---------- VERIFICATION (run these after applying; they change nothing) ----------
--- EXPECT: both tables present, 4 indexes each, 2 foreign keys each, both empty.
---   SELECT tablename FROM pg_tables
---    WHERE schemaname = 'public' AND tablename IN ('order_deletions','test_data_purges');
+-- EXPECT: both tables present, 5 indexes each, 2 foreign keys each, both empty.
+--
+-- WHY 5 INDEXES AND NOT 4
+--   Each table declares `"id" serial PRIMARY KEY`, and PostgreSQL backs a primary key
+--   with its own index - `order_deletions_pkey` and `test_data_purges_pkey`. pg_indexes
+--   lists those as well as the four indexes created below, so the honest count is 5.
+--   An earlier revision of this comment said 4, which would have made a correct upgrade
+--   look like a broken one. The same correction is made in the deploy script.
+--
+-- These read the catalogues by name rather than casting to `::regclass` or selecting
+-- from the new tables, so they return zeros instead of raising
+-- `relation ... does not exist` when the tables are absent. A verification step that
+-- can fail with a second, unrelated error is no use to whoever is reading it.
+--   SELECT c.relname FROM pg_class c
+--     JOIN pg_namespace n ON n.oid = c.relnamespace
+--    WHERE n.nspname = 'public' AND c.relkind = 'r'
+--      AND c.relname IN ('order_deletions','test_data_purges');
 --   SELECT tablename, count(*) AS indexes FROM pg_indexes
 --    WHERE schemaname = 'public' AND tablename IN ('order_deletions','test_data_purges')
 --    GROUP BY tablename;
---   SELECT conrelid::regclass AS table_name, count(*) AS fks FROM pg_constraint
---    WHERE conrelid IN ('public.order_deletions'::regclass,'public.test_data_purges'::regclass)
---      AND contype = 'f'
---    GROUP BY conrelid;
+--   SELECT c.relname AS table_name, count(*) AS fks FROM pg_constraint con
+--     JOIN pg_class c ON c.oid = con.conrelid
+--     JOIN pg_namespace n ON n.oid = c.relnamespace
+--    WHERE n.nspname = 'public'
+--      AND c.relname IN ('order_deletions','test_data_purges')
+--      AND con.contype = 'f'
+--    GROUP BY c.relname;
+-- Once both tables are confirmed present, these are safe to read directly:
 --   SELECT (SELECT count(*) FROM public.order_deletions) AS deletions,
 --          (SELECT count(*) FROM public.test_data_purges) AS purges;
 -- Nothing existing was touched:

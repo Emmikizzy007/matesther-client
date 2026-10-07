@@ -55,6 +55,21 @@
 -- the supported path.
 
 -- ---------------------------------------------------------------------------
+-- THE UPGRADE. One transaction: either every change below is applied, or none
+-- of them is. COMMIT follows the last foreign key, before any verification, so
+-- the queries in the VERIFICATION section read committed objects even in an
+-- editor that submits a pasted script as a single statement batch.
+--
+-- Without an explicit BEGIN and COMMIT the transactional behaviour of a pasted
+-- script is decided by the client rather than by this file, which is how the
+-- companion script deploy/upgrade-test-data-cleanup.sql once rolled itself back.
+-- If your editor already wraps a pasted script in a transaction of its own, the
+-- BEGIN below reports `WARNING: there is already a transaction in progress`.
+-- That is normal, is not an error, and changes nothing.
+-- ---------------------------------------------------------------------------
+BEGIN;
+
+-- ---------------------------------------------------------------------------
 -- 1. THE LIFECYCLE COLUMNS ON support_assignments
 -- ---------------------------------------------------------------------------
 ALTER TABLE "support_assignments" ADD COLUMN IF NOT EXISTS "started_at" timestamp;
@@ -118,18 +133,32 @@ BEGIN
   END IF;
 END $$;
 
+COMMIT;
+
 -- ---------------------------------------------------------------------------
--- VERIFICATION - run these after the upgrade. They change nothing.
+-- VERIFICATION - these run after the COMMIT above, so they read committed
+-- objects. They change nothing. Paste the whole file and these figures are
+-- printed for you; you do not have to run this section separately.
 --
 -- EXPECT:
 --   new_columns            = 4
 --   support_events_table   = 1
---   support_event_indexes  = 3
+--   support_event_indexes  = 4
 --   support_status_index   = 1
 --   support_event_fks      = 4
 --   support_assignments    = UNCHANGED from before you ran this file
 --   support_inspections    = UNCHANGED
 --   backfilled_events      = 0   (nothing is ever written by this file)
+--
+-- WHY support_event_indexes IS 4 AND NOT 3
+--   support_status_events declares `"id" serial PRIMARY KEY`, and PostgreSQL backs a
+--   primary key with its own index, `support_status_events_pkey`. `pg_indexes` lists
+--   that as well as the three indexes created below, so the honest count is 4. An
+--   earlier revision of this comment said 3, which would have made a correct upgrade
+--   look like a broken one. Getting 4 means the upgrade worked.
+--
+-- The final three counts read real tables, so if this section is somehow run before
+-- the upgrade they will raise `relation ... does not exist` rather than report zeros.
 -- ---------------------------------------------------------------------------
 SELECT
   (SELECT count(*) FROM information_schema.columns

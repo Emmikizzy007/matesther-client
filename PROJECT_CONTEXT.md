@@ -2168,12 +2168,27 @@ write of any kind**:
   `submitted_by_name`), `support_assignments_status_idx`, and the append-only
   `support_status_events`.
 - `drizzle/0012_deletion_and_purge_audit.sql` → `deploy/upgrade-test-data-cleanup.sql`. The
-  `order_deletions` and `test_data_purges` audit tables, four indexes each. The deploy script is
-  deliberately RICHER than the migration and is organised in five numbered sections: the two tables,
-  their guarded foreign keys, a read-only verification query, **the atomicity probe described in
-  40.7**, and the post-deploy queries that prove the trail works end to end. A migration has no
-  business containing a probe that writes and aborts, so the two files are not interchangeable and
-  the deploy script must never be regenerated from the migration without re-adding sections 3 to 5.
+  `order_deletions` and `test_data_purges` audit tables, four explicit indexes each **plus the index
+  PostgreSQL creates for each primary key, so `pg_indexes` reports 5 each** — both files originally
+  documented 4, which would have made a correct upgrade look like a broken one to whoever compared
+  the numbers.
+
+Both deploy scripts wrap their DDL in an explicit `BEGIN;` … `COMMIT;` and put every verification
+query **after** the `COMMIT`, so one paste applies the upgrade, commits it, and prints the figures
+that confirm it. The drizzle migrations contain **no** transaction control, because drizzle-kit owns
+the transaction when it applies one. That asymmetry is deliberate and is asserted by
+`tests/migration-safety.test.ts`; see 40.7 for the production incident that made it necessary.
+
+The deploy script is deliberately RICHER than the migration and is organised in five numbered
+sections: the two tables, their guarded foreign keys, the read-only verification queries, a pointer
+to the separate atomicity probe, and the post-deploy queries that prove the trail works end to end.
+**The probe is no longer one of those sections** — it lives in `deploy/verify-atomicity-probe.sql`,
+described in 40.7. A migration has no business containing a test that writes and aborts, so the two
+files are not interchangeable, and the deploy script must never be regenerated from the migration
+without re-adding the transaction boundary, the verification queries and sections 4 to 5. That
+warning is now backed mechanically rather than by memory alone: `tests/migration-safety.test.ts`
+compares each deploy script against its migration DDL statement by statement and by object
+inventory, so regenerating one from the other and losing content fails the suite.
 
 `drizzle/meta/_journal.json` has 13 contiguous entries (0000–0012) with 13 snapshots, and
 `npx drizzle-kit generate` reports "No schema changes, nothing to migrate" — so `src/db/schema.ts`
@@ -2194,27 +2209,61 @@ second.** Do not run `drizzle-kit migrate` against production.
 
 ## 40.6 Regression coverage
 
-**378 tests, 0 failures**, up from 278 at the start of this run. `npx tsc --noEmit` clean.
+**386 tests, 0 failures**, up from 278 at the start of this run. `npx tsc --noEmit` clean.
 `npm run build` succeeds and emits both new routes (`/api/test-data-cleanup`,
 `/settings/test-data`). All through the real route handlers; no application logic is
 re-implemented, copied or faked anywhere in the suite.
 
-100 tests were added, in five files:
+108 tests were added, in five files:
 
 - `tests/support-lifecycle.test.ts` — 30
 - `tests/test-data-cleanup.test.ts` — 28
 - `tests/product-route-resolution.test.ts` — 19
-- `tests/migration-safety.test.ts` — 13
+- `tests/migration-safety.test.ts` — 21
 - `tests/start-production-and-list-bounds.test.ts` — 10
 
 `tests/migration-safety.test.ts` is new in kind rather than in subject: it holds the two migrations
 mechanically to the promise every file in `deploy/` makes only in prose. No `DROP`, `TRUNCATE`,
-`RENAME`, `DELETE`, `UPDATE` or `INSERT` outside a comment; every statement a guarded DDL form or a
-read-only verification query; a runnable verification SELECT present and naming the tables it
-created; no drizzle `--> statement-breakpoint` marker leaked into a file meant to be pasted into
-the SQL Editor; both upgrade scripts applied **twice** against the migrated database with the table
-set unchanged, the new tables still empty and a real order created through the API still intact.
-Until now that promise was a comment, and a comment cannot fail a build.
+`RENAME`, `DELETE`, `UPDATE` or `INSERT` outside a comment; every statement a guarded DDL form,
+explicit transaction control or a read-only verification query; **no `RAISE` of any kind in either
+migration file, because a migration must never fail on purpose**; a runnable verification SELECT
+present and naming the tables it created; no drizzle `--> statement-breakpoint` marker leaked into a
+file meant to be pasted into the SQL Editor; **exactly one `BEGIN;`/`COMMIT;` pair per deploy script,
+bounding every DDL statement, with the first verification query after the `COMMIT`, and no
+transaction control at all in the drizzle migrations**; both upgrade scripts applied **twice** against
+the migrated database with the table set unchanged, the new tables still empty and a real order
+created through the API still intact. Until now that promise was a comment, and a comment cannot fail
+a build.
+
+It also holds the separate probe file to its own contract: it exists, it says in terms that it is
+**not a migration** and that running it is optional, both migration files point at it so it cannot be
+orphaned again, it inserts only into the audit table it undoes, its `ROLLBACK` follows its `INSERT`,
+it contains **no `COMMIT`** (which would make its row permanent) and **no DDL** (which would make it
+a second, unreviewed migration), its deliberate abort is followed by an `EXCEPTION` handler so it
+cannot halt a SQL editor, and it still raises loudly on a genuine rollback failure rather than
+passing silently. Finally it pins the documented index and column counts — 5, 5, 14 and 15 — because
+a verification figure that is wrong by one turns a successful deployment into an investigation.
+
+It also compares each deploy script against its drizzle migration statement by statement, and by
+object inventory — tables, indexes, new columns, foreign keys, **foreign-key targets and `ON DELETE`
+behaviour** — so the two files cannot drift apart unnoticed. They are applied by different tools
+(drizzle-kit for one, a person in a SQL editor for the other), so nothing else would catch it, and
+they have drifted before.
+
+Every one of those assertions was **negative-controlled**: the defect it forbids was reintroduced
+into a copy of the file, the test was shown to fail, and the file was restored. Ten controls were
+run — `RAISE EXCEPTION` back in the migration, `BEGIN`/`COMMIT` removed, a `COMMIT` added to the
+probe, the probe's `EXCEPTION` handler removed, an index expectation reverted to 4, the probe file
+deleted, transaction control added to the drizzle migration, DDL hidden in the probe file, one
+foreign key's `ON DELETE` drifted in the deploy script only, and one index deleted from the deploy
+script only. **All ten were caught.**
+
+Worth recording, because it is the kind of mistake that reports success: the first version of the
+consistency comparison split SQL on `;` without first unwrapping the `DO $$ … END $$;` guard blocks.
+That truncates each block at its first inner semicolon, so only the first of four `ADD CONSTRAINT`
+statements was ever compared — and the check still printed a confident "IDENTICAL" verdict. The
+committed version unwraps the guard blocks first and asserts that it really did compare four
+constraints, so the comparison cannot silently degenerate again.
 
 Four existing fixtures were **corrected rather than the guards being weakened**:
 `tests/support-payroll.test.ts`, `tests/support-cost-allocation.test.ts` and
@@ -2234,15 +2283,28 @@ Stated plainly, because an unverified claim in this file is worse than none:
   backed up, instead of faking a rollback assertion. The single-transaction structure is real in
   the code; only its failure behaviour is unproven here.
 
-  **`deploy/upgrade-test-data-cleanup.sql` section 4 is the manual probe to run against a real
-  PostgreSQL before relying on that claim.** It inserts one row into `order_deletions` inside a
-  transaction it then deliberately aborts, and asks for the count: if `rolled_back_insert` is
-  anything other than 0, transactions are not rolling back on that server and neither order removal
-  nor the cleanup may be used until that is understood, because both could leave the database
-  half-changed. **Do not delete that probe thinking it redundant — it is the only half of the
-  guarantee that is tested anywhere.** This file once lost it, when the deploy script was
-  regenerated from the `drizzle/` migration (which has no probe, because a migration is not the
-  place for one); it was recovered from the earlier revision and must survive any future rewrite.
+  **`deploy/verify-atomicity-probe.sql` is the manual probe to run against a real PostgreSQL before
+  relying on that claim.** It is **optional, separate, and not part of any migration**: run it on its
+  own, after the upgrade has been applied and verified. Probe A inserts one labelled row into
+  `order_deletions` inside an explicit transaction it then rolls back — the exact mechanism Drizzle
+  uses on failure — and Probe B raises inside a block whose handler catches it, which tests that an
+  *error* undoes work too. Both report a result row rather than an error, and the verdict row reads
+  `PASS - this server rolls back`. If it reports residue, transactions are not rolling back on that
+  server and neither order removal nor the cleanup may be used until that is understood, because
+  both could leave the database half-changed. **Do not delete that probe thinking it redundant — it
+  is the only half of the guarantee that is tested anywhere.**
+
+  **It used to be section 4 of the upgrade script, and that placement caused a production incident.**
+  A probe proves rollback by aborting on purpose; a migration must never abort. Pasted as part of the
+  whole file, with no `COMMIT` before it, its `RAISE EXCEPTION 'probe: deliberate abort'` aborted the
+  single implicit transaction the entire upgrade was running in and rolled the upgrade back with it.
+  The database was left unchanged and unharmed — the safe outcome — but the error gave whoever was
+  deploying no way to tell from the script whether the tables had been created, and it took a catalog
+  query to establish that they had not. The lesson is general and is now pinned by tests: **a test
+  designed to fail must never share a submission with a migration designed to succeed**, and a
+  hand-run deploy script must own its transaction rather than inherit one from whichever editor
+  pastes it. This file also lost the probe once before, when the deploy script was regenerated from
+  the `drizzle/` migration; it must survive any future rewrite, in its own file.
 
 - **`purgeHistory` must order `desc` with a `limit`, never `asc` + `limit` + reverse.** Reversing an
   ascending slice returns the OLDEST window once the trail is longer than the limit - silently, and
