@@ -3,30 +3,60 @@ import { guard, getSessionUser, OWNER } from "@/lib/authz";
 import { db } from "@/db";
 import { orderFulfilment } from "@/lib/production-control";
 import { packingRecords, orders, customers } from "@/db/schema";
-import { eq, desc } from "drizzle-orm";
+import { desc, eq, inArray, sql } from "drizzle-orm";
 
+/**
+ * GET /api/packing?orderId=&limit=&offset=
+ *
+ * Packing records, newest first. `orderId` is a WHERE CLAUSE rather than a filter
+ * applied after every record in the database has been read and enriched, which is what
+ * it was - and the order page asks for one order's packing every time it opens.
+ * Orders and schools are then fetched for the records being returned only.
+ */
 export async function GET(req: Request) {
   const __g = await guard(req, OWNER); if (__g) return __g;
   try {
     const { searchParams } = new URL(req.url);
-    const orderId = searchParams.get("orderId");
-    const rows = await db.select().from(packingRecords).orderBy(desc(packingRecords.packedAt));
-    const [orderRows, customerRows] = await Promise.all([
-      db.select().from(orders),
-      db.select().from(customers),
-    ]);
+    const rawOrderId = searchParams.get("orderId");
+    if (rawOrderId !== null && rawOrderId.trim() !== "" && !/^\d+$/.test(rawOrderId.trim()))
+      return NextResponse.json({ error: "Choose a valid order." }, { status: 400 });
+    const orderId = rawOrderId && /^\d+$/.test(rawOrderId.trim()) ? Number(rawOrderId.trim()) : null;
+    const rawLimit = searchParams.get("limit") ? Number(searchParams.get("limit")) : NaN;
+    const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 500) : 100;
+    const rawOffset = searchParams.get("offset") ? Number(searchParams.get("offset")) : 0;
+    const offset = Number.isSafeInteger(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+
+    const where = orderId !== null ? eq(packingRecords.orderId, orderId) : undefined;
+    const [totalRow] = await db.select({ total: sql<number>`count(*)` }).from(packingRecords).where(where);
+    const total = Number(totalRow?.total ?? 0);
+    const rows = total === 0
+      ? []
+      : await db.select().from(packingRecords).where(where)
+          .orderBy(desc(packingRecords.packedAt), desc(packingRecords.id))
+          .limit(limit).offset(offset);
+
+    const orderIds = [...new Set(rows.map((row) => row.orderId))];
+    const orderRows = orderIds.length
+      ? await db.select({ id: orders.id, orderNumber: orders.orderNumber, customerId: orders.customerId })
+          .from(orders).where(inArray(orders.id, orderIds))
+      : [];
+    const customerIds = [...new Set(orderRows.map((o) => o.customerId).filter((v): v is number => v !== null))];
+    const customerRows = customerIds.length
+      ? await db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
+      : [];
     const oMap = new Map(orderRows.map((o) => [o.id, o]));
     const cMap = new Map(customerRows.map((c) => [c.id, c]));
-    let data = rows.map((p) => {
+    const data = rows.map((p) => {
       const o = oMap.get(p.orderId);
       return {
         ...p,
         orderNumber: o?.orderNumber ?? "-",
-        customer: cMap.get(o?.customerId ?? -1)?.name ?? "-",
+        customer: o?.customerId ? cMap.get(o.customerId)?.name ?? "-" : "-",
       };
     });
-    if (orderId) data = data.filter((d) => d.orderId === Number(orderId));
-    return NextResponse.json(data);
+    return NextResponse.json(data, {
+      headers: { "Cache-Control": "private, no-store", "X-Total-Count": String(total) },
+    });
   } catch (e: any) {
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });
   }

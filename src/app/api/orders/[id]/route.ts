@@ -22,7 +22,8 @@ import {
 import { eq, inArray } from "drizzle-orm";
 import { refreshOrderMoney, batchProgress } from "@/lib/server";
 import { orderCosts, emptyOrderCosts, COST_LINES } from "@/lib/order-cost";
-import { guard, OWNER } from "@/lib/authz";
+import { guard, getSessionUser, OWNER } from "@/lib/authz";
+import { deleteOrderIfSafe } from "@/lib/test-data-cleanup";
 
 export async function GET(
   req: Request,
@@ -369,12 +370,53 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
   }
 }
 
+/**
+ * DELETE /api/orders/:id?reason=…
+ *
+ * Remove an order that never went anywhere, and record that it was removed.
+ *
+ * WHAT THIS USED TO BE
+ *   One statement: `delete from orders where id = ?`. It cascaded away the order's items,
+ *   variants, batches, stages, movement ledger, allocations, inspections, quality checks,
+ *   rework records, receipts, packing records and deliveries, with no check and no trace.
+ *   It also left `support_assignments` and `material_usage` ORPHANED rather than removed,
+ *   because those reference the order with `set null` and with no cascade at all - so a
+ *   helper's earnings could survive attached to an order that no longer existed, and an
+ *   inventory movement could keep drawing down a shelf for a job that was gone.
+ *
+ * WHAT IT IS NOW
+ *   Guarded by `deleteOrderIfSafe`: an order with inspected production, a customer payment
+ *   or a delivery behind it is REFUSED with 409 and the caller is pointed at the
+ *   administrative test-data cleanup, which previews the removal, demands two typed
+ *   confirmations and records the purge permanently. An order that only ever had empty
+ *   batches can still be tidied away here, because making an Owner run an administrative
+ *   procedure to delete a mistake they made ten seconds ago would just teach them to
+ *   reach for the stronger tool.
+ *
+ *   Either way stock is restored before the records justifying the adjustment are removed,
+ *   ready-made purchases are correctly left out of raw inventory, the removal is scoped to
+ *   the caller's organisation, a written reason is mandatory, and the actor comes from the
+ *   session - never from the request.
+ */
 export async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const denied = await guard(req, OWNER);
   if (denied) return denied;
   try {
+    const session = await getSessionUser(req);
+    if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
     const { id } = await params;
-    await db.delete(orders).where(eq(orders.id, Number(id)));
+    const orderId = Number(id);
+    if (!Number.isSafeInteger(orderId) || orderId < 1)
+      return NextResponse.json({ error: "Choose a valid order." }, { status: 400 });
+    const reason = String(new URL(req.url).searchParams.get("reason") ?? "").trim();
+
+    const result = await deleteOrderIfSafe(
+      session.organizationId,
+      orderId,
+      { userId: session.id, name: session.name },
+      reason
+    );
+    if (!("ok" in result)) return NextResponse.json({ error: result.error }, { status: result.status });
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     return NextResponse.json({ error: e?.queryError?.message || e?.cause?.message || e?.message || "Unknown error" }, { status: 500 });

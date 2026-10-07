@@ -62,8 +62,34 @@ const MIGRATIONS = [
   "0008_production_allocations",
   "0009_support_cost_and_material_detail",
   "0010_actor_audit",
+  "0011_support_lifecycle",
+  "0012_deletion_and_purge_audit",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
+/**
+ * Statements pg-mem cannot run, and what to do instead.
+ *
+ * pg-mem has no plpgsql interpreter, so a `DO $$ ... $$` guard block cannot be
+ * executed; the ALTER TABLE statements inside it are run directly instead, which is
+ * safe because this database is always created empty so a guard could never fire.
+ *
+ * `CREATE INDEX IF NOT EXISTS` is passed through untouched: pg-mem honours it for
+ * indexes, which is why migration 0006 can re-declare every index in the schema
+ * against a database that already has them. (It does NOT honour the guarded form for
+ * `CREATE TABLE`, per tests/README.md, so no migration uses it there.) Stripping the
+ * guard here was tried and is wrong: it turns 0006's idempotent re-declaration into
+ * a "relation already exists" failure.
+ *
+ * THE DO-BLOCK TEST IS `/\bDO\s+\$\$/`, NOT `/^DO\s+\$/`. It used to be anchored,
+ * which meant a migration whose guard block was preceded by its own explanatory
+ * comment - the house style - was handed to pg-mem whole and failed with `Unknown
+ * language "plpgsql"`. Anchoring made the detector depend on comment placement,
+ * which is not a property of the SQL. Only ALTER TABLE is unwrapped from inside a
+ * guard block, exactly as before: a `CREATE INDEX IF NOT EXISTS` inside one is there
+ * to be a no-op on an up-to-date database, and running it against a fresh one would
+ * duplicate an index the earlier migrations already created.
+ */
+const DO_BLOCK = /\bDO\s+\$\$/i;
 
 const applied = [];
 for (const name of MIGRATIONS) {
@@ -73,14 +99,21 @@ for (const name of MIGRATIONS) {
   for (const chunk of sql.split("--> statement-breakpoint")) {
     const statement = chunk.trim();
     if (!statement) continue;
-    if (/^DO\s+\$/i.test(statement)) {
-      for (const inner of statement.match(INNER_STATEMENTS) || []) {
+    // A comment-only chunk carries no statement.
+    const withoutComments = statement
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("--"))
+      .join("\n")
+      .trim();
+    if (!withoutComments) continue;
+    if (DO_BLOCK.test(withoutComments)) {
+      for (const inner of withoutComments.match(INNER_STATEMENTS) || []) {
         mem.public.none(inner);
         statements += 1;
       }
       continue;
     }
-    mem.public.none(statement);
+    mem.public.none(withoutComments);
     statements += 1;
   }
   applied.push(`${name} (${statements})`);
@@ -138,6 +171,26 @@ const REQUIRED_COLUMNS = [
   ["material_usage", "quantity_returned"],
   ["material_usage", "quantity_wasted"],
   ["material_usage", "worker_id"],
+  // Fails loudly if migration 0011 was not applied: the support-work lifecycle and
+  // its audit trail both depend on these, and Production Control reads the pause.
+  ["support_assignments", "started_at"],
+  ["support_assignments", "paused_at"],
+  ["support_assignments", "pause_reason"],
+  ["support_assignments", "submitted_by_name"],
+  ["support_status_events", "event_type"],
+  ["support_status_events", "to_status"],
+  ["support_status_events", "actor_name"],
+  ["support_status_events", "reason"],
+  // Fails loudly if migration 0012 was not applied: the guarded order deletion and the
+  // administrative test-data purge both have to leave a record that survives the rows
+  // they removed, and neither can be audited without these.
+  ["order_deletions", "reason"],
+  ["order_deletions", "order_number"],
+  ["order_deletions", "deleted_by_name"],
+  ["test_data_purges", "confirmed_customer_name"],
+  ["test_data_purges", "preview_fingerprint"],
+  ["test_data_purges", "payroll_report"],
+  ["test_data_purges", "inventory_report"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);

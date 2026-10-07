@@ -13,6 +13,7 @@ import {
   products,
   productionAllocations,
   orderItemSizes,
+  supportStatusEvents,
 } from "@/db/schema";
 import { guard, getSessionUser, getLinkedWorkerId, ANYONE } from "@/lib/authz";
 import { SUPPORT_OPERATIONS, SUPPORT_ROLE, sameRole, variantLabel } from "@/lib/format";
@@ -23,6 +24,13 @@ import {
   supportInspectionRate,
   supportInspectionDeduction,
   supportHeadroom,
+  supportStatusAfterInspection,
+  supportTransitionError,
+  recordSupportEvent,
+  supportEventsFor,
+  SUPPORT_ACTIONS,
+  SUPPORT_STATUS_LABELS,
+  type SupportEvent,
 } from "@/lib/support-work";
 
 export const dynamic = "force-dynamic";
@@ -150,6 +158,40 @@ export async function GET(req: Request) {
       : [];
     const shareHolderById = new Map(shareHolders.map((person) => [person.id, person.name]));
 
+    /**
+     * `?events=1` asks for the lifecycle trail of the rows on this page. It is one
+     * extra query for the whole page - never one per assignment - and it is off by
+     * default, because a list of support work does not need every transition of
+     * every row to be readable.
+     */
+    const withEvents = query.get("events") === "1";
+    const eventsByAssignment = new Map<number, {
+      id: number; eventType: string; fromStatus: string | null; toStatus: string;
+      actorName: string; reason: string | null; occurredAt: Date | null;
+    }[]>();
+    if (withEvents) {
+      const eventRows = await db
+        .select({
+          id: supportStatusEvents.id,
+          supportAssignmentId: supportStatusEvents.supportAssignmentId,
+          eventType: supportStatusEvents.eventType,
+          fromStatus: supportStatusEvents.fromStatus,
+          toStatus: supportStatusEvents.toStatus,
+          actorName: supportStatusEvents.actorName,
+          reason: supportStatusEvents.reason,
+          occurredAt: supportStatusEvents.occurredAt,
+        })
+        .from(supportStatusEvents)
+        .where(inArray(supportStatusEvents.supportAssignmentId, assignments.map((row) => row.id)));
+      for (const event of eventRows) {
+        const list = eventsByAssignment.get(event.supportAssignmentId) ?? [];
+        list.push(event);
+        eventsByAssignment.set(event.supportAssignmentId, list);
+      }
+      for (const list of eventsByAssignment.values())
+        list.sort((a, b) => (a.occurredAt?.getTime() ?? 0) - (b.occurredAt?.getTime() ?? 0) || a.id - b.id);
+    }
+
     const personById = new Map(people.map((person) => [person.id, person]));
     const orderById = new Map(orderRows.map((order) => [order.id, order]));
     const customerById = new Map(customerRows.map((row) => [row.id, row]));
@@ -211,6 +253,35 @@ export async function GET(req: Request) {
             }
           : null,
         pending: supportPending(row),
+        /* ---- the lifecycle, as facts rather than as a status word to decode ----
+         *
+         * `statusLabel` is the same vocabulary the production board uses, so a
+         * controller reading "PAUSED" here and "PAUSED" there is reading one thing.
+         * `started` / `paused` answer the two questions Production Control asks: has
+         * the helper begun, and are they stopped right now.
+         */
+        statusLabel: SUPPORT_STATUS_LABELS[row.status] ?? row.status,
+        started: row.startedAt !== null,
+        startedAt: row.startedAt,
+        paused: row.status === "PAUSED",
+        pausedAt: row.pausedAt,
+        pauseReason: row.pauseReason,
+        submittedBy: row.submittedByName,
+        /**
+         * THE DELEGATION MATHS, derived here and nowhere else.
+         *
+         * "50 assigned, 20 delegated, 15 approved, 5 still out" must be one answer
+         * wherever it appears, so it is computed once on the server from the stored
+         * figures rather than re-derived by each screen. `outstanding` is what the
+         * helper still owes: delegated, less everything already judged.
+         */
+        outstanding: Math.max(
+          0,
+          row.quantityAssigned - row.quantityApproved - row.quantityRejected - row.quantityRework
+        ),
+        awaitingInspection: supportPending(row),
+        /** The lifecycle trail, when the caller asked for it. One query for the page. */
+        events: withEvents ? (eventsByAssignment.get(row.id) ?? []) : undefined,
       };
     });
 
@@ -398,7 +469,8 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "That order could not be found." }, { status: 404 });
     }
 
-    const [created] = await db
+    const created = await db.transaction(async (tx) => {
+      const [row] = await tx
       .insert(supportAssignments)
       .values({
         organizationId: session.organizationId,
@@ -419,6 +491,23 @@ export async function POST(req: Request) {
         notes: body.notes ? String(body.notes).slice(0, 2000) : null,
       })
       .returning();
+      // The trail starts at the assignment, so "who handed this out and when" is a
+      // recorded event rather than something inferred from a created_at column.
+      await recordSupportEvent(tx, {
+        supportAssignmentId: row.id,
+        organizationId: session.organizationId,
+        eventType: "CREATED",
+        fromStatus: null,
+        toStatus: row.status,
+        // The actor is the person SIGNED IN, who may be a supervisor recording the
+        // hand-over on the holder's behalf - that distinction is the whole point of
+        // keeping `assignedByWorkerId` and the actor separate.
+        actor: { userId: session.id, workerId: myWorkerId, name: session.name },
+        reason: null,
+        notes: row.notes,
+      });
+      return row;
+    });
     return NextResponse.json(created, { status: 201 });
   } catch (error) {
     console.error("Support work assignment failed", error);
@@ -428,9 +517,15 @@ export async function POST(req: Request) {
 
 /**
  * PUT /api/support-work
+ *  { id, action: "start" | "pause" | "resume" | "cancel", reason? } - the lifecycle
  *  { id, submitQty }                                        - the helper submits
  *  { id, quantityApproved, quantityRework, quantityRejected } - the tailor inspects
- *  { id, status: "CANCELLED" }                              - before anything is done
+ *
+ * EVERY TRANSITION IS VALIDATED SERVER-SIDE against one table of legal moves
+ * (`SUPPORT_TRANSITIONS` in lib/support-work.ts), and every one of them appends a
+ * row to `support_status_events` naming the person who made it. Hiding a button in
+ * the UI therefore changes nothing about what is allowed: a direct API request
+ * meets the same rule and the same recorded answer.
  *
  * A support worker can never approve their own work, whatever their login role.
  */
@@ -446,11 +541,146 @@ export async function PUT(req: Request) {
       return NextResponse.json({ error: "Choose a support assignment." }, { status: 400 });
     const [assignment] = await db.select().from(supportAssignments).where(eq(supportAssignments.id, id)).limit(1);
     if (!assignment) return NextResponse.json({ error: "Support assignment not found." }, { status: 404 });
+    /*
+     * ORGANISATION ISOLATION, and the reason it has to be here rather than left to the
+     * actor checks below.
+     *
+     * Every actor rule on this route is derived from identity: `isSupportWorker` and
+     * `isAssigningTailor` compare the caller's own linked worker record against the
+     * assignment's, and worker ids are organisation-scoped, so neither can match across
+     * organisations. `isSupervisor` is different - it is derived from the login ROLE
+     * alone. Without this check an OWNER or PRODUCTION_MANAGER of one organisation could
+     * name an assignment id belonging to another and inspect it, and inspection is what
+     * approves pieces and therefore what makes them payable. Pausing and cancelling
+     * somebody else's production is the same gap with less money behind it.
+     *
+     * This is a pre-existing gap, present at the commit this branch started from, not
+     * something the lifecycle work introduced. It is fixed here because the lifecycle put
+     * three more supervisor-reachable actions behind the same lookup.
+     *
+     * The answer is 404 rather than 403, so probing ids cannot distinguish another
+     * organisation's assignment from one that does not exist - the same choice
+     * /api/routes and the test-data cleanup make.
+     *
+     * A legacy row with no organisation at all is not refused: there is nothing to
+     * compare it against, and `ownedBy` in src/lib/production-route.ts takes the same
+     * view. `POST` below has always written the session's organisation, so this only
+     * describes rows that predate organisation scoping.
+     */
+    if (assignment.organizationId !== null && session.organizationId !== null
+      && assignment.organizationId !== session.organizationId)
+      return NextResponse.json({ error: "Support assignment not found." }, { status: 404 });
 
     const myWorkerId = await getLinkedWorkerId(session);
     const isSupervisor = session.role === "OWNER" || session.role === "PRODUCTION_MANAGER";
     const isAssigningTailor = !!myWorkerId && myWorkerId === assignment.assignedByWorkerId;
     const isSupportWorker = !!myWorkerId && myWorkerId === assignment.workerId;
+    const actor = { userId: session.id, workerId: myWorkerId, name: session.name };
+
+    /**
+     * Move the assignment and record the move, together or not at all.
+     *
+     * One transaction, because an assignment that is PAUSED with no event saying so
+     * is exactly the silent state change this trail exists to prevent - and the
+     * reverse (an event for a move that did not happen) would be worse.
+     */
+    async function transition(
+      to: string,
+      eventType: SupportEvent,
+      patch: Record<string, unknown>,
+      reason: string | null
+    ) {
+      const blocked = supportTransitionError(assignment.status, to);
+      if (blocked) return NextResponse.json({ error: blocked }, { status: 409 });
+      return db.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(supportAssignments)
+          .set({ ...patch, status: to })
+          .where(eq(supportAssignments.id, assignment.id))
+          .returning();
+        await recordSupportEvent(tx, {
+          supportAssignmentId: assignment.id,
+          organizationId: assignment.organizationId,
+          eventType,
+          fromStatus: assignment.status,
+          toStatus: to,
+          actor,
+          reason,
+          notes: null,
+        });
+        return NextResponse.json(updated);
+      });
+    }
+
+    /* ---------- the helper's own lifecycle: begin, stop, restart ---------- */
+    if (body.action !== undefined) {
+      const action = String(body.action).trim().toLowerCase();
+      if (!(action in SUPPORT_ACTIONS))
+        return NextResponse.json(
+          { error: `Choose one of: ${Object.keys(SUPPORT_ACTIONS).join(", ")}.` },
+          { status: 400 }
+        );
+      // An action carries nothing but an optional reason. Everything else - above
+      // all a quantity or a status - is refused, so an "action" call cannot smuggle
+      // a submission or an approval past the checks below.
+      if (Object.keys(body).some((key) => !["id", "action", "reason", "notes"].includes(key)))
+        return NextResponse.json({ error: "A lifecycle action carries no quantity." }, { status: 403 });
+
+      const reason = body.reason === undefined || body.reason === null
+        ? null
+        : String(body.reason).trim().slice(0, 500) || null;
+
+      if (action === "start" || action === "resume") {
+        // Only the person holding the work can begin it. A supervisor may not start
+        // somebody's work for them: that would put a helper's pieces in motion with
+        // the helper having done nothing, which is the same fabrication the
+        // submission rule below exists to stop.
+        if (!isSupportWorker)
+          return NextResponse.json(
+            { error: "Only the support worker who was given this work can start it." },
+            { status: 403 }
+          );
+        const now = new Date();
+        // A resume clears the pause, because `paused_at` answers "is it paused right
+        // now". The pause itself is not lost: it stays in the trail, with its reason.
+        return transition(
+          "STARTED",
+          assignment.status === "PAUSED" ? "RESUMED" : "STARTED",
+          { startedAt: assignment.startedAt ?? now, pausedAt: null, pauseReason: null },
+          null
+        );
+      }
+
+      if (action === "pause") {
+        if (!isSupportWorker && !isAssigningTailor && !isSupervisor)
+          return NextResponse.json(
+            { error: "Only the support worker, the tailor who handed it out, a supervisor or the Owner can pause this work." },
+            { status: 403 }
+          );
+        // A pause without a reason is not actionable: the whole point is that
+        // Production Control can say WHY the tailor's stage is not moving.
+        if (!reason || reason.length < 3)
+          return NextResponse.json(
+            { error: "Say why the support work is being paused. Production Control shows this reason beside the stage it is holding up." },
+            { status: 400 }
+          );
+        const now = new Date();
+        return transition("PAUSED", "PAUSED", { pausedAt: now, pauseReason: reason }, reason);
+      }
+
+      // action === "cancel"
+      if (!isAssigningTailor && !isSupervisor)
+        return NextResponse.json(
+          { error: "Only the assigning tailor, a supervisor or the Owner can cancel." },
+          { status: 403 }
+        );
+      if (!reason || reason.length < 3)
+        return NextResponse.json(
+          { error: "Say why the support work is being cancelled, so the record explains itself." },
+          { status: 400 }
+        );
+      return transition("CANCELLED", "CANCELLED", {}, reason);
+    }
 
     /* ---------- the support worker submits their own completed work ---------- */
     if (body.submitQty !== undefined) {
@@ -461,22 +691,39 @@ export async function PUT(req: Request) {
         );
       if (Object.keys(body).some((key) => !["id", "submitQty"].includes(key)))
         return NextResponse.json({ error: "Only your completed quantity can be submitted." }, { status: 403 });
-      if (assignment.status === "CANCELLED")
-        return NextResponse.json({ error: "This support assignment was cancelled." }, { status: 400 });
+      // THE LIFECYCLE RULE, enforced here rather than in the button that hides
+      // itself: work that has not begun cannot be handed back, and work that is
+      // paused cannot be handed back either.
+      const blocked = supportTransitionError(assignment.status, "SUBMITTED");
+      if (blocked) return NextResponse.json({ error: blocked }, { status: 409 });
       const pending = supportPending(assignment);
       const available = Math.max(0, assignment.quantityAssigned - assignment.quantitySubmitted + pending);
       const qty = Number(body.submitQty);
       if (!Number.isSafeInteger(qty) || qty < 1 || qty > available)
         return NextResponse.json({ error: `You can submit between 1 and ${available} pieces.` }, { status: 400 });
-      const [submitted] = await db
-        .update(supportAssignments)
-        .set({
-          quantitySubmitted: assignment.quantitySubmitted + qty,
-          status: "SUBMITTED",
-          submittedAt: new Date(),
-        })
-        .where(eq(supportAssignments.id, id))
-        .returning();
+      const submitted = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(supportAssignments)
+          .set({
+            quantitySubmitted: assignment.quantitySubmitted + qty,
+            status: "SUBMITTED",
+            submittedAt: new Date(),
+            submittedByName: session.name,
+          })
+          .where(eq(supportAssignments.id, id))
+          .returning();
+        await recordSupportEvent(tx, {
+          supportAssignmentId: id,
+          organizationId: assignment.organizationId,
+          eventType: "SUBMITTED",
+          fromStatus: assignment.status,
+          toStatus: "SUBMITTED",
+          actor,
+          reason: null,
+          notes: `${qty} piece${qty === 1 ? "" : "s"} submitted`,
+        });
+        return row;
+      });
       return NextResponse.json(submitted);
     }
 
@@ -487,7 +734,9 @@ export async function PUT(req: Request) {
           { error: "Only the tailor who handed out this work, a supervisor or the Owner can inspect it." },
           { status: 403 }
         );
-      // Separation of duty: the person who did the work never approves it.
+      // Separation of duty: the person who did the work never approves it. Checked
+      // on IDENTITY, not on login role, so it also holds for a supervisor whose own
+      // worker record did the work.
       if (isSupportWorker)
         return NextResponse.json(
           { error: "You cannot approve your own support work. Ask the tailor who assigned it, a supervisor or the Owner." },
@@ -511,81 +760,113 @@ export async function PUT(req: Request) {
           { status: 400 }
         );
 
+      /* ---- which state this inspection produces ----
+       *
+       * PARTIAL INSPECTION IS NOT A TERMINAL STATE. Where pieces are still unjudged
+       * the assignment stays SUBMITTED and the helper can hand the rest back without
+       * the work ever having stopped. So the transition is validated against the
+       * state THIS inspection actually produces, not against the state the last
+       * piece would eventually produce: validating against APPROVED here used to
+       * refuse a perfectly ordinary second inspection of the remaining pieces with
+       * "support work that is APPROVED is finished", which is a sentence about a
+       * state the row was never in.
+       */
+      const toStatus = supportStatusAfterInspection({
+        quantityAssigned: assignment.quantityAssigned,
+        quantitySubmitted: assignment.quantitySubmitted,
+        quantityApproved: assignment.quantityApproved + approved,
+        quantityRejected: assignment.quantityRejected + rejected,
+        quantityRework: assignment.quantityRework + rework,
+      });
+      // Nothing may be judged that was never handed back, and nothing may be judged
+      // while the helper has the work paused.
+      const blocked = supportTransitionError(assignment.status, toStatus);
+      if (blocked) return NextResponse.json({ error: blocked }, { status: 409 });
+
       const [person] = await db.select().from(workers).where(eq(workers.id, assignment.workerId)).limit(1);
       const inspectorWorkerId = isSupervisor && !isAssigningTailor ? null : myWorkerId;
 
-      const [inspection] = await db
-        .insert(supportInspections)
-        .values({
-          supportAssignmentId: id,
-          inspectedBy: session.name,
-          // Snapshot the agreed rate so pay history survives a later change.
-          pieceRate: assignment.pieceRate,
-          quantityApproved: approved,
-          quantityRework: rework,
-          quantityRejected: rejected,
-          notes: body.notes ? String(body.notes).slice(0, 2000) : null,
-        })
-        .returning();
+      const result = await db.transaction(async (tx) => {
+        const [inspection] = await tx
+          .insert(supportInspections)
+          .values({
+            supportAssignmentId: id,
+            inspectedBy: session.name,
+            // Snapshot the agreed rate so pay history survives a later change.
+            pieceRate: assignment.pieceRate,
+            quantityApproved: approved,
+            quantityRework: rework,
+            quantityRejected: rejected,
+            notes: body.notes ? String(body.notes).slice(0, 2000) : null,
+          })
+          .returning();
 
-      const totals = {
-        quantityApproved: assignment.quantityApproved + approved,
-        quantityRework: assignment.quantityRework + rework,
-        quantityRejected: assignment.quantityRejected + rejected,
-      };
-      const remainingPending = Math.max(0, assignment.quantitySubmitted - (totals.quantityApproved + totals.quantityRework + totals.quantityRejected));
-      const [updated] = await db
-        .update(supportAssignments)
-        .set({
+        const totals = {
+          quantityApproved: assignment.quantityApproved + approved,
+          quantityRework: assignment.quantityRework + rework,
+          quantityRejected: assignment.quantityRejected + rejected,
+        };
+        // The very same rule, applied to the totals actually being written, so the
+        // state validated above and the state stored cannot drift apart.
+        const settledStatus = supportStatusAfterInspection({
+          quantityAssigned: assignment.quantityAssigned,
+          quantitySubmitted: assignment.quantitySubmitted,
           ...totals,
-          status: remainingPending > 0 ? "SUBMITTED" : rework > 0 && approved === 0 ? "REWORK" : "APPROVED",
-          inspectedAt: new Date(),
-          approvedByWorkerId: inspectorWorkerId ?? assignment.approvedByWorkerId,
-        })
-        .where(eq(supportAssignments.id, id))
-        .returning();
+        });
+        const [updated] = await tx
+          .update(supportAssignments)
+          .set({
+            ...totals,
+            status: settledStatus,
+            inspectedAt: new Date(),
+            approvedByWorkerId: inspectorWorkerId ?? assignment.approvedByWorkerId,
+          })
+          .where(eq(supportAssignments.id, id))
+          .returning();
+        await recordSupportEvent(tx, {
+          supportAssignmentId: id,
+          organizationId: assignment.organizationId,
+          eventType: "INSPECTED",
+          fromStatus: assignment.status,
+          toStatus: settledStatus,
+          actor,
+          reason: (rework > 0 || rejected > 0) ? String(body.notes ?? "").trim().slice(0, 500) : null,
+          notes: `${approved} approved, ${rework} rework, ${rejected} rejected`,
+        });
+        return { inspection, updated };
+      });
 
       return NextResponse.json(
         {
-          ...inspection,
-          assignment: updated,
+          ...result.inspection,
+          assignment: result.updated,
           // What this inspection makes payable, so the UI and payroll agree.
           payable: person
-            ? supportInspectionEarnings(inspection, assignment, person)
+            ? supportInspectionEarnings(result.inspection, assignment, person)
             : 0,
-          pieceRatePaid: person ? supportInspectionRate(inspection, assignment, person) : assignment.pieceRate,
+          pieceRatePaid: person ? supportInspectionRate(result.inspection, assignment, person) : assignment.pieceRate,
           /**
            * The other side of the same money: what this approval takes back from the
            * tailor who handed the work out. Shown here so nobody can read the
            * helper's pay as an extra cost on top of the tailor's.
            */
           deductedFromTailor: person
-            ? supportInspectionDeduction(inspection, assignment, person)
+            ? supportInspectionDeduction(result.inspection, assignment, person)
             : 0,
-          deductedFromWorkerId: updated.assignedByWorkerId,
+          deductedFromWorkerId: result.updated.assignedByWorkerId,
         },
         { status: 201 }
       );
     }
 
-    /* ---------- cancel, only while nothing has been done ---------- */
-    if (body.status === "CANCELLED") {
-      if (!isSupervisor && !isAssigningTailor)
-        return NextResponse.json({ error: "Only the assigning tailor, a supervisor or the Owner can cancel." }, { status: 403 });
-      if (assignment.quantitySubmitted > 0)
-        return NextResponse.json(
-          { error: "Work has already been submitted. Inspect it instead of cancelling, so the history stays intact." },
-          { status: 400 }
-        );
-      const [updated] = await db
-        .update(supportAssignments)
-        .set({ status: "CANCELLED" })
-        .where(eq(supportAssignments.id, id))
-        .returning();
-      return NextResponse.json(updated);
-    }
+    /* ---------- a bare status word is not an instruction ---------- */
+    if (body.status !== undefined)
+      return NextResponse.json(
+        { error: "Set a status through its own action: start, pause, resume or cancel. A status cannot be written directly." },
+        { status: 400 }
+      );
 
-    return NextResponse.json({ error: "Submit a quantity, or record an inspection." }, { status: 400 });
+    return NextResponse.json({ error: "Submit a quantity, record an inspection, or send an action." }, { status: 400 });
   } catch (error) {
     console.error("Support work update failed", error);
     return NextResponse.json({ error: "Unable to update this support assignment." }, { status: 500 });

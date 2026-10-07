@@ -51,9 +51,37 @@ function toPositionalRows(result) {
   };
 }
 
+/**
+ * Statement counter, off unless a measurement script switches it on.
+ *
+ * The application's own code is never touched: this sits in the DRIVER, which is
+ * already the one place the test suite is allowed to differ from production, and it
+ * records the SQL the real Drizzle client actually emits. That is what makes a
+ * "query count before/after" number evidence rather than an estimate - it counts
+ * statements that really ran, not statements somebody meant to write.
+ *
+ * `global.__PGMEM_COUNT__` is the switch. `global.__PGMEM_STATEMENTS__` accumulates
+ * `{ sql, ms }` for every statement while it is on.
+ */
+const STATEMENTS = (global.__PGMEM_STATEMENTS__ = global.__PGMEM_STATEMENTS__ || []);
+
+function record(text, startedAt) {
+  if (!global.__PGMEM_COUNT__) return;
+  STATEMENTS.push({ sql: String(text ?? "").replace(/\s+/g, " ").trim(), ms: Number((performance.now() - startedAt).toFixed(3)) });
+}
+
+function statementText(config) {
+  if (typeof config === "string") return config;
+  if (config && typeof config === "object" && !Array.isArray(config)) return config.text;
+  if (Array.isArray(config)) return config[0];
+  return "";
+}
+
 class MemDriver extends adapter.Pool {
   query(...args) {
     const config = args[0];
+    const startedAt = performance.now();
+    const text = statementText(config);
     let arrayMode = false;
     if (
       config &&
@@ -70,11 +98,16 @@ class MemDriver extends adapter.Pool {
     const callbackAt = args.findIndex((arg, index) => index > 0 && typeof arg === "function");
     if (callbackAt !== -1) {
       const original = args[callbackAt];
-      args[callbackAt] = (error, result) =>
-        original(error, error ? result : toPositionalRows(result));
+      args[callbackAt] = (error, result) => {
+        record(text, startedAt);
+        return original(error, error ? result : toPositionalRows(result));
+      };
       return super.query(...args);
     }
-    return Promise.resolve(super.query(...args)).then(toPositionalRows);
+    return Promise.resolve(super.query(...args)).then((result) => {
+      record(text, startedAt);
+      return toPositionalRows(result);
+    });
   }
 }
 

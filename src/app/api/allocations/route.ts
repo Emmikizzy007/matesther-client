@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { productionAllocations, productionBatches, productionOperations, workers } from "@/db/schema";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { productionAllocations, productionBatches, productionOperations, supportAssignments, workers } from "@/db/schema";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { refreshBatchAndOrder } from "@/lib/server";
 import { guard, getSessionUser, getLinkedWorkerId, productionAccess, ANYONE, STAFF } from "@/lib/authz";
 import { isExternalMethod, isPurchasedMethod, methodLabel, sameRole } from "@/lib/format";
@@ -135,6 +135,53 @@ export async function GET(req: Request) {
       allocatedByOp.set(row.productionOperationId, (allocatedByOp.get(row.productionOperationId) ?? 0) + row.quantityAllocated);
     }
 
+    /* ---- what each share has already delegated to support workers ----
+     *
+     * ONE grouped query for the whole page, keyed by share id. A tailor handing out
+     * support work has to be able to see "20 of my 40 are already out with a helper"
+     * before they choose a quantity, because the ceiling the server enforces is per
+     * (share, supporting operation) and an invisible ceiling is one people keep
+     * hitting. Cancelled hand-overs are excluded in SQL, so withdrawing one gives the
+     * pieces back rather than leaving them counted against the share.
+     */
+    const shareIds = rows.map((row) => row.id);
+    const supportRows = shareIds.length
+      ? await db
+          .select({
+            allocationId: supportAssignments.productionAllocationId,
+            operation: supportAssignments.operation,
+            delegated: sql<number>`coalesce(sum(${supportAssignments.quantityAssigned}), 0)`,
+            approved: sql<number>`coalesce(sum(${supportAssignments.quantityApproved}), 0)`,
+            rework: sql<number>`coalesce(sum(${supportAssignments.quantityRework}), 0)`,
+            rejected: sql<number>`coalesce(sum(${supportAssignments.quantityRejected}), 0)`,
+            paused: sql<number>`count(case when ${supportAssignments.status} = 'PAUSED' then 1 end)`,
+          })
+          .from(supportAssignments)
+          .where(and(
+            inArray(supportAssignments.productionAllocationId, shareIds),
+            sql`${supportAssignments.status} <> 'CANCELLED'`
+          ))
+          .groupBy(supportAssignments.productionAllocationId, supportAssignments.operation)
+      : [];
+    const supportByShare = new Map<number, {
+      delegated: number; approved: number; outstanding: number; paused: number;
+      /** Per supporting operation, because that is the unit the ceiling is counted in. */
+      byOperation: { operation: string; delegated: number; remaining: number }[];
+    }>();
+    for (const row of supportRows) {
+      const allocationId = Number(row.allocationId);
+      const current = supportByShare.get(allocationId) ?? { delegated: 0, approved: 0, outstanding: 0, paused: 0, byOperation: [] };
+      const delegated = Number(row.delegated) || 0;
+      const approved = Number(row.approved) || 0;
+      const settled = approved + (Number(row.rework) || 0) + (Number(row.rejected) || 0);
+      current.delegated += delegated;
+      current.approved += approved;
+      current.outstanding += Math.max(0, delegated - settled);
+      current.paused += Number(row.paused) || 0;
+      current.byOperation.push({ operation: row.operation, delegated, remaining: Math.max(0, delegated - settled) });
+      supportByShare.set(allocationId, current);
+    }
+
     return NextResponse.json(
       rows.map((row) => {
         const op = opById.get(row.productionOperationId);
@@ -153,6 +200,17 @@ export async function GET(req: Request) {
           outstanding: Math.max(0, row.quantityAllocated - row.quantitySubmitted),
           unjudged: Math.max(0, row.quantitySubmitted - row.quantityApproved - row.quantityRework - row.quantityRejected),
           live: LIVE_ALLOC_STATUSES.includes(row.status),
+          /**
+           * The share's delegation picture: what has been handed to helpers, what they
+           * have had accepted, what is still out, and how many hand-overs are paused.
+           * Derived from the same rows the server enforces its ceiling against, so the
+           * figure shown and the figure enforced cannot disagree.
+           */
+          supportDelegated: supportByShare.get(row.id)?.delegated ?? 0,
+          supportApproved: supportByShare.get(row.id)?.approved ?? 0,
+          supportOutstanding: supportByShare.get(row.id)?.outstanding ?? 0,
+          supportPaused: supportByShare.get(row.id)?.paused ?? 0,
+          supportByOperation: supportByShare.get(row.id)?.byOperation ?? [],
         };
       }),
       { headers: { "Cache-Control": "private, no-store" } }

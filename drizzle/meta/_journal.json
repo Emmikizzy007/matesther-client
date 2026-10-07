@@ -78,6 +78,20 @@
       "when": 1791283060029,
       "tag": "0010_actor_audit",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1791331457164,
+      "tag": "0011_support_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1791333366026,
+      "tag": "0012_deletion_and_purge_audit",
+      "breakpoints": true
     }
   ]
 }

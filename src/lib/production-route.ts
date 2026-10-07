@@ -125,14 +125,41 @@ export function normaliseStages(
 }
 
 /**
+ * ORGANISATION SCOPING FOR ROUTES.
+ *
+ * A route is written with the creating session's `organizationId`, so a route
+ * belonging to another organisation must never be resolved, listed or offered -
+ * not by id, not as a product's route, not as the fallback default. Before this,
+ * `resolveRoute` accepted any `routeId` at all: a caller who guessed an id from
+ * another company would have that company's stages frozen onto their own batch.
+ *
+ * `organizationId === null` (a session that predates organisations, or the
+ * built-in fallback) applies no scope, because there is nothing to compare
+ * against; inventing one would lock such a caller out of every route.
+ */
+function ownedBy(organizationId: number | null | undefined) {
+  return organizationId === null || organizationId === undefined
+    ? undefined
+    : eq(productionRoutes.organizationId, organizationId);
+}
+
+/**
  * Resolve the route a NEW batch should be built from.
  *
  * Precedence, highest first:
  *   1. an explicit `stages` list on the request (a one-off route for this batch);
- *   2. an explicit `routeId`;
- *   3. the product's own default route;
+ *   2. an explicit `routeId` - which must belong to this organisation;
+ *   3. the product's OWN route: its default if one is flagged, otherwise its
+ *      single active route, because "assign a route to this garment" must mean
+ *      something whether or not anybody also ticked "use automatically";
  *   4. the organization's generic default route;
  *   5. the built-in eight-stage route.
+ *
+ * (3) BEFORE (4) is the whole point: an organisation default must never silently
+ * override a route explicitly assigned to the product. It used to be reachable in
+ * two ways - the product query demanded `is_default = true`, so a product route
+ * saved without that flag was invisible here, and `listRoutes` dropped every
+ * product route from the screen that was supposed to show it.
  *
  * Falling all the way through to (5) is what makes this backwards compatible: a
  * request shaped exactly like the old one gets exactly the old eight stages.
@@ -149,8 +176,15 @@ export async function resolveRoute(options: {
     return { routeId: null, name: "One-off route for this batch", source: "explicit", stages: normalised.stages };
   }
 
-  const byId = async (routeId: number): Promise<ResolvedRoute | null> => {
-    const [route] = await db.select().from(productionRoutes).where(eq(productionRoutes.id, routeId)).limit(1);
+  const organizationId = options.organizationId ?? null;
+
+  /** Load one route and its stages, refusing a route this organisation does not own. */
+  const byId = async (routeId: number, source: ResolvedRoute["source"]): Promise<ResolvedRoute | null> => {
+    const [route] = await db
+      .select()
+      .from(productionRoutes)
+      .where(and(eq(productionRoutes.id, routeId), ownedBy(organizationId)))
+      .limit(1);
     if (!route || !route.isActive) return null;
     const rows = await db
       .select()
@@ -161,7 +195,7 @@ export async function resolveRoute(options: {
     return {
       routeId: route.id,
       name: route.name,
-      source: "explicit",
+      source,
       stages: rows.map((row, index) => ({
         position: row.position ?? index + 1,
         stage: row.stage,
@@ -173,42 +207,65 @@ export async function resolveRoute(options: {
   };
 
   if (options.routeId) {
-    const found = await byId(Number(options.routeId));
+    const requested = Number(options.routeId);
+    if (!Number.isSafeInteger(requested) || requested < 1)
+      return { error: "Choose a valid production route." };
+    const found = await byId(requested, "explicit");
+    // Deliberately the same answer for "does not exist", "is retired" and "belongs
+    // to another organisation": probing for somebody else's route id must not be
+    // able to tell those cases apart.
     if (!found) return { error: "That production route no longer exists or is inactive." };
     return found;
   }
 
-  // The product's own default route, then the organization's generic default.
-  const candidates = await db
-    .select()
-    .from(productionRoutes)
-    .where(
-      and(
-        eq(productionRoutes.isDefault, true),
-        eq(productionRoutes.isActive, true),
-        options.productId
-          ? eq(productionRoutes.productId, options.productId)
-          : isNull(productionRoutes.productId)
-      )
-    )
-    .limit(1);
-  const productDefault = candidates[0];
-  if (productDefault) {
-    const found = await byId(productDefault.id);
-    if (found) return { ...found, source: options.productId ? "product" : "organization" };
-  }
+  /* ---- 3. the product's OWN route ----
+   *
+   * One query, both facts: the product's active routes in this organisation,
+   * default first. Taking the flagged default when there is one, and otherwise
+   * the single active route, is what makes an explicit assignment authoritative
+   * without ever guessing between two competing ones.
+   */
   if (options.productId) {
-    const [generic] = await db
-      .select()
+    const productRoutes = await db
+      .select({
+        id: productionRoutes.id,
+        isDefault: productionRoutes.isDefault,
+      })
       .from(productionRoutes)
-      .where(and(eq(productionRoutes.isDefault, true), eq(productionRoutes.isActive, true), isNull(productionRoutes.productId)))
-      .limit(1);
-    if (generic) {
-      const found = await byId(generic.id);
-      if (found) return { ...found, source: "organization" };
+      .where(and(
+        eq(productionRoutes.productId, options.productId),
+        eq(productionRoutes.isActive, true),
+        ownedBy(organizationId)
+      ))
+      .orderBy(sql`case when ${productionRoutes.isDefault} then 0 else 1 end`, asc(productionRoutes.id));
+    // Several unflagged routes on one product is a configuration the Owner has to
+    // settle rather than something to resolve by row order, so it falls through to
+    // the organisation default exactly as a product with no route does.
+    const chosen = productRoutes.find((route) => route.isDefault)
+      ?? (productRoutes.length === 1 ? productRoutes[0] : undefined);
+    if (chosen) {
+      const found = await byId(chosen.id, "product");
+      if (found) return found;
     }
   }
 
+  /* ---- 4. the organization's generic default ---- */
+  const [generic] = await db
+    .select({ id: productionRoutes.id })
+    .from(productionRoutes)
+    .where(and(
+      eq(productionRoutes.isDefault, true),
+      eq(productionRoutes.isActive, true),
+      isNull(productionRoutes.productId),
+      ownedBy(organizationId)
+    ))
+    .limit(1);
+  if (generic) {
+    const found = await byId(generic.id, "organization");
+    if (found) return found;
+  }
+
+  /* ---- 5. the route Matesther has always run ---- */
   return { routeId: null, name: "Matesther standard eight-stage route", source: "builtin", stages: builtinRoute() };
 }
 
@@ -505,10 +562,80 @@ export async function completedForVariant(variantId: number): Promise<number> {
 }
 
 /** Every route, with its stages, for the route editor. */
-export async function listRoutes(productId?: number | null) {
+/**
+ * Would a NEW batch actually follow this route, given the routes that exist?
+ *
+ * This is the LIST-side mirror of `resolveRoute`'s steps 3 and 4, kept in the same
+ * module on purpose: one rule, so the screen that says "this garment uses this
+ * route" can never disagree with the batch that gets created. It is deliberately a
+ * pure function over rows already loaded - answering it per route with its own
+ * query would be an N+1 across the route list.
+ *
+ *   - a retired route is never automatic;
+ *   - a product's flagged default wins;
+ *   - a product with exactly ONE active route uses it even unflagged, because
+ *     "assign a route to this garment" has to mean something;
+ *   - a product with several active routes and none flagged has nothing to choose
+ *     between, so NONE of them is automatic and the organisation default applies;
+ *   - an organization-level route is automatic only when flagged, and only for a
+ *     product that resolved to nothing of its own.
+ */
+export function isAutomaticRoute(
+  route: { id: number; productId: number | null; isDefault: boolean; isActive: boolean },
+  all: { id: number; productId: number | null; isDefault: boolean; isActive: boolean }[]
+): boolean {
+  if (!route.isActive) return false;
+  if (route.productId === null) return route.isDefault;
+  const siblings = all.filter((other) => other.productId === route.productId && other.isActive);
+  const flagged = siblings.find((other) => other.isDefault);
+  if (flagged) return flagged.id === route.id;
+  return siblings.length === 1;
+}
+
+/**
+ * Which routes to list.
+ *
+ * THE BUG THIS TYPE EXISTS TO PREVENT. The parameter used to be
+ * `productId?: number | null`, and the body tested `productId === undefined` to
+ * mean "no filter". Every caller passed `productId ?? null`, so `null` - intended
+ * as "no filter" - was instead treated as "routes whose product IS NULL", and
+ * EVERY PRODUCT-SPECIFIC ROUTE WAS SILENTLY DROPPED from `GET /api/routes`. The
+ * Production Routes screen therefore showed only organization defaults, which is
+ * exactly the reported symptom, and the assign screen's route dropdown was
+ * missing the garment routes too.
+ *
+ * A named filter object cannot be called positionally by accident, and each of
+ * the three meanings is now explicit rather than implied by which falsy value a
+ * caller happened to pass.
+ */
+export type RouteFilter = {
+  /** Omit for every route; `null` for organization-level routes only; a number for one product's. */
+  productId?: number | null;
+  /** Restrict to routes owned by this organisation. Omit to apply no scope. */
+  organizationId?: number | null;
+  /** Restrict to routes still in use. */
+  activeOnly?: boolean;
+};
+
+/**
+ * Routes with their stages, in TWO QUERIES whatever the filter - never one per
+ * route. Sorted so a product's own routes read together and an organization
+ * default (productId NULL) sorts first.
+ */
+export async function listRoutes(filter: RouteFilter = {}) {
+  const scope = and(
+    filter.productId === undefined
+      ? undefined
+      : filter.productId === null
+        ? isNull(productionRoutes.productId)
+        : eq(productionRoutes.productId, filter.productId),
+    ownedBy(filter.organizationId),
+    filter.activeOnly ? eq(productionRoutes.isActive, true) : undefined
+  );
   const routes = await db
     .select()
     .from(productionRoutes)
+    .where(scope)
     .orderBy(asc(productionRoutes.productId), asc(productionRoutes.name));
   const ids = routes.map((route) => route.id);
   const stageRows = ids.length
@@ -520,8 +647,7 @@ export async function listRoutes(productId?: number | null) {
     list.push(row);
     byRoute.set(row.routeId, list);
   }
-  const shaped = routes.map((route) => ({ ...route, stages: byRoute.get(route.id) ?? [] }));
-  return productId === undefined ? shaped : shaped.filter((route) => route.productId === productId);
+  return routes.map((route) => ({ ...route, stages: byRoute.get(route.id) ?? [] }));
 }
 
 /** How much of a variant is still unallocated, computed server-side. */

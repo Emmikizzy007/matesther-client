@@ -45,6 +45,7 @@ import {
   type StageControl,
 } from "@/lib/production-control";
 import * as controlRoute from "@/app/api/production-control/route";
+import { EMPTY_STAGE_SUPPORT } from "@/lib/support-work";
 import {
   api,
   expectStatus,
@@ -197,12 +198,19 @@ async function workStage(
   return f.stages.get(stage);
 }
 
-/** A StageControl for the pure-function tests, with everything zeroed by default. */
+/**
+ * A StageControl for the pure-function tests, with everything zeroed by default.
+ *
+ * `support` defaults to the shared EMPTY_STAGE_SUPPORT rather than a copy of it, so a
+ * test that overrides one support figure cannot accidentally leave another stale, and
+ * the empty value under test is the same object the production code falls back to.
+ */
 function stageControl(overrides: Partial<StageControl> = {}): StageControl {
   return {
     operationId: 1, position: 1, stage: "SEWING", method: null, status: "IN_PROGRESS",
     received: 0, submitted: 0, approved: 0, rework: 0, rejected: 0, remaining: 0,
-    awaitingInspection: 0, assigned: 0, workers: [], openDispatches: 0, isCurrent: true,
+    awaitingInspection: 0, assigned: 0, workers: [], openDispatches: 0,
+    support: { ...EMPTY_STAGE_SUPPORT }, isCurrent: true,
     ...overrides,
   };
 }
