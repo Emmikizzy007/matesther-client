@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 376 tests in about 4 minutes. No server, no `DATABASE_URL`, no network,
+Runs 378 tests in about 4 minutes. No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists

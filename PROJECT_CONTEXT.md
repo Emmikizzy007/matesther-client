@@ -2168,7 +2168,12 @@ write of any kind**:
   `submitted_by_name`), `support_assignments_status_idx`, and the append-only
   `support_status_events`.
 - `drizzle/0012_deletion_and_purge_audit.sql` → `deploy/upgrade-test-data-cleanup.sql`. The
-  `order_deletions` and `test_data_purges` audit tables, four indexes each.
+  `order_deletions` and `test_data_purges` audit tables, four indexes each. The deploy script is
+  deliberately RICHER than the migration and is organised in five numbered sections: the two tables,
+  their guarded foreign keys, a read-only verification query, **the atomicity probe described in
+  40.7**, and the post-deploy queries that prove the trail works end to end. A migration has no
+  business containing a probe that writes and aborts, so the two files are not interchangeable and
+  the deploy script must never be regenerated from the migration without re-adding sections 3 to 5.
 
 `drizzle/meta/_journal.json` has 13 contiguous entries (0000–0012) with 13 snapshots, and
 `npx drizzle-kit generate` reports "No schema changes, nothing to migrate" — so `src/db/schema.ts`
@@ -2189,17 +2194,17 @@ second.** Do not run `drizzle-kit migrate` against production.
 
 ## 40.6 Regression coverage
 
-**376 tests, 0 failures**, up from 278 at the start of this run. `npx tsc --noEmit` clean.
+**378 tests, 0 failures**, up from 278 at the start of this run. `npx tsc --noEmit` clean.
 `npm run build` succeeds and emits both new routes (`/api/test-data-cleanup`,
 `/settings/test-data`). All through the real route handlers; no application logic is
 re-implemented, copied or faked anywhere in the suite.
 
-98 tests were added, in five files:
+100 tests were added, in five files:
 
-- `tests/support-lifecycle.test.ts` — 29
+- `tests/support-lifecycle.test.ts` — 30
 - `tests/test-data-cleanup.test.ts` — 28
 - `tests/product-route-resolution.test.ts` — 19
-- `tests/migration-safety.test.ts` — 12
+- `tests/migration-safety.test.ts` — 13
 - `tests/start-production-and-list-bounds.test.ts` — 10
 
 `tests/migration-safety.test.ts` is new in kind rather than in subject: it holds the two migrations
@@ -2228,6 +2233,22 @@ Stated plainly, because an unverified claim in this file is worse than none:
   at the top and asserts the ordering, the fingerprint and the guards that a rollback would have
   backed up, instead of faking a rollback assertion. The single-transaction structure is real in
   the code; only its failure behaviour is unproven here.
+
+  **`deploy/upgrade-test-data-cleanup.sql` section 4 is the manual probe to run against a real
+  PostgreSQL before relying on that claim.** It inserts one row into `order_deletions` inside a
+  transaction it then deliberately aborts, and asks for the count: if `rolled_back_insert` is
+  anything other than 0, transactions are not rolling back on that server and neither order removal
+  nor the cleanup may be used until that is understood, because both could leave the database
+  half-changed. **Do not delete that probe thinking it redundant — it is the only half of the
+  guarantee that is tested anywhere.** This file once lost it, when the deploy script was
+  regenerated from the `drizzle/` migration (which has no probe, because a migration is not the
+  place for one); it was recovered from the earlier revision and must survive any future rewrite.
+
+- **`purgeHistory` must order `desc` with a `limit`, never `asc` + `limit` + reverse.** Reversing an
+  ascending slice returns the OLDEST window once the trail is longer than the limit - silently, and
+  only in production, because no test database has 50 purges in it. This regression was introduced
+  and caught during the merge of two revisions of this work; the correct form and its comment are in
+  `src/lib/test-data-cleanup.ts`.
 - **The performance probe was itself defective, and the defect flattered the results.** It submitted
   a stage before starting it and asked a stage for more pieces than the previous stage had approved,
   so every support handout was correctly refused and the probe built a dataset with **zero support

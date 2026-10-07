@@ -51,9 +51,12 @@ The same change is recorded for the ORM as `drizzle/0011_support_lifecycle.sql`.
 This release adds **two new tables**, `order_deletions` and `test_data_purges`. Nothing existing is altered.
 
 1. **Back up the client database first.** This release adds a screen that can remove an order, so the backup is not a formality.
-2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-test-data-cleanup.sql` and Run. It is additive and repeatable: 2 `CREATE TABLE IF NOT EXISTS`, 8 `CREATE INDEX IF NOT EXISTS` and 4 guarded `ADD CONSTRAINT`. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no `ALTER` of any existing table, and **it writes no data at all**. Both tables are created empty, because nothing has been deleted yet that could honestly be recorded.
-3. Run the verification query at the bottom of the file. Expect `audit_tables = 2`, `deletion_indexes = 4`, `purge_indexes = 4`, `deletion_fks = 2`, `purge_fks = 2`, and `deletions_recorded = 0` with `purges_recorded = 0`. The `orders`, `payments`, `batches` and `support_assignments` counts must be **unchanged**.
-4. Only then deploy the new application code. **SQL first, code second.** The new code writes to both tables, so deploying it first would fail.
+2. In the client project's **SQL Editor**, paste all of `deploy/upgrade-test-data-cleanup.sql` and Run. **Sections 1 and 2** are additive and repeatable: 2 `CREATE TABLE IF NOT EXISTS`, 8 `CREATE INDEX IF NOT EXISTS` and 4 guarded `ADD CONSTRAINT`. There is no `DROP`, no `TRUNCATE`, no `DELETE`, no `RENAME`, no `ALTER` of any existing table, and no backfill. Both tables are created empty, because nothing has been deleted yet that could honestly be recorded.
+3. Run the verification query in **section 3**. Expect `audit_tables = 2`, `deletions_indexes = 4`, `purges_indexes = 4`, `deletions_fks = 2`, `purges_fks = 2`, and `deletions_rows = 0` with `purges_rows = 0`. The `orders`, `payments` and `production_batches` counts must be **unchanged**.
+4. Run the atomicity probe in **section 4**, once. It inserts one row inside a transaction it then deliberately aborts, so the row must never land. Expect the block to raise `probe: deliberate abort`, then `rolled_back_insert = 0`. **If that is not 0, stop** - transactions are not rolling back on your server, and neither order removal nor the cleanup may be used until that is understood, because both would be able to leave the database half-changed. Some SQL editors halt at the first error; that error IS the probe working, so re-run from the `SELECT` beneath it rather than re-running the whole file. The probe leaves no residue and touches no application data.
+5. Only then deploy the new application code. **SQL first, code second.** The new code writes to both tables, so deploying it first would fail.
+
+Section 5 of the script is not part of the upgrade: it is the queries to run AFTER deploying, which prove the trail is being written and that the counts a preview promised match the counts actually removed.
 
 ### What changes for the people using the system
 

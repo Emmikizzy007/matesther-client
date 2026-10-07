@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   customers,
@@ -935,15 +935,16 @@ export async function deleteOrderIfSafe(
 
 /** The removal history for one organisation, newest first. Bounded. */
 export async function purgeHistory(organizationId: number | null | undefined, limit = 50) {
-  const scope = organizationId === null || organizationId === undefined ? undefined : eq(testDataPurges.organizationId, organizationId);
+  const scoped = organizationId !== null && organizationId !== undefined;
   const [purges, deletions] = await Promise.all([
-    db.select().from(testDataPurges).where(scope).orderBy(asc(testDataPurges.ranAt)).limit(limit),
+    db.select().from(testDataPurges)
+      .where(scoped ? eq(testDataPurges.organizationId, organizationId) : undefined)
+      // desc + limit, not asc + limit + reverse: once the trail is longer than the
+      // limit, taking the oldest slice and reversing it would return the wrong window.
+      .orderBy(desc(testDataPurges.ranAt)).limit(limit),
     db.select().from(orderDeletions)
-      .where(organizationId === null || organizationId === undefined ? undefined : eq(orderDeletions.organizationId, organizationId))
-      .orderBy(asc(orderDeletions.deletedAt)).limit(limit),
+      .where(scoped ? eq(orderDeletions.organizationId, organizationId) : undefined)
+      .orderBy(desc(orderDeletions.deletedAt)).limit(limit),
   ]);
-  return {
-    purges: [...purges].reverse(),
-    deletions: [...deletions].reverse(),
-  };
+  return { purges, deletions };
 }

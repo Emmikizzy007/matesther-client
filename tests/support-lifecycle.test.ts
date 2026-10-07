@@ -833,3 +833,34 @@ test("another organisation's supervisor cannot act on, or read, this organisatio
   const [paid] = await db.select().from(supportAssignments).where(eq(supportAssignments.id, assignmentId));
   assert.equal(paid.quantityApproved, 20, "Twenty pieces approved by the person entitled to approve them");
 });
+
+test("a stage nobody delegated from carries no support object at all, so the board does not grow with stages that have nothing to say", async () => {
+  const f = await fixture();
+  // `delegate` already asserts 201 and returns the created assignment, so it is not
+  // wrapped in `expectStatus` here: that helper reads `.status` as an HTTP code, and the
+  // assignment's own `status` is the lifecycle word "ASSIGNED".
+  await delegate(f, 20);
+
+  const board = await api("GET", `/api/production-control?batchId=${f.batchId}`, { cookie: f.owner.cookie });
+  const row = (await expectStatus(board, 200, "Read the board")).rows.find((entry: any) => entry.batchId === f.batchId);
+  const sewing = row.route.find((stage: any) => stage.stage === "SEWING");
+  const cutting = row.route.find((stage: any) => stage.stage === "CUTTING");
+
+  assert.ok(sewing.support, "The delegated stage reports its support work");
+  assert.equal(sewing.support.delegated, 20);
+  // NULL, not a zeroed object. This is a payload assertion dressed as a shape assertion:
+  // an eight-stage route where one stage was delegated from used to carry ten zero-valued
+  // support fields on all eight stages, which added 48 KB to a full board and said nothing
+  // on seven of them. If this ever becomes `{ delegated: 0, ... }` again the board has
+  // quietly gone back to paying for empty rows.
+  assert.equal(cutting.support, null, "An undelegated stage carries no support object");
+  assert.equal(
+    row.route.filter((stage: any) => stage.support !== null).length, 1,
+    "Exactly one stage of the eight reports support work, because exactly one has any"
+  );
+
+  // And the flags agree with the shape: no phantom "support in progress" on a stage that
+  // has none, and none on the batch beyond the one that was delegated.
+  assert.ok(row.flags.includes("SUPPORT_IN_PROGRESS"), "The batch still says support is out");
+  assert.ok(!row.flags.includes("SUPPORT_PAUSED"), "and nothing claims a pause that did not happen");
+});

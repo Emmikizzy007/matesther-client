@@ -126,7 +126,7 @@ for (const release of RELEASES) {
         // and, for the two one-line ALTER forms, on what it contains. Nothing else is
         // DDL that an additive script has any business running.
         const allowed =
-          /^CREATE TABLE IF NOT EXISTS\s+"?\w+"?\s*\(/i.test(statement) ||
+          /^CREATE TABLE IF NOT EXISTS\s+(?:"?\w+"?\.)?"?\w+"?\s*\(/i.test(statement) ||
           /^CREATE INDEX IF NOT EXISTS\b/i.test(statement) ||
           /^ALTER TABLE\b[\s\S]*\bADD COLUMN IF NOT EXISTS\b/i.test(statement) ||
           /^ALTER TABLE\b[\s\S]*\bADD CONSTRAINT\b/i.test(statement) ||
@@ -166,6 +166,34 @@ for (const release of RELEASES) {
     );
   });
 }
+
+test("the cleanup deploy script still carries its atomicity probe", () => {
+  /*
+   * pg-mem cannot prove a transaction rolls back - it does not roll back - so the suite
+   * cannot test the atomicity of order removal or of the cleanup. The probe in section 4
+   * of the deploy script is the substitute: run once against the real PostgreSQL, it
+   * inserts a row inside a transaction it then aborts and asks whether the row survived.
+   *
+   * This file lost that probe once, when the script was regenerated from the drizzle
+   * migration (which correctly contains no probe, because a migration is not the place for
+   * one). Nothing caught it. So its presence is asserted here: it must insert, it must
+   * abort deliberately, and it must ask for the surviving count under a name a human can
+   * read in the SQL Editor output.
+   */
+  const script = read("deploy/upgrade-test-data-cleanup.sql");
+  const probe = script.slice(script.indexOf("ATOMICITY PROBE"));
+  assert.ok(probe.length > 0, "the ATOMICITY PROBE section is gone from the deploy script");
+  assert.match(probe, /INSERT INTO\s+(public\.)?"?order_deletions"?/i,
+    "the probe no longer inserts into the audit table it is testing");
+  assert.match(probe, /RAISE EXCEPTION/i,
+    "the probe no longer aborts its own transaction, so it would prove nothing");
+  assert.match(probe, /rolled_back_insert/i,
+    "the probe no longer reports rolled_back_insert, the figure the deploy steps check");
+  // And the row it inserts must be recognisable as the probe's, so a human who finds it
+  // in the table knows what it is rather than wondering who deleted order zero.
+  assert.match(probe, /PROBE-ROLLED-BACK/,
+    "the probe's row is no longer labelled, so a surviving row could not be identified");
+});
 
 test("both new migrations are registered, in order, with a snapshot each", () => {
   const journal = JSON.parse(read("drizzle/meta/_journal.json")) as {

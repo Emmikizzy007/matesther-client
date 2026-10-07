@@ -33,9 +33,13 @@ type StageControl = {
   openDispatches: number; isCurrent: boolean;
   /**
    * Support work handed out from this stage - the part a tailor gave to a helper - or
-   * NULL when the stage has none. Nullable to match the API: most stages of most batches
-   * have no support work, and sending a zeroed object for each of them was 48 KB of
-   * nothing on a full board. Every read below therefore has to ask first.
+   * NULL when nobody delegated from it.
+   *
+   * Mirrors lib/production-control.ts, including the nullability. That matters: this file
+   * re-declares the shape rather than importing it, so if the two drift the compiler
+   * cannot help, and a stage with no support work would be read as `null.delegated` at
+   * runtime. Most stages of most batches have no support work, so this is the common case
+   * and not an edge one.
    */
   support: StageSupport | null;
 };
@@ -400,17 +404,20 @@ export default function ProductionControlPage() {
                                 helper has stopped - which is the state that would otherwise
                                 leave the stage looking merely in progress. */}
                             <td className="py-1.5 pr-3 whitespace-nowrap">
-                              {/* `stage.support` is null on a stage nobody delegated from,
-                                  so it is asked about before any field is read: dereferencing
-                                  it unconditionally would crash the expanded route table on
-                                  the first ordinary batch. */}
-                              {stage.support && stage.support.delegated > 0 ? (
-                                <span className={stage.support.paused > 0 ? "font-semibold text-red-700" : "text-slate-600"}>
-                                  {stage.support.delegated} out · {stage.support.approved} ok · {stage.support.outstanding} owed
-                                  {stage.support.paused > 0 ? " · PAUSED" : ""}
-                                  {stage.support.paused > 0 && stage.support.pausedReason ? ` (${stage.support.pausedReason})` : ""}
-                                </span>
-                              ) : ""}
+                              {/* Narrowed once, into a name, rather than optional-chained
+                                  five times: either this stage has support work to report
+                                  or it has nothing to say. */}
+                              {(() => {
+                                const support = stage.support;
+                                if (!support || support.delegated <= 0) return "";
+                                return (
+                                  <span className={support.paused > 0 ? "font-semibold text-red-700" : "text-slate-600"}>
+                                    {support.delegated} out · {support.approved} ok · {support.outstanding} owed
+                                    {support.paused > 0 ? " · PAUSED" : ""}
+                                    {support.paused > 0 && support.pausedReason ? ` (${support.pausedReason})` : ""}
+                                  </span>
+                                );
+                              })()}
                             </td>
                             <td className="py-1.5 pr-3 text-slate-600">
                               {stage.workers.length
