@@ -316,12 +316,25 @@ test("a deduction with no commission to come out of is held, never made negative
   const tailorLogin = (await createStaff(owner.cookie, { name: tailorName, role: "WORKER" })).cookie;
   const weaver = await helper(owner.cookie, "Support Weaver");
 
-  // Support work with no production share behind it: nothing has been approved for this
-  // tailor at all, so there is no commission for the helper's rate to come out of.
+  // The tailor holds 10 pieces of SEWING, but none of it has been submitted or approved, so
+  // there is no commission for the helper's rate to come out of. The hand-over is from that
+  // real production - support work cannot be recorded from nothing.
+  const order = await createOrder(owner.cookie, { quantity: 10, unitPrice: 4500 });
+  const batch = await api("POST", "/api/batches", {
+    cookie: owner.cookie,
+    body: {
+      orderId: order.orderId, orderItemId: order.itemId, quantity: 10,
+      stages: [{ stage: "SEWING" }],
+      assignments: [{ stage: "SEWING", workerId: tailorA.id, pieceRate: 300 }],
+    },
+  });
+  await expectStatus(batch, 201, "Give the tailor 10 pieces of SEWING");
+  const jobs = await api("GET", `/api/operations?batchId=${batch.data.id}`, { cookie: owner.cookie });
+  const sewing = (await expectStatus(jobs, 200, "Read the SEWING job")).find((job: any) => job.stage === "SEWING");
   const assignment = await expectStatus(
     await api("POST", "/api/support-work", {
       cookie: tailorLogin,
-      body: { workerId: weaver.id, operation: "Taping", quantityAssigned: 10, pieceRate: 300 },
+      body: { workerId: weaver.id, operation: "Taping", quantityAssigned: 10, pieceRate: 300, productionOperationId: sewing.id },
     }),
     201, "The tailor records 10 pieces of taping handed to the helper"
   );

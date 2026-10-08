@@ -1,7 +1,18 @@
 import { db } from "@/db";
-import { supportAssignments, supportInspections, supportStatusEvents, workers } from "@/db/schema";
+import {
+  orders,
+  productionAllocations,
+  productionBatches,
+  productionOperations,
+  supportAssignments,
+  supportInspections,
+  supportStatusEvents,
+  workers,
+} from "@/db/schema";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { inspectionEarnings, inspectionPieceRate } from "@/lib/job-pay";
+import { SUPPORT_OPERATIONS, isExternalMethod, isPurchasedMethod, sameRole } from "@/lib/format";
+import { LIVE_ALLOC_STATUSES } from "@/lib/production-allocation";
 
 /**
  * Pay rules for tailor support work.
@@ -499,3 +510,329 @@ export async function supportByOperation(
  * inside `supportByOperation` - it is never handed back as an answer.
  */
 export { supportAssignments, supportInspections };
+
+/* -------------------------------------------------------------------------- */
+/* What a tailor may hand out from - ONE resolver for the list and the write.  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A piece of production a person may hand part of to a support worker.
+ *
+ * Two shapes exist, and both are real production:
+ *   - SHARE: a live `production_allocations` row - one tailor's share of a stage that
+ *     was split between several people. Its holding is the share's quantity.
+ *   - STAGE: an unsplit stage job whose `production_operations.workerId` names the
+ *     tailor. This is how ordinary "Assign Production" work is recorded, so a tailor
+ *     with a plain sewing job holds production even though no share row exists. Its
+ *     holding is the pieces that have actually reached the stage.
+ *
+ * `remaining` is the ceiling per supporting operation - the same arithmetic the write
+ * path enforces - so the figure shown to a person and the figure refused by the server
+ * come from one function and cannot drift apart.
+ */
+export type DelegationSource = {
+  kind: "SHARE" | "STAGE";
+  productionAllocationId: number | null;
+  productionOperationId: number;
+  productionBatchId: number;
+  holderWorkerId: number;
+  stage: string;
+  orderId: number | null;
+  orderItemId: number | null;
+  orderVariantId: number | null;
+  batchNumber: string | null;
+  size: string | null;
+  color: string | null;
+  /** Pieces this production gives its holder to delegate from. */
+  holding: number;
+  /** Per supporting operation: pieces already handed out and not cancelled. */
+  delegated: Record<string, number>;
+  /** Per supporting operation: the most that may still be handed out right now. */
+  remaining: Record<string, number>;
+  /** Why this production cannot be handed out from at present, or null when it can. */
+  blockedReason: string | null;
+  /** True when the holder can hand out at least one piece of at least one operation. */
+  eligible: boolean;
+};
+
+export type DelegationScope = {
+  /** The caller's organisation. Every source is read through its order and checked. */
+  organizationId: number | null;
+  /** Only production held by this worker - what a tailor may hand out from. */
+  holderWorkerId?: number;
+  /** One named share. Closed shares are returned too, so the refusal can say why. */
+  allocationId?: number;
+  /** One named stage job. */
+  operationId?: number;
+  /** Bound on the listing. A supervisor's view is organisation-wide and must stay bounded. */
+  limit?: number;
+  /**
+   * List only production still open for work: live shares and stages not yet complete.
+   * The Support page sets this, so a tailor's dropdown shows what they are doing now and
+   * not every garment they have ever finished. A named lookup leaves it off, so approved
+   * pieces on a completed share can still be reconciled against the helper who did them.
+   */
+  openOnly?: boolean;
+};
+
+/** The canonical spelling of a supporting operation, or null when it is not one. */
+export function canonicalSupportOperation(value: string | null | undefined): string | null {
+  const found = SUPPORT_OPERATIONS.find((known) => sameRole(known, value ?? ""));
+  return found ?? null;
+}
+
+/**
+ * Share states a tailor may still hand support work out from.
+ *
+ * ASSIGNED and ACTIVE are live. COMPLETED is included on purpose: a tailor who has sewn
+ * and had their pieces approved may still have helpers working the same garments, and the
+ * approved-pieces deduction is settled against exactly that share. TRANSFERRED and
+ * CANCELLED are closed - the work moved to someone else or never happened - so nothing may
+ * be handed out from them.
+ */
+const DELEGABLE_ALLOC_STATUSES: string[] = [...LIVE_ALLOC_STATUSES, "COMPLETED"];
+
+/** A stage that is split is judged by ANY share still holding work, not only live ones. */
+const HOLDING_ALLOC_STATUSES: string[] = DELEGABLE_ALLOC_STATUSES;
+
+/** A stage whose work is finished. Listed only on request, never offered as open work. */
+const FINISHED_STAGE_STATUS = "COMPLETED";
+
+/**
+ * Load the production a scope may hand out from, with its live delegation picture.
+ *
+ * Read in a fixed number of grouped queries however many sources there are - never one
+ * query per source - and bounded by the scope. Organisation is checked through each
+ * source's ORDER, not through the allocation's own organisation column, because shares
+ * created by the stage-allocation flow do not carry one.
+ *
+ * Pass a transaction handle from a write path so the figures are read after the parent
+ * row has been locked (see POST /api/support-work).
+ */
+export async function loadDelegationSources(
+  handle: SupportDb,
+  scope: DelegationScope
+): Promise<DelegationSource[]> {
+  const namedShare = scope.allocationId !== undefined;
+  const namedStage = scope.operationId !== undefined;
+
+  // Shares. A named share is read whatever its state, so a closed one can be refused with
+  // a reason. A holder's listing reads that holder's delegable shares. A named STAGE reads
+  // no shares at all - and a supervisor's organisation view reads the bounded live set.
+  // Reading every share for a named stage was a bug: the first row returned could belong to
+  // a different tailor entirely.
+  const shareWhere = namedStage
+    ? null
+    : and(
+        namedShare ? eq(productionAllocations.id, scope.allocationId!) : undefined,
+        scope.holderWorkerId !== undefined ? eq(productionAllocations.workerId, scope.holderWorkerId) : undefined,
+        namedShare ? undefined : inArray(productionAllocations.status, scope.openOnly ? LIVE_ALLOC_STATUSES : DELEGABLE_ALLOC_STATUSES)
+      );
+  const shareRows = shareWhere === null
+    ? []
+    : await handle
+        .select()
+        .from(productionAllocations)
+        .where(shareWhere)
+        .orderBy(productionAllocations.id)
+        .limit(scope.limit ?? 500);
+
+  // Stage jobs. A named share needs none of its own (its stage is read below); a named
+  // stage is read by id, whoever holds it, so a refusal can say whose it is; a listing
+  // reads the holder's stages, or every staffed stage for a bounded supervisor view.
+  const stageWhere = namedShare
+    ? null
+    : namedStage
+      ? eq(productionOperations.id, scope.operationId!)
+      : and(
+          scope.holderWorkerId !== undefined
+            ? eq(productionOperations.workerId, scope.holderWorkerId)
+            : sql`${productionOperations.workerId} is not null`,
+          scope.openOnly ? sql`${productionOperations.status} <> ${FINISHED_STAGE_STATUS}` : undefined
+        );
+  const stageRows = stageWhere === null
+    ? []
+    : await handle
+        .select()
+        .from(productionOperations)
+        .where(stageWhere)
+        .orderBy(productionOperations.id)
+        .limit(scope.limit ?? 500);
+
+  const opIds = [...new Set([
+    ...shareRows.map((row) => row.productionOperationId),
+    ...stageRows.map((row) => row.id),
+  ])];
+  if (!opIds.length) return [];
+
+  const [opRows, liveRows, supportRows] = await Promise.all([
+    handle.select().from(productionOperations).where(inArray(productionOperations.id, opIds)),
+    handle
+      .select({ productionOperationId: productionAllocations.productionOperationId })
+      .from(productionAllocations)
+      .where(and(
+        inArray(productionAllocations.productionOperationId, opIds),
+        inArray(productionAllocations.status, HOLDING_ALLOC_STATUSES)
+      )),
+    handle
+      .select({
+        allocationId: supportAssignments.productionAllocationId,
+        operationId: supportAssignments.productionOperationId,
+        operation: supportAssignments.operation,
+        delegated: sql<number>`coalesce(sum(${supportAssignments.quantityAssigned}), 0)`,
+      })
+      .from(supportAssignments)
+      .where(and(
+        inArray(supportAssignments.productionOperationId, opIds),
+        sql`${supportAssignments.status} <> 'CANCELLED'`
+      ))
+      .groupBy(supportAssignments.productionAllocationId, supportAssignments.productionOperationId, supportAssignments.operation),
+  ]);
+  const opById = new Map(opRows.map((row) => [row.id, row]));
+  const batchIds = [...new Set(opRows.map((row) => row.productionBatchId))];
+  const batchRows = batchIds.length
+    ? await handle.select().from(productionBatches).where(inArray(productionBatches.id, batchIds))
+    : [];
+  const batchById = new Map(batchRows.map((row) => [row.id, row]));
+  const orderIds = [...new Set(batchRows.map((row) => row.orderId))];
+  const orderRows = orderIds.length
+    ? await handle.select({ id: orders.id, organizationId: orders.organizationId }).from(orders).where(inArray(orders.id, orderIds))
+    : [];
+  const orderById = new Map(orderRows.map((row) => [row.id, row]));
+  const liveOps = new Set(liveRows.map((row) => row.productionOperationId));
+
+  // Delegation already on each (share | stage, operation). Cancelled rows are excluded in
+  // SQL, so withdrawing a hand-over gives its pieces back.
+  const delegatedByKey = new Map<string, number>();
+  for (const row of supportRows) {
+    const operation = canonicalSupportOperation(row.operation) ?? row.operation;
+    const key = `${row.allocationId ?? "stage"}|${row.operationId}|${operation.toLowerCase()}`;
+    delegatedByKey.set(key, (delegatedByKey.get(key) ?? 0) + (Number(row.delegated) || 0));
+  }
+
+  const orderVisible = (orderId: number | null) => {
+    if (orderId === null) return false;
+    const order = orderById.get(orderId);
+    if (!order) return false;
+    // Legacy rows with no organisation are not refused, matching the rest of the system;
+    // anything that names another organisation never is.
+    return order.organizationId === null || scope.organizationId === null
+      || order.organizationId === scope.organizationId;
+  };
+
+  const build = (args: {
+    kind: "SHARE" | "STAGE";
+    allocationId: number | null;
+    op: typeof productionOperations.$inferSelect;
+    holding: number;
+    holder: number;
+    blocked: string | null;
+  }): DelegationSource | null => {
+    const batch = batchById.get(args.op.productionBatchId);
+    if (!batch || !orderVisible(batch.orderId)) return null;
+    const delegated: Record<string, number> = {};
+    const remaining: Record<string, number> = {};
+    for (const operation of SUPPORT_OPERATIONS) {
+      const key = `${args.allocationId ?? "stage"}|${args.op.id}|${operation.toLowerCase()}`;
+      const handed = delegatedByKey.get(key) ?? 0;
+      delegated[operation] = handed;
+      remaining[operation] = args.blocked ? 0 : supportHeadroom(args.holding, handed);
+    }
+    const anyLeft = Object.values(remaining).some((value) => value > 0);
+    const blockedReason = args.blocked
+      ?? (anyLeft ? null : "Every piece of this production is already handed out to support workers.");
+    return {
+      kind: args.kind,
+      productionAllocationId: args.allocationId,
+      productionOperationId: args.op.id,
+      productionBatchId: batch.id,
+      holderWorkerId: args.holder,
+      stage: args.op.stage,
+      orderId: batch.orderId,
+      orderItemId: batch.orderItemId,
+      orderVariantId: batch.orderVariantId,
+      batchNumber: batch.batchNumber,
+      size: batch.size,
+      color: batch.color,
+      holding: args.holding,
+      delegated,
+      remaining,
+      blockedReason,
+      eligible: blockedReason === null,
+    };
+  };
+
+  const out: DelegationSource[] = [];
+  for (const share of shareRows) {
+    const op = opById.get(share.productionOperationId);
+    if (!op) continue;
+    const built = build({
+      kind: "SHARE",
+      allocationId: share.id,
+      op,
+      holding: share.quantityAllocated,
+      holder: share.workerId,
+      blocked: (DELEGABLE_ALLOC_STATUSES as string[]).includes(share.status)
+        ? null
+        : "This share is closed. Its pieces were moved to another worker or cancelled, so nothing more can be handed out from it.",
+    });
+    if (built) out.push(built);
+  }
+  for (const stage of stageRows) {
+    // External and bought-in stages have no worker to hand work out from.
+    if (isExternalMethod(stage.method) || isPurchasedMethod(stage.method)) continue;
+    const split = liveOps.has(stage.id);
+    const built = build({
+      kind: "STAGE",
+      allocationId: null,
+      op: stage,
+      holding: stage.quantityReceived,
+      holder: stage.workerId ?? 0,
+      blocked: stage.workerId === null
+        ? "Nobody holds this stage yet, so there is no production to hand out from."
+        : split
+          ? "This stage is split between workers. Hand out from your own share of it."
+          : stage.quantityReceived < 1
+            ? "No pieces have reached this stage yet."
+            : null,
+    });
+    if (built) out.push(built);
+  }
+  // A named lookup returns exactly the row it named, never a neighbour.
+  return out.filter((source) =>
+    namedShare ? source.kind === "SHARE" && source.productionAllocationId === scope.allocationId
+      : namedStage ? source.kind === "STAGE" && source.productionOperationId === scope.operationId
+        : true
+  );
+}
+
+/** The ceiling for one operation on a source, read back for an error message. */
+export function remainingFor(source: DelegationSource, operation: string): number {
+  return source.remaining[canonicalSupportOperation(operation) ?? operation] ?? 0;
+}
+
+/**
+ * Lock the parent production row for the rest of the transaction.
+ *
+ * The headroom check and the insert are a read followed by a write. Two hand-outs
+ * arriving together would both read the same headroom and both be accepted, which
+ * over-delegates pieces that do not exist. Touching the parent row first makes the
+ * second transaction wait for the first to commit, then read the committed total. The
+ * statement sets the column to itself, so no value changes.
+ */
+export async function lockDelegationSource(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  source: { kind: "SHARE" | "STAGE"; productionAllocationId: number | null; productionOperationId: number }
+): Promise<void> {
+  if (source.kind === "SHARE" && source.productionAllocationId !== null) {
+    await tx
+      .update(productionAllocations)
+      .set({ quantityAllocated: sql`${productionAllocations.quantityAllocated}` })
+      .where(eq(productionAllocations.id, source.productionAllocationId));
+    return;
+  }
+  await tx
+    .update(productionOperations)
+    .set({ quantityReceived: sql`${productionOperations.quantityReceived}` })
+    .where(eq(productionOperations.id, source.productionOperationId));
+}

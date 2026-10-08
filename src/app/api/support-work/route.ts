@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { desc, eq, inArray, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   supportAssignments,
@@ -15,15 +15,17 @@ import {
   orderItemSizes,
   supportStatusEvents,
 } from "@/db/schema";
-import { guard, getSessionUser, getLinkedWorkerId, ANYONE } from "@/lib/authz";
-import { SUPPORT_OPERATIONS, SUPPORT_ROLE, sameRole, variantLabel } from "@/lib/format";
+import { guard, getSessionUser, getLinkedWorkerId, ANYONE, type SessionUser } from "@/lib/authz";
+import { SUPPORT_OPERATIONS, SUPPORT_ROLE, variantLabel } from "@/lib/format";
 import { workerHoldsRole } from "@/lib/worker-roles";
 import {
+  loadDelegationSources,
+  lockDelegationSource,
+  canonicalSupportOperation,
   supportPending,
   supportInspectionEarnings,
   supportInspectionRate,
   supportInspectionDeduction,
-  supportHeadroom,
   supportStatusAfterInspection,
   supportTransitionError,
   recordSupportEvent,
@@ -45,6 +47,93 @@ export const dynamic = "force-dynamic";
 
 /** GET /api/support-work - a Worker sees only support work they are part of. */
 /**
+ * GET /api/support-work?delegable=1 - the production this login may hand out from.
+ *
+ * A tailor gets their OWN production only: live shares they hold and stage jobs that name
+ * them. A supervisor gets the organisation's bounded view, because they may record a
+ * hand-over on any holder's behalf. Every ceiling is computed by `loadDelegationSources`,
+ * the same function the write path checks against, so the number shown is the number
+ * enforced. Names are resolved for the rows returned and nothing more.
+ */
+async function delegableProduction(session: SessionUser) {
+  const isWorker = session.role === "WORKER";
+  const myWorkerId = isWorker ? await getLinkedWorkerId(session) : null;
+  const headers = { "Cache-Control": "private, no-store" };
+  if (isWorker && myWorkerId === null) return NextResponse.json([], { headers });
+
+  const sources = await loadDelegationSources(db, {
+    organizationId: session.organizationId,
+    ...(isWorker ? { holderWorkerId: myWorkerId! } : {}),
+    limit: 500,
+    // Open work only: the page offers what is in hand now, not every finished garment.
+    openOnly: true,
+  });
+  if (!sources.length) return NextResponse.json([], { headers });
+
+  const holderIds = [...new Set(sources.map((source) => source.holderWorkerId))];
+  const orderIds = [...new Set(sources.map((source) => source.orderId).filter((v): v is number => !!v))];
+  const itemIds = [...new Set(sources.map((source) => source.orderItemId).filter((v): v is number => !!v))];
+  const [holders, orderRows, itemRows] = await Promise.all([
+    db.select({ id: workers.id, name: workers.name }).from(workers).where(inArray(workers.id, holderIds)),
+    orderIds.length
+      ? db.select({ id: orders.id, orderNumber: orders.orderNumber, customerId: orders.customerId }).from(orders).where(inArray(orders.id, orderIds))
+      : Promise.resolve([] as { id: number; orderNumber: string; customerId: number | null }[]),
+    itemIds.length
+      ? db.select({ id: orderItems.id, productId: orderItems.productId }).from(orderItems).where(inArray(orderItems.id, itemIds))
+      : Promise.resolve([] as { id: number; productId: number | null }[]),
+  ]);
+  const customerIds = [...new Set(orderRows.map((order) => order.customerId).filter((v): v is number => !!v))];
+  const productIds = [...new Set(itemRows.map((item) => item.productId).filter((v): v is number => !!v))];
+  const [customerRows, productRows] = await Promise.all([
+    customerIds.length
+      ? db.select({ id: customers.id, name: customers.name }).from(customers).where(inArray(customers.id, customerIds))
+      : Promise.resolve([] as { id: number; name: string }[]),
+    productIds.length
+      ? db.select({ id: products.id, name: products.name }).from(products).where(inArray(products.id, productIds))
+      : Promise.resolve([] as { id: number; name: string }[]),
+  ]);
+  const holderName = new Map(holders.map((person) => [person.id, person.name]));
+  const orderById = new Map(orderRows.map((order) => [order.id, order]));
+  const customerName = new Map(customerRows.map((row) => [row.id, row.name]));
+  const itemById = new Map(itemRows.map((item) => [item.id, item]));
+  const productName = new Map(productRows.map((row) => [row.id, row.name]));
+
+  return NextResponse.json(
+    sources.map((source) => {
+      const order = source.orderId ? orderById.get(source.orderId) : undefined;
+      const item = source.orderItemId ? itemById.get(source.orderItemId) : undefined;
+      const hasVariant = [source.size, source.color].some((value) => !!value && String(value).trim() !== "");
+      return {
+        kind: source.kind,
+        productionAllocationId: source.productionAllocationId,
+        productionOperationId: source.productionOperationId,
+        holderWorkerId: source.holderWorkerId,
+        holder: holderName.get(source.holderWorkerId) ?? "-",
+        stage: source.stage,
+        orderId: source.orderId,
+        orderNumber: order?.orderNumber ?? "-",
+        customer: order?.customerId ? customerName.get(order.customerId) ?? "-" : "-",
+        garment: item?.productId ? productName.get(item.productId) ?? null : null,
+        batchNumber: source.batchNumber,
+        size: source.size,
+        color: source.color,
+        variant: hasVariant ? variantLabel(source.size, source.color) : null,
+        holding: source.holding,
+        // Every supporting operation with what it has out and what it may still take.
+        operations: SUPPORT_OPERATIONS.map((operation) => ({
+          operation,
+          delegated: source.delegated[operation] ?? 0,
+          remaining: source.remaining[operation] ?? 0,
+        })),
+        eligible: source.eligible,
+        blockedReason: source.blockedReason,
+      };
+    }),
+    { headers }
+  );
+}
+
+/**
  * GET /api/support-work?limit=&offset=
  *
  * Support work handed from a tailor to a helper. A tailor signs in as a Worker,
@@ -63,6 +152,7 @@ export async function GET(req: Request) {
   try {
     const session = await getSessionUser(req);
     if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
+    if (new URL(req.url).searchParams.get("delegable") === "1") return delegableProduction(session);
     const myWorkerId = session.role === "WORKER" ? await getLinkedWorkerId(session) : null;
     if (session.role === "WORKER" && myWorkerId === null)
       return NextResponse.json([], { headers: { "Cache-Control": "private, no-store" } });
@@ -294,6 +384,48 @@ export async function GET(req: Request) {
   }
 }
 
+/**
+ * Hand-outs against the SAME production run one at a time in this process.
+ *
+ * The check (what is left) and the write (the new hand-over) are two steps. The
+ * transaction takes a row lock on the production before it reads, so across processes
+ * the database serialises the two. Inside one process this queue makes it certain as
+ * well, without depending on how a particular driver or in-memory test database
+ * schedules overlapping transactions.
+ */
+const productionQueues = new Map<string, Promise<unknown>>();
+function serialisedPerProduction<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = productionQueues.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(work);
+  const settled = run.catch(() => undefined);
+  productionQueues.set(key, settled);
+  void settled.then(() => {
+    if (productionQueues.get(key) === settled) productionQueues.delete(key);
+  });
+  return run;
+}
+
+/**
+ * POST /api/support-work - hand part of a production job to a support worker.
+ *
+ * { workerId, operation, quantityAssigned, pieceRate?, productionAllocationId | productionOperationId, notes? }
+ *
+ * THE RULES, IN ORDER - each one enforced here on the server:
+ *   1. Support work always comes FROM production. There is no free-standing hand-over: a
+ *      request must name a share or a stage job, and the order, garment, size, colour and
+ *      stage are read off that production, never typed in.
+ *   2. A Worker may hand out only from production they hold themselves. A supervisor
+ *      records it under the holder's name - the work still came from the holder, so the
+ *      inspection authority and the pay deduction land on the holder, not the typist.
+ *   3. The source must be live: a closed share, a finished stage, or a stage split between
+ *      workers is refused, with the reason.
+ *   4. The quantity may not exceed what is still open on that source for that supporting
+ *      operation. That ceiling comes from `loadDelegationSources`, the same function the
+ *      Support Work page uses to show it, and the check runs after the parent row is
+ *      locked, so two hand-outs arriving together cannot both take the last pieces.
+ *   5. The helper must be an active worker in the same organisation who holds the Support
+ *      Worker role, and may not be the holder.
+ */
 export async function POST(req: Request) {
   const denied = await guard(req, ANYONE);
   if (denied) return denied;
@@ -302,29 +434,42 @@ export async function POST(req: Request) {
     if (!session) return NextResponse.json({ error: "Please sign in again." }, { status: 401 });
     const body = await req.json();
 
-    // Who is handing the work out? Only the Owner may name somebody else.
+    // The caller's own factory profile. A Worker must have one to hand anything out.
     const myWorkerId = await getLinkedWorkerId(session);
-    const namedAssigner =
-      session.role === "OWNER" && body.assignedByWorkerId ? Number(body.assignedByWorkerId) : null;
-    const assignerId = namedAssigner ?? myWorkerId;
-    if (assignerId === null || !Number.isSafeInteger(assignerId) || assignerId < 1)
+    if (session.role === "WORKER" && myWorkerId === null)
       return NextResponse.json(
         { error: "Only a tailor with a worker record can hand out support work. Ask the Owner to record it." },
         { status: 400 }
       );
 
-    const [assigner] = await db.select().from(workers).where(eq(workers.id, assignerId)).limit(1);
-    if (!assigner || assigner.status !== "ACTIVE" || assigner.organizationId !== session.organizationId)
-      return NextResponse.json({ error: "The assigning tailor must be an active Matesther worker." }, { status: 400 });
-
     const workerId = Number(body.workerId);
     if (!Number.isSafeInteger(workerId) || workerId < 1)
       return NextResponse.json({ error: "Choose the support worker." }, { status: 400 });
-    if (workerId === assignerId)
+    if (session.role === "WORKER" && workerId === myWorkerId)
+      return NextResponse.json({ error: "A tailor cannot hand support work to themselves." }, { status: 400 });
+
+    /* ---------- the production this is handed out from ---------- */
+    const allocationId = body.productionAllocationId ? Number(body.productionAllocationId) : null;
+    if (allocationId !== null && (!Number.isSafeInteger(allocationId) || allocationId < 1))
+      return NextResponse.json({ error: "Choose a valid production share." }, { status: 400 });
+    const parentOperationId = body.productionOperationId ? Number(body.productionOperationId) : null;
+    if (parentOperationId !== null && (!Number.isSafeInteger(parentOperationId) || parentOperationId < 1))
+      return NextResponse.json({ error: "Choose a valid production job." }, { status: 400 });
+    if (allocationId !== null && parentOperationId !== null)
       return NextResponse.json(
-        { error: "A tailor cannot hand support work to themselves." },
+        { error: "Choose either the tailor's share of the stage or the stage itself, not both." },
         { status: 400 }
       );
+    if (allocationId === null && parentOperationId === null)
+      return NextResponse.json(
+        {
+          error: "Choose the production this support work comes from: one of your shares, or a stage you hold. "
+            + "Support work cannot be recorded without it.",
+        },
+        { status: 400 }
+      );
+
+    /* ---------- the helper ---------- */
     const [person] = await db.select().from(workers).where(eq(workers.id, workerId)).limit(1);
     if (!person || person.status !== "ACTIVE" || person.organizationId !== session.organizationId)
       return NextResponse.json({ error: "Choose an active Matesther worker." }, { status: 400 });
@@ -334,8 +479,8 @@ export async function POST(req: Request) {
         { status: 400 }
       );
 
-    const operation = String(body.operation ?? "").trim();
-    if (!SUPPORT_OPERATIONS.some((known) => sameRole(known, operation)))
+    const operation = canonicalSupportOperation(String(body.operation ?? "").trim());
+    if (!operation)
       return NextResponse.json(
         { error: `Choose one of: ${SUPPORT_OPERATIONS.join(", ")}.` },
         { status: 400 }
@@ -354,161 +499,100 @@ export async function POST(req: Request) {
         { status: 400 }
       );
 
-    /* ---------- the exact work being supported, inherited not re-chosen ----------
+    const notes = body.notes ? String(body.notes).slice(0, 2000) : null;
+    const actor = { userId: session.id, workerId: myWorkerId, name: session.name };
+
+    /**
+     * Check and write in ONE transaction, after locking the parent row.
      *
-     * A helper is never handed "some school's order". They are handed THIS tailor's
-     * share of THIS stage, on THIS item, THIS size and THIS colour, in a quantity
-     * that cannot exceed the share. Where a share exists it is named; otherwise the
-     * stage job is, and the order, item, variant and stage are all read off it.
+     * The ceiling is a read of what is already out, followed by an insert. Without the
+     * lock, two requests arriving together both read the same headroom and both succeed.
+     * `lockDelegationSource` makes the second wait for the first to commit, then read its
+     * committed figure. Refusals are returned from inside the transaction as values, so
+     * nothing is written when they fire.
      */
-    const allocationId = body.productionAllocationId ? Number(body.productionAllocationId) : null;
-    if (allocationId !== null && (!Number.isSafeInteger(allocationId) || allocationId < 1))
-      return NextResponse.json({ error: "Choose a valid production share." }, { status: 400 });
-    const parentOperationId = body.productionOperationId ? Number(body.productionOperationId) : null;
-    if (parentOperationId !== null && !Number.isSafeInteger(parentOperationId))
-      return NextResponse.json({ error: "Choose a valid production job." }, { status: 400 });
-    if (allocationId !== null && parentOperationId !== null)
-      return NextResponse.json(
-        { error: "Choose either the tailor's share of the stage or the stage itself, not both." },
-        { status: 400 }
-      );
+    type Outcome = { status: number; body: unknown };
+    const outcome: Outcome = await serialisedPerProduction(
+      allocationId !== null ? `share:${allocationId}` : `stage:${parentOperationId}`,
+      () => db.transaction(async (tx): Promise<Outcome> => {
+      await lockDelegationSource(tx, {
+        kind: allocationId !== null ? "SHARE" : "STAGE",
+        productionAllocationId: allocationId,
+        productionOperationId: parentOperationId ?? 0,
+      });
+      const scope = allocationId !== null
+        ? { organizationId: session.organizationId, allocationId }
+        : { organizationId: session.organizationId, operationId: parentOperationId! };
+      const [source] = await loadDelegationSources(tx, scope);
+      if (!source)
+        return {
+          status: 404,
+          body: { error: allocationId !== null ? "That production share could not be found." : "That production job could not be found." },
+        };
 
-    const share = allocationId
-      ? (await db.select().from(productionAllocations).where(eq(productionAllocations.id, allocationId)).limit(1))[0] ?? null
-      : null;
-    if (allocationId !== null && !share)
-      return NextResponse.json({ error: "That production share could not be found." }, { status: 404 });
+      // Who holds it decides who may hand it out, and whose name the work is recorded under.
+      const holderId = source.holderWorkerId;
+      if (session.role === "WORKER" && holderId !== myWorkerId)
+        return { status: 403, body: { error: "You can only hand out support work on pieces you hold yourself." } };
+      if (workerId === holderId)
+        return { status: 400, body: { error: "The worker holding this share cannot also be the support worker on it." } };
 
-    // A share names its own stage job; never let a request disagree with it.
-    const resolvedOperationId = share ? share.productionOperationId : parentOperationId;
-    const parent = resolvedOperationId
-      ? (await db.select().from(productionOperations).where(eq(productionOperations.id, resolvedOperationId)).limit(1))[0] ?? null
-      : null;
-    if (resolvedOperationId !== null && !parent)
-      return NextResponse.json({ error: "That production job could not be found." }, { status: 404 });
-
-    const batch = parent
-      ? (await db.select().from(productionBatches).where(eq(productionBatches.id, parent.productionBatchId)).limit(1))[0] ?? null
-      : null;
-
-    /* ---------- only the holder of the work may hand it out ---------- */
-    const holderId = share ? share.workerId : parent?.workerId ?? null;
-    let effectiveAssignerId = assignerId;
-    if (holderId !== null && holderId !== assignerId) {
-      const isSupervisor = session.role === "OWNER" || session.role === "PRODUCTION_MANAGER";
-      if (!isSupervisor)
-        return NextResponse.json(
-          { error: "You can only hand out support work on pieces you hold yourself." },
-          { status: 403 }
-        );
-      // A supervisor recording a hand-over on somebody's behalf: the work still came
-      // from the worker holding the pieces, so inspection authority AND the pay
-      // deduction both land on them rather than on whoever typed it in.
-      effectiveAssignerId = holderId;
-    }
-    if (effectiveAssignerId !== assignerId) {
-      const [holder] = await db.select().from(workers).where(eq(workers.id, effectiveAssignerId)).limit(1);
+      const [holder] = await tx.select().from(workers).where(eq(workers.id, holderId)).limit(1);
       if (!holder || holder.status !== "ACTIVE" || holder.organizationId !== session.organizationId)
-        return NextResponse.json(
-          { error: "The worker holding this share must be an active Matesther worker." },
-          { status: 400 }
-        );
-      if (holder.id === workerId)
-        return NextResponse.json(
-          { error: "The worker holding this share cannot also be the support worker on it." },
-          { status: 400 }
-        );
-    }
+        return { status: 400, body: { error: "The worker holding this share must be an active Matesther worker." } };
 
-    /* ---------- how much may be handed out ----------
-     *
-     * The helper's pieces are a subset of the pieces the tailor holds. The ceiling
-     * is per supporting operation: 40 garments can take 40 weaves AND 40 tapes, but
-     * never 60 weaves, because there would be nothing for the extra 20 to be on.
-     */
-    const holding = share
-      ? share.quantityAllocated
-      : parent
-        ? batch?.quantity ?? 0
-        : null;
-    if (holding !== null) {
-      const [handedOut] = await db
-        .select({ total: sql<number>`coalesce(sum(${supportAssignments.quantityAssigned}), 0)` })
-        .from(supportAssignments)
-        .where(and(
-          share
-            ? eq(supportAssignments.productionAllocationId, share.id)
-            : and(
-                eq(supportAssignments.productionOperationId, parent!.id),
-                isNull(supportAssignments.productionAllocationId)
-              ),
-          sql`lower(${supportAssignments.operation}) = lower(${operation})`,
-          sql`${supportAssignments.status} <> 'CANCELLED'`
-        ));
-      const headroom = supportHeadroom(holding, Number(handedOut?.total) || 0);
+      if (!source.eligible)
+        return { status: 400, body: { error: source.blockedReason ?? "This production cannot be handed out from right now." } };
+
+      const headroom = source.remaining[operation] ?? 0;
       if (quantity > headroom)
-        return NextResponse.json(
-          {
+        return {
+          status: 400,
+          body: {
             error: headroom === 0
-              ? `All ${holding} piece${holding === 1 ? "" : "s"} of ${operation} on this work have already been handed out.`
+              ? `All ${source.holding} piece${source.holding === 1 ? "" : "s"} of ${operation} on this work have already been handed out.`
               : `Only ${headroom} piece${headroom === 1 ? "" : "s"} of ${operation} are left to hand out on this work.`,
           },
-          { status: 400 }
-        );
-    }
+        };
 
-    const requestedOrderId = body.orderId ? Number(body.orderId) : null;
-    if (requestedOrderId !== null && !Number.isSafeInteger(requestedOrderId))
-      return NextResponse.json({ error: "Choose a valid order." }, { status: 400 });
-    // The order, item, variant and stage come from the production work. A caller
-    // may not attach support work to an order it has nothing to do with.
-    const orderId = parent ? batch?.orderId ?? null : requestedOrderId;
-    if (!parent && requestedOrderId !== null) {
-      const [order] = await db.select().from(orders).where(eq(orders.id, requestedOrderId)).limit(1);
-      if (!order || order.organizationId !== session.organizationId)
-        return NextResponse.json({ error: "That order could not be found." }, { status: 404 });
-    }
-
-    const created = await db.transaction(async (tx) => {
       const [row] = await tx
-      .insert(supportAssignments)
-      .values({
-        organizationId: session.organizationId,
-        assignedByWorkerId: effectiveAssignerId,
-        workerId,
-        productionOperationId: resolvedOperationId,
-        productionAllocationId: share?.id ?? null,
-        orderId,
-        // Inherited so the helper's dashboard and the order's cost all see the same
-        // exact garment - item, size, colour and stage - without re-typing any of it.
-        orderItemId: parent ? batch?.orderItemId ?? null : null,
-        orderVariantId: parent ? batch?.orderVariantId ?? null : null,
-        stage: parent ? parent.stage : null,
-        operation,
-        pieceRate: rate,
-        quantityAssigned: quantity,
-        status: "ASSIGNED",
-        notes: body.notes ? String(body.notes).slice(0, 2000) : null,
-      })
-      .returning();
-      // The trail starts at the assignment, so "who handed this out and when" is a
-      // recorded event rather than something inferred from a created_at column.
+        .insert(supportAssignments)
+        .values({
+          organizationId: session.organizationId,
+          assignedByWorkerId: holderId,
+          workerId,
+          productionOperationId: source.productionOperationId,
+          productionAllocationId: source.productionAllocationId,
+          // Read off the production itself, so the helper's dashboard, the order's cost and
+          // the production board all name the same exact garment.
+          orderId: source.orderId,
+          orderItemId: source.orderItemId,
+          orderVariantId: source.orderVariantId,
+          stage: source.stage,
+          operation,
+          pieceRate: rate,
+          quantityAssigned: quantity,
+          status: "ASSIGNED",
+          notes,
+        })
+        .returning();
+      // The trail starts at the assignment, so "who handed this out and when" is a recorded
+      // event. The actor is the person SIGNED IN, which may differ from the holder when a
+      // supervisor records the hand-over on the holder's behalf.
       await recordSupportEvent(tx, {
         supportAssignmentId: row.id,
         organizationId: session.organizationId,
         eventType: "CREATED",
         fromStatus: null,
         toStatus: row.status,
-        // The actor is the person SIGNED IN, who may be a supervisor recording the
-        // hand-over on the holder's behalf - that distinction is the whole point of
-        // keeping `assignedByWorkerId` and the actor separate.
-        actor: { userId: session.id, workerId: myWorkerId, name: session.name },
+        actor,
         reason: null,
         notes: row.notes,
       });
-      return row;
-    });
-    return NextResponse.json(created, { status: 201 });
+      return { status: 201, body: row };
+      })
+    );
+    return NextResponse.json(outcome.body, { status: outcome.status });
   } catch (error) {
     console.error("Support work assignment failed", error);
     return NextResponse.json({ error: "Unable to record this support assignment." }, { status: 500 });
@@ -696,8 +780,12 @@ export async function PUT(req: Request) {
       // paused cannot be handed back either.
       const blocked = supportTransitionError(assignment.status, "SUBMITTED");
       if (blocked) return NextResponse.json({ error: blocked }, { status: 409 });
-      const pending = supportPending(assignment);
-      const available = Math.max(0, assignment.quantityAssigned - assignment.quantitySubmitted + pending);
+      // What the helper may still hand back: what was handed out, less what has already
+      // been handed back, PLUS what the tailor sent back for rework (those pieces go round
+      // again). Pieces handed back and still awaiting judgement are NOT available again -
+      // counting them as available let a helper submit more pieces than were ever given.
+      // Rejected pieces are settled, so they stay out.
+      const available = Math.max(0, assignment.quantityAssigned - assignment.quantitySubmitted + assignment.quantityRework);
       const qty = Number(body.submitQty);
       if (!Number.isSafeInteger(qty) || qty < 1 || qty > available)
         return NextResponse.json({ error: `You can submit between 1 and ${available} pieces.` }, { status: 400 });

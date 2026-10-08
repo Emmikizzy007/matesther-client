@@ -62,9 +62,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       name: result.name,
       email: result.email,
       role: result.role,
-      // The login route does not resolve a factory profile, so these stay unset
-      // until /api/auth/me is read on the next load. Deliberately not fetched here:
-      // signing in should not wait on it, and no screen needs it before first paint.
+      // The login response carries the same factory profile /api/auth/me resolves, so a
+      // tailor's hand-out action is correct from the first screen after signing in, with
+      // no reload. Every action it enables is still re-authorised by the server.
       workerId: result.workerId ?? null,
       workerName: result.workerName ?? null,
     };
