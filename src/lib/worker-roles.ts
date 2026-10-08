@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "@/db";
 import { workerRoles, workers } from "@/db/schema";
 import { WORKER_ROLES, hasRole, sameRole } from "@/lib/format";
@@ -85,6 +85,34 @@ export async function rolesByWorker(): Promise<Map<number, string[]>> {
     db
       .select({ workerId: workerRoles.workerId, role: workerRoles.role, isPrimary: workerRoles.isPrimary })
       .from(workerRoles),
+  ]);
+  const byWorker = new Map<number, { role: string; isPrimary: boolean }[]>();
+  for (const row of stored) {
+    const list = byWorker.get(row.workerId) ?? [];
+    list.push({ role: row.role, isPrimary: row.isPrimary });
+    byWorker.set(row.workerId, list);
+  }
+  return new Map(
+    people.map((person) => [person.id, effectiveRoles(person.specialty, byWorker.get(person.id) ?? [])])
+  );
+}
+
+/**
+ * Effective roles for a known set of people, in two queries.
+ *
+ * `rolesByWorker()` reads every worker and every role row in the database, which is the
+ * wrong answer for a screen that needs the roles of the twenty people it is about to show.
+ * Callers pass the ids they actually need.
+ */
+export async function rolesForWorkerIds(workerIds: number[]): Promise<Map<number, string[]>> {
+  const ids = [...new Set(workerIds)];
+  if (!ids.length) return new Map();
+  const [people, stored] = await Promise.all([
+    db.select({ id: workers.id, specialty: workers.specialty }).from(workers).where(inArray(workers.id, ids)),
+    db
+      .select({ workerId: workerRoles.workerId, role: workerRoles.role, isPrimary: workerRoles.isPrimary })
+      .from(workerRoles)
+      .where(inArray(workerRoles.workerId, ids)),
   ]);
   const byWorker = new Map<number, { role: string; isPrimary: boolean }[]>();
   for (const row of stored) {

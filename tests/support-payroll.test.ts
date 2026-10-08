@@ -54,7 +54,45 @@ async function supportWorld() {
   const helperLogin = await createStaff(owner.cookie, { name: helperName, role: "WORKER" });
 
   const order = await createOrder(owner.cookie, { quantity: 20, unitPrice: 5000 });
-  return { owner, tailor, helper, tailorLogin, helperLogin, order };
+  const sewingId = await holdSewing(owner.cookie, order, tailor.id, tailorLogin.cookie, 20);
+  return { owner, tailor, helper, tailorLogin, helperLogin, order, sewingId };
+}
+
+/**
+ * The SEWING job each tailor holds, keyed by their login cookie.
+ *
+ * Support work can only be handed out FROM production the tailor holds. A fixture that
+ * hands work out therefore first gives the tailor a real batch (see `holdSewing`), and
+ * `assignSupport` names that job by default. Nothing here hands out from a stage that
+ * has no tailor on it.
+ */
+const sewingByTailor = new Map<string, number>();
+
+/**
+ * Give a tailor real production to hand out from: a batch of `pieces` garments whose
+ * SEWING stage they hold, with the pieces already received at that stage.
+ */
+async function holdSewing(
+  ownerCookie: string,
+  order: { orderId: number; itemId: number },
+  tailorId: number,
+  tailorCookie: string,
+  pieces: number
+): Promise<number> {
+  const batch = await api("POST", "/api/batches", {
+    cookie: ownerCookie,
+    body: {
+      orderId: order.orderId, orderItemId: order.itemId, quantity: pieces,
+      stages: [{ stage: "SEWING" }],
+      assignments: [{ stage: "SEWING", workerId: tailorId, pieceRate: 300 }],
+    },
+  });
+  await expectStatus(batch, 201, "Give the tailor SEWING production to hand out from");
+  const jobs = await api("GET", `/api/operations?batchId=${batch.data.id}`, { cookie: ownerCookie });
+  const sewing = (await expectStatus(jobs, 200, "Read the tailor's SEWING job")).find((job: any) => job.stage === "SEWING");
+  if (!sewing) throw new Error("The batch has no SEWING job");
+  sewingByTailor.set(tailorCookie, sewing.id);
+  return sewing.id;
 }
 
 /** Hand out support work and return the created assignment. */
@@ -70,7 +108,7 @@ async function assignSupport(
       operation: fields.operation ?? "Weaving",
       quantityAssigned: fields.quantity ?? 10,
       pieceRate: fields.rate ?? 300,
-      productionOperationId: fields.productionOperationId ?? null,
+      productionOperationId: fields.productionOperationId ?? sewingByTailor.get(tailorCookie) ?? null,
     },
   });
   await expectStatus(created, 201, "Hand out support work");
@@ -164,6 +202,7 @@ test("a supervisor who does support work cannot approve their own support work",
 
   const tailor = await createWorker(owner.cookie, { name: tailorName, specialty: "Tailor" });
   const tailorLogin = await createStaff(owner.cookie, { name: tailorName, role: "WORKER" });
+  await holdSewing(owner.cookie, await createOrder(owner.cookie, { quantity: 20, unitPrice: 5000 }), tailor.id, tailorLogin.cookie, 20);
 
   // The dangerous combination: a supervisor whose own worker record also holds
   // the support role, given support work by somebody else.
@@ -216,11 +255,11 @@ test("a supervisor who does support work cannot approve their own support work",
 });
 
 test("support work can only be handed to somebody who holds the support role", async () => {
-  const { owner, tailor, helper, tailorLogin } = await supportWorld();
+  const { owner, tailor, helper, tailorLogin, sewingId } = await supportWorld();
 
   const toSelf = await api("POST", "/api/support-work", {
     cookie: tailorLogin.cookie,
-    body: { workerId: tailor.id, operation: "Weaving", quantityAssigned: 5, pieceRate: 200 },
+    body: { workerId: tailor.id, operation: "Weaving", quantityAssigned: 5, pieceRate: 200, productionOperationId: sewingId },
   });
   assert.equal(toSelf.status, 400, "A tailor cannot hand support work to themselves");
 
@@ -234,40 +273,34 @@ test("support work can only be handed to somebody who holds the support role", a
   });
   const notAHelper = await api("POST", "/api/support-work", {
     cookie: tailorLogin.cookie,
-    body: { workerId: salesPerson.id, operation: "Weaving", quantityAssigned: 5, pieceRate: 200 },
+    body: { workerId: salesPerson.id, operation: "Weaving", quantityAssigned: 5, pieceRate: 200, productionOperationId: sewingId },
   });
   assert.equal(notAHelper.status, 400, "Only somebody with the support role may be given support work");
 
   const unknownOperation = await api("POST", "/api/support-work", {
     cookie: tailorLogin.cookie,
-    body: { workerId: helper.id, operation: "Flying", quantityAssigned: 5, pieceRate: 200 },
+    body: { workerId: helper.id, operation: "Flying", quantityAssigned: 5, pieceRate: 200, productionOperationId: sewingId },
   });
   assert.equal(unknownOperation.status, 400, "The supporting operation must be one Matesther uses");
 
   const noRate = await api("POST", "/api/support-work", {
     cookie: tailorLogin.cookie,
-    body: { workerId: helper.id, operation: "Taping", quantityAssigned: 5, pieceRate: 0 },
+    body: { workerId: helper.id, operation: "Taping", quantityAssigned: 5, pieceRate: 0, productionOperationId: sewingId },
   });
   assert.equal(noRate.status, 400, "A per-piece helper needs an agreed rate before work starts");
 });
 
 test("a support assignment preserves worker, operation, quantities, split, rate and earnings", async () => {
-  const { owner, tailor, helper, tailorLogin, helperLogin, order } = await supportWorld();
+  const { owner, tailor, helper, tailorLogin, helperLogin, order, sewingId } = await supportWorld();
 
-  // Link the support work to a real production job so it stays traceable.
-  const batch = await api("POST", "/api/batches", {
-    cookie: owner.cookie,
-    body: { orderId: order.orderId, orderItemId: order.itemId, quantity: 20 },
-  });
-  await expectStatus(batch, 201, "Create a batch");
-  const jobs = await api("GET", "/api/operations", { cookie: owner.cookie });
-  const sewing = jobs.data.find((job: any) => job.productionBatchId === batch.data.id && job.stage === "SEWING");
-
+  // The support work is linked to the tailor's own SEWING job, so it stays traceable.
+  const sewingBefore = (await expectStatus(await api("GET", "/api/operations", { cookie: owner.cookie }), 200, "Read the SEWING job"))
+    .find((job: any) => job.id === sewingId);
   const assignment = await assignSupport(tailorLogin.cookie, helper.id, {
     operation: "Taping",
     quantity: 12,
     rate: 350,
-    productionOperationId: sewing.id,
+    productionOperationId: sewingId,
   });
   assert.equal(assignment.workerId, helper.id, "The support worker is recorded");
   assert.equal(assignment.assignedByWorkerId, tailor.id, "The assigning tailor is recorded");
@@ -301,13 +334,13 @@ test("a support assignment preserves worker, operation, quantities, split, rate 
   assert.equal(row.status, "APPROVED");
   assert.equal(row.orderNumber, order.orderNumber, "Traceable back to the order");
   assert.notEqual(row.customer, "-", "The school is recorded");
-  assert.equal(row.batchNumber, batch.data.batchNumber, "Linked to the batch it came from");
+  assert.equal(row.batchNumber, sewingBefore.batchNumber, "Linked to the batch it came from");
   assert.equal(row.stage, "SEWING", "Linked to the parent production stage");
 
   // The parent tailor's own production job is untouched by the support work.
   const jobsAfter = await api("GET", "/api/operations", { cookie: owner.cookie });
-  const sewingAfter = jobsAfter.data.find((job: any) => job.id === sewing.id);
-  assert.equal(sewingAfter.workerId, sewing.workerId, "The tailor's stage responsibility is unchanged");
+  const sewingAfter = jobsAfter.data.find((job: any) => job.id === sewingId);
+  assert.equal(sewingAfter.workerId, sewingBefore.workerId, "The tailor's stage responsibility is unchanged");
   assert.equal(sewingAfter.quantityCompleted, 0, "Support work never inflates the parent stage");
 
   const earnings = await payrollRow(owner.cookie, helper.id);
@@ -474,6 +507,7 @@ test("payroll separates salary, production piecework, support piecework, overtim
   const tailorName = unique("Assigning Tailor");
   const tailor = await createWorker(owner.cookie, { name: tailorName, specialty: "Tailor" });
   const tailorLogin = await createStaff(owner.cookie, { name: tailorName, role: "WORKER" });
+  await holdSewing(owner.cookie, await createOrder(owner.cookie, { quantity: 10, unitPrice: 5000 }), tailor.id, tailorLogin.cookie, 10);
 
   // A per-piece worker who also does support work, on a salary-free profile.
   const person = await createWorker(owner.cookie, {
@@ -784,6 +818,7 @@ test("the payment sheet lists staff, roles and amounts for the bank", async () =
   const tailorName = unique("Piece Tailor");
   const tailor = await createWorker(owner.cookie, { name: tailorName, specialty: "Tailor", roles: ["Tailor", SUPPORT_ROLE] });
   const tailorLogin = await createStaff(owner.cookie, { name: tailorName, role: "WORKER" });
+  await holdSewing(owner.cookie, await createOrder(owner.cookie, { quantity: 10, unitPrice: 5000 }), tailor.id, tailorLogin.cookie, 10);
   const helperName = unique("Weaver");
   const helper = await createWorker(owner.cookie, {
     name: helperName,

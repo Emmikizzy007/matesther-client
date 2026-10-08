@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
-import { users } from "@/db/schema";
+import { users, workers } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { getLinkedWorkerId } from "@/lib/authz";
 import { verifyPassword } from "@/lib/password";
 import { attachNewSession, clearExpiredSessions } from "@/lib/session";
 import { rejectCrossSiteMutation } from "@/lib/request-security";
@@ -37,7 +38,22 @@ export async function POST(req: Request) {
     if (user.status !== "ACTIVE")
       return NextResponse.json({ error: "Account inactive. Contact the owner." }, { status: 403 });
 
-    const response = NextResponse.json({ name: user.name, email: user.email, role: user.role });
+    // The signed-in person's own factory profile, resolved by the SAME function /api/auth/me
+    // uses. Without it the client only learns who the login is linked to on a full page
+    // reload, so a tailor who signs in and navigates straight to Support Work was shown no
+    // hand-out action until they refreshed. Nothing is trusted from this on the way back in:
+    // every action it enables is re-authorised by the server.
+    const workerId = await getLinkedWorkerId({
+      id: user.id, name: user.name, email: user.email, role: user.role,
+      organizationId: user.organizationId, workerId: user.workerId,
+    });
+    const [profile] = workerId === null
+      ? []
+      : await db.select({ name: workers.name }).from(workers).where(eq(workers.id, workerId)).limit(1);
+    const response = NextResponse.json({
+      name: user.name, email: user.email, role: user.role,
+      workerId, workerName: profile?.name ?? null,
+    });
     await attachNewSession(user.id, response);
     clearExpiredSessions().catch(() => {});
     return response;

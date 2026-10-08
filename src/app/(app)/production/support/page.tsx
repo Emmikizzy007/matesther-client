@@ -31,15 +31,16 @@ export default function SupportWorkPage() {
   const [rows, setRows] = useState<any[]>([]);
   const [workers, setWorkers] = useState<any[]>([]);
   /**
-   * The shares that can be handed out from, not a list of production jobs.
+   * The production that can be handed out from, as the SERVER computes it.
    *
-   * Handing out support work used to offer a dropdown of every active production job in
-   * the system, which let a helper be attached to a school nobody chose deliberately. A
-   * tailor now offers a part of THEIR OWN share of one exact variant at one exact stage,
-   * and the garment, stage and quantity behind it come with it. For a Worker this returns
-   * only their own shares - the endpoint scopes itself to the login.
+   * One source per share or stage job, each with the exact order, garment, size, colour
+   * and stage, and with the most that may still be handed out for each supporting
+   * operation. The button, the dropdown and the quantity ceiling all read this one list,
+   * and the write path checks against the same arithmetic - so what is offered is what
+   * will be accepted. A Worker gets only their own production; a supervisor gets the
+   * bounded organisation view.
    */
-  const [shares, setShares] = useState<any[]>([]);
+  const [sources, setSources] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [formErr, setFormErr] = useState("");
@@ -51,9 +52,10 @@ export default function SupportWorkPage() {
     operation: string;
     quantityAssigned: string;
     pieceRate: string;
-    productionAllocationId: string;
+    /** "share:<id>" or "stage:<id>" - the production the work is handed out from. */
+    source: string;
     notes: string;
-  }>({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", productionAllocationId: "", notes: "" });
+  }>({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", source: "", notes: "" });
   const [submitFor, setSubmitFor] = useState<any>(null);
   const [submitQty, setSubmitQty] = useState("");
   const [inspectFor, setInspectFor] = useState<any>(null);
@@ -79,18 +81,17 @@ export default function SupportWorkPage() {
        * details, because that is all this picker needs.
        */
       fetch("/api/workers?supportHelpers=1", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
-      // Only shares that can still be worked are offered, and the endpoint is bounded,
-      // so this never downloads the whole allocation history to fill a <select>.
-      // For a Worker this returns only their own shares - the endpoint scopes itself.
-      fetch("/api/allocations?live=1&limit=500", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
+      // The production this login may hand out from, with the ceilings the server will
+      // enforce. Bounded by the server; a Worker gets only their own production.
+      fetch("/api/support-work?delegable=1", { cache: "no-store" }).then((r) => r.json()).catch(() => []),
     ]);
   }
 
-  function apply([support, people, allocations]: [any, any, any]) {
+  function apply([support, people, delegable]: [any, any, any]) {
     if (support && support.error) setErr(support.error);
     else setRows(Array.isArray(support) ? support : []);
     setWorkers(Array.isArray(people) ? people : []);
-    setShares(Array.isArray(allocations) ? allocations.filter((share: any) => share.live) : []);
+    setSources(Array.isArray(delegable) ? delegable : []);
   }
 
   function load() {
@@ -120,14 +121,14 @@ export default function SupportWorkPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...form,
           workerId: Number(form.workerId),
+          operation: form.operation,
           quantityAssigned: Number(form.quantityAssigned),
           pieceRate: Number(form.pieceRate) || 0,
-          // The share, not the stage job: the server inherits the order, item, variant,
-          // size, colour and stage from it and attributes the work to the tailor who
-          // actually holds it.
-          productionAllocationId: form.productionAllocationId ? Number(form.productionAllocationId) : null,
+          notes: form.notes,
+          // The source is named by id; the server inherits the order, item, variant, size,
+          // colour and stage from it and records the work against the tailor who holds it.
+          ...sourceIds(form.source),
         }),
       });
       const data = await response.json();
@@ -230,18 +231,55 @@ export default function SupportWorkPage() {
    * A tailor is a Worker who HOLDS production. That is the whole authorisation
    * relationship: they may delegate part of what they hold, and nothing else.
    *
-   * `shares` is the caller's own live shares for a Worker and every live share for a
-   * supervisor, because the endpoint scopes itself to the login - so "has something to
-   * hand out" is the same question the server will answer when the form is submitted,
-   * and the button is never shown for an action the backend would refuse.
+   * `sources` is the caller's own production for a Worker and the organisation's for a
+   * supervisor, computed by the server - so "can hand something out" is the same question
+   * the server answers when the form is submitted, and the button is never shown for an
+   * action the backend would refuse.
    */
   const myWorkerId = user?.workerId ?? null;
-  const canHandOut = !isWorker || (!!myWorkerId && shares.length > 0);
+  /** The production that can take a hand-out right now. Decided by the server. */
+  const eligibleSources = sources.filter((source) => source.eligible);
+  const canHandOut = eligibleSources.length > 0;
+  /**
+   * Why the action is unavailable, in the words a tailor needs. Shown instead of a button
+   * that would fail, so a person can see what to fix rather than guess.
+   */
+  const handOutUnavailable = (() => {
+    if (canHandOut || loading) return "";
+    if (isWorker && !myWorkerId)
+      return "Your login is not linked to a Workers record yet, so Matesther cannot tell which production is yours. Ask the Owner to add your Workers record under the same full name as your login.";
+    if (sources.length === 0)
+      return isWorker
+        ? "No production is assigned to you right now. Once a stage is assigned to you, you can hand part of it to a support worker from here."
+        : "No production is open for hand-outs right now.";
+    return sources.find((source) => source.blockedReason)?.blockedReason
+      ?? "Everything assigned to you has already been handed out to support workers.";
+  })();
   /** Is this row mine to move through its lifecycle? Only the helper who holds it. */
   const isMySupportRow = (row: any) => !!myWorkerId && row.workerId === myWorkerId;
-  /** May I judge this row? The tailor who handed it out, or a supervisor - never the helper. */
+  /**
+   * May I judge this row? A supervisor or the tailor who handed it out - never the helper,
+   * and that holds even when a supervisor is the helper, because the server refuses it.
+   */
   const canInspect = (row: any) =>
-    !isWorker && row.pending > 0 || (!!myWorkerId && row.assignedByWorkerId === myWorkerId && row.pending > 0);
+    row.pending > 0 && !isMySupportRow(row) && (!isWorker || (!!myWorkerId && row.assignedByWorkerId === myWorkerId));
+
+  /** "share:12" -> { productionAllocationId: 12 }; "stage:7" -> { productionOperationId: 7 }. */
+  function sourceIds(key: string): { productionAllocationId?: number; productionOperationId?: number } {
+    const [kind, id] = key.split(":");
+    if (!id) return {};
+    return kind === "share" ? { productionAllocationId: Number(id) } : { productionOperationId: Number(id) };
+  }
+  /** The chosen source, if any, by its form key. */
+  const chosenSource = eligibleSources.find((source) => {
+    const [kind, id] = form.source.split(":");
+    return kind === (source.kind === "SHARE" ? "share" : "stage")
+      && Number(id) === (source.kind === "SHARE" ? source.productionAllocationId : source.productionOperationId);
+  });
+  /** The most that may be handed out for the operation chosen, on the source chosen. */
+  const chosenRemaining = chosenSource
+    ? (chosenSource.operations.find((entry: any) => entry.operation === form.operation)?.remaining ?? 0)
+    : null;
 
   return (
     <div>
@@ -253,7 +291,7 @@ export default function SupportWorkPage() {
           // a Worker only when they hold production to delegate from. A Worker with no
           // share of their own gets no button, rather than a button that fails.
           canHandOut && (
-            <Btn onClick={() => { setFormErr(""); setForm({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", productionAllocationId: "", notes: "" }); setAssignOpen(true); }}>
+            <Btn onClick={() => { setFormErr(""); setForm({ workerId: "", operation: SUPPORT_OPERATIONS[0], quantityAssigned: "", pieceRate: "", source: "", notes: "" }); setAssignOpen(true); }}>
               <Plus className="w-4 h-4" /> Hand Out Support Work
             </Btn>
           )
@@ -261,6 +299,11 @@ export default function SupportWorkPage() {
       />
 
       {err && <p className="mb-4 text-sm text-red-700">{err}</p>}
+      {handOutUnavailable && (
+        <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800" data-testid="hand-out-unavailable">
+          <strong>Hand out support work is unavailable.</strong> {handOutUnavailable}
+        </p>
+      )}
 
       <Card>
         <CardHeader title="Support assignments" subtitle="The tailor keeps their own production job; this records the help alongside it" />
@@ -396,7 +439,7 @@ export default function SupportWorkPage() {
                           <Pause className="w-3.5 h-3.5" /> Pause
                         </button>
                       )}
-                      {isMySupportRow(row) && ["STARTED", "REWORK"].includes(row.status) && row.quantitySubmitted < row.quantityAssigned && (
+                      {isMySupportRow(row) && ["STARTED", "REWORK"].includes(row.status) && row.quantitySubmitted - row.quantityRework < row.quantityAssigned && (
                         <button
                           onClick={() => { setFormErr(""); setSubmitFor(row); setSubmitQty(""); }}
                           className="ml-3 inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-matesther-700"
@@ -438,26 +481,32 @@ export default function SupportWorkPage() {
               {SUPPORT_OPERATIONS.map((operation) => <option key={operation} value={operation}>{operation}</option>)}
             </select>
           </Field>
-          <Field label="Pieces handed over *"><input required type="number" min="1" value={form.quantityAssigned} onChange={(e) => setForm({ ...form, quantityAssigned: e.target.value })} className={inputCls} /></Field>
+          <Field label="Pieces handed over *"><input required type="number" min="1" max={chosenRemaining ?? undefined} value={form.quantityAssigned} onChange={(e) => setForm({ ...form, quantityAssigned: e.target.value })} className={inputCls} /></Field>
           <Field label="Agreed rate per piece (₦)"><input type="number" min="0" value={form.pieceRate} onChange={(e) => setForm({ ...form, pieceRate: e.target.value })} className={inputCls} /></Field>
-          <Field label="From which of your shares (optional)" className="sm:col-span-2">
-            <select value={form.productionAllocationId} onChange={(e) => setForm({ ...form, productionAllocationId: e.target.value })} className={inputCls}>
-              <option value="">General support work, not part of a specific share</option>
-              {shares.map((share) => (
-                <option key={share.id} value={share.id}>
-                  {[
-                    isWorker ? null : share.workerName,
-                    share.batchNumber && share.batchNumber !== "-" ? share.batchNumber : null,
-                    share.stage ? String(share.stage).replaceAll("_", " ") : null,
-                    [share.size, share.color].filter(Boolean).join(" / ") || null,
-                  ].filter(Boolean).join(" • ")} ({share.outstanding} of {isWorker ? "your" : `${share.workerName ?? "their"}`} {share.quantityAllocated} still open{share.supportDelegated ? `, ${share.supportDelegated} already handed out` : ""})
-                </option>
-              ))}
+          <Field label="From which production *" className="sm:col-span-2">
+            <select required value={form.source} onChange={(e) => setForm({ ...form, source: e.target.value })} className={inputCls}>
+              <option value="">Select production…</option>
+              {eligibleSources.map((source) => {
+                const id = source.kind === "SHARE" ? source.productionAllocationId : source.productionOperationId;
+                return (
+                  <option key={`${source.kind}:${id}`} value={`${source.kind === "SHARE" ? "share" : "stage"}:${id}`}>
+                    {[
+                      isWorker ? null : source.holder,
+                      source.orderNumber && source.orderNumber !== "-" ? source.orderNumber : null,
+                      source.garment,
+                      source.variant,
+                      source.stage ? String(source.stage).replaceAll("_", " ") : null,
+                    ].filter(Boolean).join(" • ")} ({source.holding} pcs)
+                  </option>
+                );
+              })}
             </select>
             <p className="mt-1 text-xs text-slate-500">
-              Picking a share names the school, garment, size, colour and stage for you, and the
-              work is recorded against the tailor who holds it - the helper never picks a school
-              from scratch, and the pieces handed over can never exceed what is still open.
+              {chosenSource
+                ? chosenRemaining !== null && chosenRemaining > 0
+                  ? `${chosenRemaining} piece${chosenRemaining === 1 ? "" : "s"} of ${form.operation} still open on this work.`
+                  : `Nothing more of ${form.operation} can be handed out on this work.`
+                : "Choose the exact garment this help is for. The order, size, colour and stage come with it, and the pieces handed over can never exceed what is still open."}
             </p>
           </Field>
           <Field label="Notes" className="sm:col-span-2"><input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className={inputCls} placeholder="e.g. Taping for the navy blazers" /></Field>

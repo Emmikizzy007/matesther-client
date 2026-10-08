@@ -9,6 +9,7 @@ import {
   normaliseRoles,
   replaceWorkerRoles,
   rolesByWorker,
+  rolesForWorkerIds,
   rolesForWorker,
   unknownRoles,
 } from "@/lib/worker-roles";
@@ -107,7 +108,8 @@ async function supportHelperList(req: Request) {
   // Roles are resolved through the same effective-roles rule as everywhere else -
   // stored role rows plus the legacy specialty - so this list can never disagree with
   // what the Workers screen shows or with what POST /api/support-work will accept.
-  const roleMap = await rolesByWorker();
+  // Only the roles of the people actually being considered - never the whole table.
+  const roleMap = await rolesForWorkerIds(rows.map((person) => person.id));
   const helpers = rows
     .filter((person) => hasRole(roleMap.get(person.id) ?? [person.specialty], SUPPORT_ROLE))
     .map(({ organizationId, ...person }) => ({
