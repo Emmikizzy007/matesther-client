@@ -65,7 +65,10 @@ export function StageAllocations({ operation, workers, requiredRole, onChanged }
       setError(cause instanceof Error ? cause.message : "Could not load this stage's allocations.");
     } finally { setLoading(false); }
   }, [operation]);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [load]);
 
   if (!operation) return null;
   const external = ["OUTSOURCED", "VENDOR_PROCESSING", "READY_MADE"].includes(operation.method);

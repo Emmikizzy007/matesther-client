@@ -2,6 +2,7 @@
 
 import type { ReactNode } from "react";
 import { BrandLogo } from "@/components/BrandLogo";
+import { LogoLink } from "@/components/LogoLink";
 import { MATESTHER_MOTTO } from "@/lib/brand";
 
 export interface LetterBusiness {
@@ -31,7 +32,7 @@ export function Letterhead({
   return (
     <article className="matesther-letter bg-white text-[#242527]" aria-label={`${title}, ${ourRef}`}>
       <header className="letter-header">
-        <div className="letter-logo-wrap"><BrandLogo className="h-[60px] w-[60px] rounded-sm" /></div>
+        <div className="letter-logo-wrap"><LogoLink className="h-[60px] w-[60px] rounded-sm" /></div>
         <h1 className="letter-brand">Matesther Enterprises</h1>
         <p className="letter-tagline">perfecting the right stitches</p>
         <div className="letter-contact">

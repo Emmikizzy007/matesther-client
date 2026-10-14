@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Plus, Search, Trash2 } from "lucide-react";
 import {
@@ -15,6 +15,7 @@ import {
   inputCls,
   Btn,
 } from "@/components/ui";
+import { SkeletonTable } from "@/components/Skeleton";
 import { naira, fmtDate } from "@/lib/format";
 
 interface Item { productId: string; quantity: string; unitPrice: string; notes: string }
@@ -85,7 +86,12 @@ export default function OrdersPage() {
       .catch(() => setErr("Could not load orders."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, [applied, page]);
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const id = window.setTimeout(() => { void loadRef.current(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [applied, page]);
 
   // Send the search once typing pauses, and go back to the first page when it changes:
   // page 3 of a narrower search is very often empty, which reads as "no orders found".
@@ -217,7 +223,7 @@ export default function OrdersPage() {
 
       <Card>
         {loading ? (
-          <Loading />
+          <SkeletonTable rows={8} cols={5} bare label="Loading orders…" />
         ) : filtered.length === 0 ? (
           <EmptyState
             title={applied.search || applied.status ? "No orders match this search" : "No orders found"}

@@ -65,6 +65,8 @@ const MIGRATIONS = [
   "0011_support_lifecycle",
   "0012_deletion_and_purge_audit",
   "0013_payroll-deductions",
+  "0014_payroll-cooperative-incidents",
+  "0015_worker-bank-account",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 /**

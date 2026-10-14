@@ -48,7 +48,10 @@ test("0013 and hand-run upgrade contain identical guarded DDL for only seven new
 
 test("new migration is journaled after 0012 and its snapshot chains to the previous schema", () => {
   const journal = JSON.parse(read("drizzle/meta/_journal.json"));
-  assert.equal(journal.entries.at(-1).tag, "0013_payroll-deductions");
+  const entry = journal.entries.find((e: { tag: string }) => e.tag === "0013_payroll-deductions");
+  assert.ok(entry, "0013 must stay in the drizzle journal");
+  assert.equal(journal.entries[entry.idx + 1]?.tag, "0014_payroll-cooperative-incidents",
+    "0014 must be journaled directly after 0013");
   const before = JSON.parse(read("drizzle/meta/0012_snapshot.json"));
   const after = JSON.parse(read("drizzle/meta/0013_snapshot.json"));
   assert.equal(after.prevId, before.id);

@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Plus } from "lucide-react";
-import { Card, CardHeader, PageHeader, Loading, Modal, Field, inputCls, Btn, Badge } from "@/components/ui";
+import { Card, CardHeader, PageHeader, Modal, Field, inputCls, Btn, Badge } from "@/components/ui";
+import { SkeletonForm, LoadError } from "@/components/Skeleton";
 import { naira, stageLabel, STAGES as STAGE_CODES } from "@/lib/format";
 import { useAuth, roleLabel } from "@/lib/auth";
 import { BrandLogo } from "@/components/BrandLogo";
@@ -14,6 +15,7 @@ export default function SettingsPage() {
   const [users, setUsers] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [orgForm, setOrgForm] = useState({ name: "", phone: "", email: "", address: "" });
   const [msg, setMsg] = useState("");
   const [prodModal, setProdModal] = useState(false);
@@ -49,6 +51,7 @@ export default function SettingsPage() {
 
   function load() {
     setLoading(true);
+    setLoadError("");
     Promise.all([
       fetch("/api/org", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/products", { cache: "no-store" }).then((r) => r.json()),
@@ -61,9 +64,13 @@ export default function SettingsPage() {
         setProducts(Array.isArray(p) ? p : []);
         if (o.org) setOrgForm({ name: o.org.name, phone: o.org.phone || "", email: o.org.email || "", address: o.org.address || "" });
       })
+      .catch(() => setLoadError("Could not load settings."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  useEffect(() => {
+    const id = window.setTimeout(load, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   async function saveOrg(e: React.FormEvent) {
     e.preventDefault();
@@ -107,14 +114,16 @@ export default function SettingsPage() {
     <div>
       <PageHeader title="Settings" subtitle="Business profile, uniform catalogue, users and workflow" />
 
-      {loading ? (
-        <Card><Loading /></Card>
+      {loadError && !loading ? (
+        <LoadError message={loadError} onRetry={load} />
+      ) : loading ? (
+        <SkeletonForm />
       ) : (
-        <div className="grid xl:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
           <div className="space-y-4">
             <Card>
               <CardHeader title="Business Profile" subtitle="Shown across the Matesther ERP" />
-              <form onSubmit={saveOrg} className="p-5 grid sm:grid-cols-2 gap-3">
+              <form onSubmit={saveOrg} className="p-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <Field label="Business name"><input value={orgForm.name} onChange={(e) => setOrgForm({ ...orgForm, name: e.target.value })} className={inputCls} /></Field>
                 <Field label="Phone"><input value={orgForm.phone} onChange={(e) => setOrgForm({ ...orgForm, phone: e.target.value })} className={inputCls} /></Field>
                 <Field label="Email"><input value={orgForm.email} onChange={(e) => setOrgForm({ ...orgForm, email: e.target.value })} className={inputCls} /></Field>
@@ -129,13 +138,13 @@ export default function SettingsPage() {
             <Card>
               <CardHeader title="Original company logo" subtitle="Upload the actual file; the app does not redraw or replace your artwork." />
               <div className="space-y-3 p-5">
-                <div className="flex items-center gap-3">
-                  <div className="rounded-xl bg-matesther-950 p-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="shrink-0 rounded-xl bg-matesther-950 p-3">
                     <BrandLogo key={logoVersion} className="h-20 w-20 rounded-lg" version={logoVersion} />
                   </div>
-                  <div className="text-sm">
-                    <p className="font-semibold text-slate-900">{logoConfigured ? "Logo saved in Matesther's database" : "Original logo not uploaded yet"}</p>
-                    <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                  <div className="min-w-0 text-sm">
+                    <p className="break-words font-semibold text-slate-900">{logoConfigured ? "Logo saved in Matesther's database" : "Original logo not uploaded yet"}</p>
+                    <p className="mt-1 break-words text-xs leading-relaxed text-slate-500">
                       Save the exact image from your chat to your device, then select that file below.
                       The original pixels are used in the header and receipts; phone icons only scale it to fit.
                     </p>
@@ -164,7 +173,7 @@ export default function SettingsPage() {
               <div className="divide-y divide-slate-100">
                 {users.map((u: any) => (
                   <div key={u.id} className="px-5 py-3 flex items-center justify-between gap-3 text-sm">
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <p className="font-semibold truncate">
                         {u.name} {user?.email === u.email && <span className="text-xs text-matesther-700">(you)</span>}
                       </p>
@@ -237,12 +246,12 @@ export default function SettingsPage() {
             />
             <div className="divide-y divide-slate-100">
               {products.map((p) => (
-                <div key={p.id} className="px-5 py-3 flex items-center justify-between text-sm">
-                  <div>
-                    <p className="font-semibold">{p.name}</p>
-                    <p className="text-xs text-slate-500">{p.category || "-"}{p.description ? ` • ${p.description}` : ""}</p>
+                <div key={p.id} className="px-5 py-3 flex items-center justify-between gap-3 text-sm">
+                  <div className="min-w-0">
+                    <p className="break-words font-semibold">{p.name}</p>
+                    <p className="break-words text-xs text-slate-500">{p.category || "-"}{p.description ? ` • ${p.description}` : ""}</p>
                   </div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex shrink-0 items-center gap-3">
                     <p className="font-bold">{naira(p.sellingPrice)}</p>
                     <button
                       onClick={() => { setProdForm({ id: p.id, name: p.name, description: p.description || "", category: p.category || "Shirts", sellingPrice: String(p.sellingPrice) }); setErr(""); setProdModal(true); }}
@@ -260,7 +269,7 @@ export default function SettingsPage() {
       )}
 
       <Modal open={prodModal} onClose={() => setProdModal(false)} title={prodForm.id ? "Edit Product" : "Add Uniform Product"}>
-        <form onSubmit={saveProduct} className="grid sm:grid-cols-2 gap-3">
+        <form onSubmit={saveProduct} className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Product name *" className="sm:col-span-2"><input required value={prodForm.name} onChange={(e) => setProdForm({ ...prodForm, name: e.target.value })} className={inputCls} placeholder="e.g. Secondary School Shirt" /></Field>
           <Field label="Category">
             <select value={prodForm.category} onChange={(e) => setProdForm({ ...prodForm, category: e.target.value })} className={inputCls}>

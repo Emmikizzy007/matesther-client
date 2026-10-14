@@ -23,53 +23,59 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
 
   useEffect(() => {
     if (authLoading) return;
-    if (!user || !["WORKER", "PRODUCTION_MANAGER"].includes(user.role)) {
-      setD(null);
-      setErr("This page is for Matesther production staff. Please sign in with a Worker or Project Manager account.");
-      return;
-    }
-
     let active = true;
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 18000);
-    setD(null);
-    setErr("");
-    setInspections([]);
-    const url = user.role === "PRODUCTION_MANAGER" ? "/api/dashboard?view=my-work" : "/api/dashboard";
+    let pending: AbortController | null = null;
+    // Queued start keeps the effect body free of synchronous setState; the
+    // abort controller still cancels the in-flight requests on cleanup.
+    const start = window.setTimeout(() => {
+      if (!user || !["WORKER", "PRODUCTION_MANAGER"].includes(user.role)) {
+        setD(null);
+        setErr("This page is for Matesther production staff. Please sign in with a Worker or Project Manager account.");
+        return;
+      }
 
-    fetch(url, { cache: "no-store", credentials: "same-origin", signal: controller.signal })
-      .then(async (response) => {
-        const result = await response.json();
-        if (!response.ok || result.error) throw new Error(result.error || "Your work is temporarily unavailable.");
-        if (result.view !== "worker" || !Array.isArray(result.journal) || !Array.isArray(result.todayJobs) || !result.earnings)
-          throw new Error("Your personal work details are unavailable. Please try again or sign out and back in.");
-        return result;
-      })
-      .then((data) => {
-        if (!active) return;
-        setD(data);
-        const ids = data.journal.map((job: { id: number }) => job.id);
-        if (!ids.length) return;
-        fetch("/api/inspections?limit=200", { cache: "no-store", credentials: "same-origin", signal: controller.signal })
-          .then((response) => response.ok ? response.json() : [])
-          .then((rows: any) => {
-            if (active) setInspections(Array.isArray(rows) ? rows.filter((check: { productionOperationId: number }) => ids.includes(check.productionOperationId)) : []);
-          })
-          .catch(() => { if (active) setInspections([]); });
-      })
-      .catch((cause) => {
-        if (active) setErr(cause instanceof Error && cause.name === "AbortError"
-          ? "Your work took too long to load. Check your connection and try again."
-          : cause instanceof Error ? cause.message : "Your work is temporarily unavailable.");
-      })
-      .finally(() => window.clearTimeout(timeout));
+      const controller = new AbortController();
+      pending = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 18000);
+      setD(null);
+      setErr("");
+      setInspections([]);
+      const url = user.role === "PRODUCTION_MANAGER" ? "/api/dashboard?view=my-work" : "/api/dashboard";
+
+      fetch(url, { cache: "no-store", credentials: "same-origin", signal: controller.signal })
+        .then(async (response) => {
+          const result = await response.json();
+          if (!response.ok || result.error) throw new Error(result.error || "Your work is temporarily unavailable.");
+          if (result.view !== "worker" || !Array.isArray(result.journal) || !Array.isArray(result.todayJobs) || !result.earnings)
+            throw new Error("Your personal work details are unavailable. Please try again or sign out and back in.");
+          return result;
+        })
+        .then((data) => {
+          if (!active) return;
+          setD(data);
+          const ids = data.journal.map((job: { id: number }) => job.id);
+          if (!ids.length) return;
+          fetch("/api/inspections?limit=200", { cache: "no-store", credentials: "same-origin", signal: controller.signal })
+            .then((response) => response.ok ? response.json() : [])
+            .then((rows: any) => {
+              if (active) setInspections(Array.isArray(rows) ? rows.filter((check: { productionOperationId: number }) => ids.includes(check.productionOperationId)) : []);
+            })
+            .catch(() => { if (active) setInspections([]); });
+        })
+        .catch((cause) => {
+          if (active) setErr(cause instanceof Error && cause.name === "AbortError"
+            ? "Your work took too long to load. Check your connection and try again."
+            : cause instanceof Error ? cause.message : "Your work is temporarily unavailable.");
+        })
+        .finally(() => window.clearTimeout(timeout));
+    }, 0);
 
     return () => {
       active = false;
-      window.clearTimeout(timeout);
-      controller.abort();
+      window.clearTimeout(start);
+      pending?.abort();
     };
-  }, [authLoading, user?.email, user?.role, retry]);
+  }, [authLoading, user, retry]);
 
   async function doSubmit(e: React.FormEvent) {
     e.preventDefault();

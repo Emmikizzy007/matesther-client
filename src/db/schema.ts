@@ -142,6 +142,10 @@ export const workers = pgTable("workers", {
   jobTitle: text("job_title"),
   paymentType: text("payment_type").notNull().default("PER_PIECE"),
   paymentRate: integer("payment_rate").notNull().default(0),
+  // Payroll payout detail for the Monthly Staff Bank Payment Schedule.
+  // Owner-managed and Owner-read only; the bank sheet flags a missing or
+  // malformed number and never invents one.
+  bankAccountNumber: text("bank_account_number"),
   isInspector: boolean("is_inspector").notNull().default(false),
   status: text("status").notNull().default("ACTIVE"),
   archivedAt: timestamp("archived_at"),
@@ -1334,6 +1338,11 @@ export const payrollDeductions = pgTable("payroll_deductions", {
   incidentLossAmount: integer("incident_loss_amount"), // net provable loss, after unpaid rejected work
   incidentFindings: text("incident_findings"),
   incidentLossBasis: text("incident_loss_basis"),
+  /** A reviewed production incident (damaged/lost/incomplete clothes) this
+   * charge follows from. The incident is evidence and review history only: it
+   * never deducts money by itself, and at most one active or booked deduction
+   * may ever claim it. */
+  incidentProductionId: integer("incident_production_id").references(() => productionIncidents.id),
   attendanceId: integer("attendance_id").references(() => payrollAttendance.id),
   workingDays: integer("working_days"), // documented month policy, not inferred calendar days
   annualGross: integer("annual_gross"),
@@ -1364,6 +1373,11 @@ export const payrollDeductions = pgTable("payroll_deductions", {
     .where(sql`${table.status} in ('PENDING','APPROVED')`),
   uniqueIndex("payroll_deduction_support_incident_active_unique").on(table.incidentSupportInspectionId, table.workerId)
     .where(sql`${table.status} in ('PENDING','APPROVED')`),
+  // One active claim per reviewed production incident, whatever its category.
+  // The API also checks the posted line ledger so a cancelled-but-already-booked
+  // case can never be charged a second time.
+  uniqueIndex("payroll_deduction_incident_production_active_unique").on(table.incidentProductionId)
+    .where(sql`${table.status} in ('PENDING','APPROVED') and ${table.incidentProductionId} is not null`),
   // Cancelled, never-posted proposals may be corrected and resubmitted; an
   // active proposal may still be the only claim on one recorded day.
   uniqueIndex("payroll_deduction_attendance_active_unique").on(table.attendanceId)
@@ -1481,4 +1495,139 @@ export const payrollReversals = pgTable("payroll_reversals", {
   index("payroll_reversal_month_idx").on(table.organizationId, table.targetMonth, table.status),
   check("payroll_reversal_amount_check", sql`${table.amount} > 0`),
   check("payroll_reversal_status_check", sql`${table.status} in ('PENDING','APPROVED','CANCELLED','REJECTED')`),
+]);
+
+/** Workers' cooperative savings: a WITHDRAWAL request against a worker's own
+ * savings. Requests, approvals and rejections move no money. Only the PAID row
+ * counts against the fund, and only when the actual cash/bank payment has been
+ * completed and recorded. The contribution side of the same fund is the posted
+ * `payroll_statement_lines.cooperative_credit` ledger; there is no second
+ * mutable balance anywhere. Balance = posted credits − paid withdrawals +
+ * approved adjustments, always computed, never stored. */
+export const payrollCooperativeWithdrawals = pgTable("payroll_cooperative_withdrawals", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  amount: integer("amount").notNull(),
+  reason: text("reason").notNull(),
+  status: text("status").notNull().default("REQUESTED"),
+  requestedById: integer("requested_by_id").references(() => users.id, { onDelete: "set null" }),
+  requestedByName: text("requested_by_name").notNull(),
+  requestedAt: timestamp("requested_at").defaultNow().notNull(),
+  reviewedById: integer("reviewed_by_id").references(() => users.id, { onDelete: "set null" }),
+  reviewedByName: text("reviewed_by_name"),
+  reviewedAt: timestamp("reviewed_at"),
+  reviewReason: text("review_reason"),
+  paidOn: date("paid_on"),
+  paymentMethod: text("payment_method"),
+  paymentReference: text("payment_reference"),
+  paymentNotes: text("payment_notes"),
+  paidById: integer("paid_by_id").references(() => users.id, { onDelete: "set null" }),
+  paidByName: text("paid_by_name"),
+  paidAt: timestamp("paid_at"),
+}, (table) => [
+  index("payroll_coop_withdrawal_org_status_idx").on(table.organizationId, table.status),
+  index("payroll_coop_withdrawal_worker_idx").on(table.workerId),
+  check("payroll_coop_withdrawal_status_check", sql`${table.status} in ('REQUESTED','APPROVED','REJECTED','CANCELLED','PAID')`),
+  check("payroll_coop_withdrawal_amount_check", sql`${table.amount} > 0`),
+  // A row can only claim to be paid with the payment date and recorder present.
+  check("payroll_coop_withdrawal_paid_fields_check",
+    sql`(${table.status} <> 'PAID') or (${table.paidOn} is not null and ${table.paidById} is not null)`),
+  // The same bank/cash reference can never complete two cooperative payments.
+  uniqueIndex("payroll_coop_withdrawal_payment_ref_unique").on(table.organizationId, table.paymentReference)
+    .where(sql`${table.status} = 'PAID' and ${table.paymentReference} is not null`),
+]);
+
+/** An authorised correction to a worker's cooperative fund (bank charges,
+ * clerical fixes, court orders). Signed amounts; only APPROVED rows change the
+ * computed balance. Approved by a different account than the creator. */
+export const payrollCooperativeAdjustments = pgTable("payroll_cooperative_adjustments", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  amount: integer("amount").notNull(), // signed: negative recovers from the fund
+  reason: text("reason").notNull(),
+  reference: text("reference"),
+  status: text("status").notNull().default("PENDING"),
+  createdById: integer("created_by_id").references(() => users.id, { onDelete: "set null" }),
+  createdByName: text("created_by_name").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  approvedById: integer("approved_by_id").references(() => users.id, { onDelete: "set null" }),
+  approvedByName: text("approved_by_name"),
+  approvedAt: timestamp("approved_at"),
+  decisionReason: text("decision_reason"),
+}, (table) => [
+  index("payroll_coop_adjustment_org_status_idx").on(table.organizationId, table.status),
+  index("payroll_coop_adjustment_worker_idx").on(table.workerId),
+  check("payroll_coop_adjustment_status_check", sql`${table.status} in ('PENDING','APPROVED','REJECTED','CANCELLED')`),
+  check("payroll_coop_adjustment_amount_check", sql`${table.amount} <> 0`),
+]);
+
+/** A production incident recorded against an EXISTING work assignment, even
+ * when that work has not been completed, inspected or approved: incomplete
+ * work, damaged clothes, lost/missing clothes or another documented incident.
+ * Recording an incident never deducts money. The company reviews it, establishes
+ * responsibility, and only an approved incident may support (at most one)
+ * separately proposed and reviewed payroll deduction. */
+export const productionIncidents = pgTable("production_incidents", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  assignmentSource: text("assignment_source").notNull(),
+  productionOperationId: integer("production_operation_id").references(() => productionOperations.id),
+  supportAssignmentId: integer("support_assignment_id").references(() => supportAssignments.id),
+  incidentType: text("incident_type").notNull(),
+  description: text("description").notNull(),
+  assignedQuantity: integer("assigned_quantity"),
+  completedQuantity: integer("completed_quantity"),
+  incompleteQuantity: integer("incomplete_quantity"),
+  damagedQuantity: integer("damaged_quantity"),
+  missingQuantity: integer("missing_quantity"),
+  proposedAmount: integer("proposed_amount"),
+  proposedCalculation: text("proposed_calculation"),
+  status: text("status").notNull().default("REPORTED"),
+  reportedById: integer("reported_by_id").references(() => users.id, { onDelete: "set null" }),
+  reportedByName: text("reported_by_name").notNull(),
+  reportedAt: timestamp("reported_at").defaultNow().notNull(),
+  reviewedById: integer("reviewed_by_id").references(() => users.id, { onDelete: "set null" }),
+  reviewedByName: text("reviewed_by_name"),
+  reviewedAt: timestamp("reviewed_at"),
+  reviewReason: text("review_reason"),
+  /** Money justified by the review; the linked deduction may not exceed it. */
+  approvedAmount: integer("approved_amount"),
+}, (table) => [
+  index("production_incident_org_idx").on(table.organizationId, table.status),
+  index("production_incident_worker_idx").on(table.workerId),
+  index("production_incident_stage_idx").on(table.productionOperationId),
+  index("production_incident_support_idx").on(table.supportAssignmentId),
+  check("production_incident_source_check",
+    sql`(${table.assignmentSource} = 'STAGE_OPERATION' and ${table.productionOperationId} is not null and ${table.supportAssignmentId} is null) or (${table.assignmentSource} = 'SUPPORT_ASSIGNMENT' and ${table.supportAssignmentId} is not null and ${table.productionOperationId} is null)`),
+  check("production_incident_type_check",
+    sql`${table.incidentType} in ('INCOMPLETE_WORK','DAMAGED_CLOTHES','LOST_CLOTHES','OTHER')`),
+  check("production_incident_status_check",
+    sql`${table.status} in ('REPORTED','CORRECTION_ONLY','APPROVED_FOR_DEDUCTION','REJECTED','CANCELLED')`),
+  check("production_incident_quantities_check",
+    sql`coalesce(${table.assignedQuantity}, 0) >= 0 and coalesce(${table.completedQuantity}, 0) >= 0 and coalesce(${table.incompleteQuantity}, 0) >= 0 and coalesce(${table.damagedQuantity}, 0) >= 0 and coalesce(${table.missingQuantity}, 0) >= 0`),
+  check("production_incident_proposed_amount_check",
+    sql`${table.proposedAmount} is null or ${table.proposedAmount} > 0`),
+  check("production_incident_approved_amount_check",
+    sql`${table.approvedAmount} is null or (${table.approvedAmount} > 0 and ${table.proposedAmount} is not null and ${table.approvedAmount} <= ${table.proposedAmount})`),
+  // One OPEN incident of a type per assignment and responsible worker. A
+  // cancelled or rejected incident may be corrected and resubmitted.
+  uniqueIndex("production_incident_stage_active_unique").on(table.organizationId, table.productionOperationId, table.incidentType)
+    .where(sql`${table.status} in ('REPORTED','CORRECTION_ONLY','APPROVED_FOR_DEDUCTION') and ${table.productionOperationId} is not null`),
+  uniqueIndex("production_incident_support_active_unique").on(table.organizationId, table.supportAssignmentId, table.incidentType)
+    .where(sql`${table.status} in ('REPORTED','CORRECTION_ONLY','APPROVED_FOR_DEDUCTION') and ${table.supportAssignmentId} is not null`),
+]);
+
+/** Per-user visibility of the Worker Payments dashboard cards. Pure display
+ * preference: it grants no permission and hides no financial record. */
+export const userDashboardCards = pgTable("user_dashboard_cards", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
+  cardKey: text("card_key").notNull(),
+  visible: boolean("visible").notNull().default(true),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  unique("user_dashboard_card_unique").on(table.userId, table.cardKey),
 ]);

@@ -99,6 +99,20 @@
       "when": 1791969882647,
       "tag": "0013_payroll-deductions",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1791976965879,
+      "tag": "0014_payroll-cooperative-incidents",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1791987604722,
+      "tag": "0015_worker-bank-account",
+      "breakpoints": true
     }
   ]
 }

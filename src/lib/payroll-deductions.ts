@@ -10,13 +10,30 @@ import { calculatePaye2026, type PayeAssessment, PAYE_RULE } from "@/lib/nigeria
 import type { SessionUser } from "@/lib/authz";
 
 export const BUILTIN_DEDUCTIONS = [
-  { code: "STATUTORY_TAX", name: "Statutory PAYE (2026)", kind: "TAX" },
+  // Everyday company deductions use the simplified workflow: worker, category,
+  // amount, payroll month, once-or-monthly. Nothing else is required on the form.
+  { code: "INTERNAL_TAX", name: "Tax", kind: "INTERNAL_TAX" },
   { code: "HOUSE_RENT", name: "House rent", kind: "COMPANY" },
   { code: "COOPERATIVE", name: "Cooperative savings", kind: "COOPERATIVE" },
-  { code: "ABSENCE", name: "Unpaid absence / leave", kind: "ATTENDANCE" },
-  { code: "DAMAGE", name: "Approved garment damage", kind: "DAMAGE" },
+  { code: "LOAN_REPAYMENT", name: "Loan repayment", kind: "COMPANY" },
   { code: "STAFF_OCCASION", name: "Staff occasion contribution", kind: "COMPANY" },
+  // Exceptional/statutory workflows keep their extra evidence, shown only for
+  // the selected category. STATUTORY_TAX is genuine government PAYE and stays
+  // completely separate from the internal "Tax" company deduction above.
+  { code: "STATUTORY_TAX", name: "Statutory PAYE (2026)", kind: "TAX" },
+  { code: "ABSENCE", name: "Unpaid absence / leave", kind: "ATTENDANCE" },
+  { code: "DAMAGE", name: "Production incident charge", kind: "DAMAGE" },
 ] as const;
+/** Built-in categories an ordinary administrator can create with just worker,
+ * category, amount, month and frequency. Custom categories behave the same. */
+export const SIMPLE_CATEGORIES = ["INTERNAL_TAX", "HOUSE_RENT", "COOPERATIVE", "LOAN_REPAYMENT", "STAFF_OCCASION"] as const;
+/** Categories where one worker may have at most one active arrangement for a
+ * payroll month, so a reopened or recalculated month can never be charged
+ * twice for the same obligation. */
+export const ONE_PER_MONTH_CATEGORIES = ["COOPERATIVE", "INTERNAL_TAX"] as const;
+/** Internal company "Tax": withheld from earnings by the company. NEVER
+ * statutory PAYE and never a tax remittance record. */
+export const INTERNAL_TAX_CODE = "INTERNAL_TAX";
 export const ATTENDANCE_STATUSES = ["PRESENT", "UNAUTHORIZED_ABSENCE", "UNPAID_LEAVE", "APPROVED_LEAVE", "PAID_LEAVE", "OTHER"] as const;
 export type Deduction = typeof payrollDeductions.$inferSelect;
 export type Reversal = typeof payrollReversals.$inferSelect;

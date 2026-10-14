@@ -172,7 +172,10 @@ function AssignProduction() {
       setError(cause instanceof Error ? cause.message : "Could not load assignment options.");
     } finally { setLoading(false); }
   }, [requestedOrderId]);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [load]);
 
   const order = orders.find((record) => String(record.id) === form.orderId);
   const item = order?.items.find((record) => String(record.id) === form.itemId);
@@ -375,7 +378,7 @@ function AssignProduction() {
                     <strong>{item.name}</strong> has no route assigned, so new batches follow{" "}
                     {routes.some((route) => !route.productId && route.isDefault)
                       ? <>the organisation default, <strong>{routes.find((route) => !route.productId && route.isDefault)?.name}</strong>.</>
-                      : <>Matesther's standard eight-stage route.</>}{" "}
+                      : <>Matesther&apos;s standard eight-stage route.</>}{" "}
                     <Link href="/production/routes" className="font-semibold text-matesther-700 hover:underline">Assign one</Link>
                   </>
                 )}

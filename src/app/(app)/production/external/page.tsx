@@ -90,7 +90,10 @@ export default function ExternalWorkPage() {
       setError(cause instanceof Error ? cause.message : "Could not load external production work.");
     } finally { setLoading(false); }
   }
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   async function post(url: string, body: unknown, method = "POST", okMessage = "") {
     setBusy(true); setError(""); setNotice("");

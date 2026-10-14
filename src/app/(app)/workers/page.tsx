@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Plus, Pencil, Phone, Trash2, Archive, RotateCcw } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, EmptyState, Modal, Field, inputCls, Btn } from "@/components/ui";
@@ -16,7 +16,7 @@ export default function WorkersPage() {
   const [loadError, setLoadError] = useState("");
   const [modal, setModal] = useState(false);
   const [editing, setEditing] = useState<any>(null);
-  const [form, setForm] = useState({ name: "", phone: "", roles: ["Tailor"], department: "", jobTitle: "", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false });
+  const [form, setForm] = useState({ name: "", phone: "", roles: ["Tailor"], department: "", jobTitle: "", paymentType: "PER_PIECE", paymentRate: "", bankAccountNumber: "", status: "ACTIVE", isInspector: false });
   const [history, setHistory] = useState<any>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -34,7 +34,12 @@ export default function WorkersPage() {
       .catch((cause) => setLoadError(cause instanceof Error ? cause.message : "Unable to load workers."))
       .finally(() => setLoading(false));
   }
-  useEffect(load, [showArchived]);
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const id = window.setTimeout(() => { void loadRef.current(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [showArchived]);
 
   async function removeWorker(person: any) {
     const action = person.hasHistory ? "archive" : "permanently delete";
@@ -101,7 +106,7 @@ export default function WorkersPage() {
         subtitle="Cutters, tailors, buttonhole, button tacking, ironers and packers - who is doing what"
         action={<>
           <Btn variant="secondary" onClick={() => setShowArchived((current) => !current)}>{showArchived ? "Active only" : "Show archived"}</Btn>
-          {isOwner && <Btn onClick={() => { setEditing(null); setForm({ name: "", phone: "", roles: ["Tailor"], department: "", jobTitle: "", paymentType: "PER_PIECE", paymentRate: "", status: "ACTIVE", isInspector: false }); setErr(""); setModal(true); }}>
+          {isOwner && <Btn onClick={() => { setEditing(null); setForm({ name: "", phone: "", roles: ["Tailor"], department: "", jobTitle: "", paymentType: "PER_PIECE", paymentRate: "", bankAccountNumber: "", status: "ACTIVE", isInspector: false }); setErr(""); setModal(true); }}>
             <Plus className="w-4 h-4" /> Add Worker
           </Btn>}
         </>}
@@ -162,7 +167,7 @@ export default function WorkersPage() {
                       {isOwner && <>
                         <button title={`Edit ${w.name}`} aria-label={`Edit ${w.name}`} onClick={() => {
                           setEditing(w);
-                          setForm({ name: w.name, phone: w.phone || "", roles: Array.isArray(w.roles) && w.roles.length ? w.roles : [w.specialty], department: w.department || "", jobTitle: w.jobTitle || "", paymentType: w.paymentType, paymentRate: String(w.paymentRate), status: w.status, isInspector: !!w.isInspector });
+                          setForm({ name: w.name, phone: w.phone || "", roles: Array.isArray(w.roles) && w.roles.length ? w.roles : [w.specialty], department: w.department || "", jobTitle: w.jobTitle || "", paymentType: w.paymentType, paymentRate: String(w.paymentRate), bankAccountNumber: w.bankAccountNumber || "", status: w.status, isInspector: !!w.isInspector });
                           setErr(""); setModal(true);
                         }} className="p-1 text-slate-500 hover:text-matesther-700"><Pencil className="w-4 h-4" /></button>
                         {w.status === "ACTIVE" ? <button title={w.hasHistory ? `Archive ${w.name}` : `Delete ${w.name}`} aria-label={w.hasHistory ? `Archive ${w.name}` : `Delete ${w.name}`}
@@ -218,6 +223,17 @@ export default function WorkersPage() {
           </Field>
           {form.paymentType === "PER_PIECE" ? <p className="self-end rounded-lg border border-matesther-100 bg-matesther-50 p-2 text-xs text-matesther-800">Agree the price per garment when assigning each production job. This profile does not fix one price for all clothes.</p>
             : <Field label={["MONTHLY", "HYBRID"].includes(form.paymentType) ? "Monthly salary (₦)" : "Daily rate (₦)"}><input type="number" min="0" value={form.paymentRate} onChange={(e) => setForm({ ...form, paymentRate: e.target.value })} className={inputCls} /></Field>}
+          {isOwner && (
+            <Field label="Bank account number" className="sm:col-span-2">
+              <input
+                value={form.bankAccountNumber}
+                onChange={(e) => setForm({ ...form, bankAccountNumber: e.target.value })}
+                className={inputCls}
+                inputMode="numeric"
+                placeholder="For the Monthly Staff Bank Payment Schedule"
+              />
+            </Field>
+          )}
           {form.paymentType === "HYBRID" && <p className="sm:col-span-2 text-xs text-amber-900 bg-amber-50 rounded-lg p-2">Salary is added monthly; piece rates are agreed on individual jobs and paid only on approved pieces. To protect past payroll, changing an established worker into or out of this payment type is blocked.</p>}
           <label className="flex items-center gap-2 text-sm text-slate-700 sm:col-span-2">
             <input type="checkbox" checked={!!form.isInspector} onChange={(e) => setForm({ ...form, isInspector: e.target.checked })} className="accent-matesther-700" />

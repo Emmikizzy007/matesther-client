@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { asc, desc, eq } from "drizzle-orm";
+import { asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "@/db";
 import { orderFulfilment } from "@/lib/production-control";
 import { customers, deliveries, deliveryLines, orderItems, orderItemSizes, orders, organizations, products } from "@/db/schema";
@@ -80,6 +80,20 @@ export async function GET(req: Request) {
       ]);
       const order = orderRows[0];
       if (!order) return NextResponse.json({ error: "Order not found." }, { status: 404 });
+      // Colour per delivery line, resolved from the order variants (one batched
+      // read). A line whose (item, size) maps to exactly one colour shows it;
+      // anything ambiguous is left blank rather than guessed.
+      const sizeRows = items.length
+        ? await db.select().from(orderItemSizes).where(inArray(orderItemSizes.orderItemId, items.map((item) => item.id)))
+        : [];
+      const colourByVariant = new Map<string, Set<string>>();
+      for (const row of sizeRows) {
+        if (!row.color) continue;
+        const key = `${row.orderItemId}|${String(row.size ?? "").toUpperCase()}`;
+        const set = colourByVariant.get(key) ?? new Set<string>();
+        set.add(row.color);
+        colourByVariant.set(key, set);
+      }
       const customer = customerRows.find((row) => row.id === order.customerId);
       const orderedQty = items.reduce((sum, item) => sum + item.quantity, 0);
       const shippedBefore = allDeliveries
@@ -87,8 +101,16 @@ export async function GET(req: Request) {
         .reduce((sum, row) => sum + row.deliveredQuantity, 0);
       return NextResponse.json({
         delivery: { ...delivery, deliveryNumber: `MTH-DLV-${String(delivery.id).padStart(4, "0")}` },
-        lines: lines.length ? lines.map((line) => ({ description: line.description, size: line.size, quantity: line.quantity })) : [
-          { description: "School uniforms (garment breakdown not recorded)", size: null, quantity: delivery.deliveredQuantity },
+        lines: lines.length ? lines.map((line) => {
+          const colours = colourByVariant.get(`${line.orderItemId}|${String(line.size ?? "").toUpperCase()}`);
+          return {
+            description: line.description,
+            size: line.size,
+            quantity: line.quantity,
+            colour: colours && colours.size === 1 ? [...colours][0] : null,
+          };
+        }) : [
+          { description: "School uniforms (garment breakdown not recorded)", size: null, quantity: delivery.deliveredQuantity, colour: null },
         ],
         legacySummary: lines.length === 0,
         order: { orderNumber: order.orderNumber, orderDate: order.orderDate, orderedQuantity: orderedQty, shippedBefore, remainingAfter: Math.max(0, orderedQty - shippedBefore - delivery.deliveredQuantity) },

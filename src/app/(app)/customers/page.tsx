@@ -24,7 +24,12 @@ export default function CustomersPage() {
       .then((d) => setRows(Array.isArray(d) ? d : []))
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  // Loading runs in the queued timeout, not synchronously during the effect,
+  // so no setState happens inside the effect body itself.
+  useEffect(() => {
+    const id = window.setTimeout(load, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   function openNew() {
     setEditing(null);

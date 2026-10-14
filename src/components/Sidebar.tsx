@@ -35,7 +35,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useAuth, roleLabel, Role } from "@/lib/auth";
-import { BrandLogo } from "@/components/BrandLogo";
+import { LogoLink } from "@/components/LogoLink";
 import { InstallPrompt } from "@/components/InstallPrompt";
 
 type NavItem = { href: string; label: string; icon: any };
@@ -158,7 +158,7 @@ function navForRole(role: Role): NavGroup[] {
 function Brand() {
   return (
     <div className="flex items-center gap-3 px-5 pb-5 pt-[max(1.25rem,env(safe-area-inset-top))]">
-      <BrandLogo className="h-10 w-10 rounded-lg" />
+      <LogoLink className="h-10 w-10 rounded-lg" />
       <div>
         <p className="font-extrabold tracking-wide text-white text-lg leading-none">MATESTHER</p>
         <p className="text-[10px] text-matesther-100/80 mt-1 leading-tight">
@@ -289,10 +289,7 @@ export default function Sidebar() {
     <>
       {/* mobile top bar */}
       <div className="lg:hidden flex items-center justify-between bg-matesther-900 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] sticky top-0 z-40">
-        <div className="flex items-center gap-2">
-          <BrandLogo className="h-8 w-8 rounded-lg" />
-          <span className="font-extrabold text-white tracking-wide">MATESTHER</span>
-        </div>
+        <LogoLink className="h-8 w-8 rounded-lg" showWordmark />
         <button
           onClick={() => setOpen(!open)}
           className="flex h-11 w-11 items-center justify-center rounded-lg text-white hover:bg-white/10"

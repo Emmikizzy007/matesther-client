@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CalendarClock, CheckCircle2, ClipboardCheck, Search } from "lucide-react";
 import { Badge, Btn, Card, Loading, PageHeader, inputCls } from "@/components/ui";
 import { SchoolOrderGroups } from "@/components/SchoolOrderGroups";
@@ -82,7 +82,12 @@ export default function ProductionHistoryPage() {
   }
   // Changing the status or stage filter re-queries the database instead of
   // re-filtering a download of everything.
-  useEffect(() => { void load(); }, [filter, stage]); // eslint-disable-line react-hooks/exhaustive-deps
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const id = window.setTimeout(() => { void loadRef.current(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [filter, stage]);
 
   function loadMore() {
     setError("");

@@ -16,6 +16,7 @@ import {
   inputCls,
   Btn,
 } from "@/components/ui";
+import { SkeletonTable, LoadError } from "@/components/Skeleton";
 import { naira, fmtDate } from "@/lib/format";
 
 const PAY_METHODS = ["Cash", "Bank Transfer", "POS", "Other"];
@@ -43,14 +44,28 @@ export default function PayrollPage() {
   const [workers, setWorkers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
+  const [formErr, setFormErr] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // Which information cards this user wants on the dashboard (pure display
+  // preference — nothing financial is hidden or granted by it).
+  const [cards, setCards] = useState<any[]>([]);
+  const [cardsOpen, setCardsOpen] = useState(false);
+  const [cardsDraft, setCardsDraft] = useState<any[]>([]);
+
+  // "Cooperative Savings" card: real ledger totals, searchable members, and
+  // each member's balance/history. The company total is the sum of balances.
+  const [coop, setCoop] = useState<any>(null);
+  const [coopSearch, setCoopSearch] = useState("");
+  const [coopDeferred, setCoopDeferred] = useState("");
+  const [coopHistory, setCoopHistory] = useState<any>(null);
+  const [coopErr, setCoopErr] = useState("");
 
   const [payModal, setPayModal] = useState<any>(null);
   const [payForm, setPayForm] = useState({ workerId: "", pieceworkAmount: "", supportAmount: "", salaryAmount: "", overtimeAmount: "", otherAmount: "", amount: "", method: "Bank Transfer", paymentDate: new Date().toISOString().slice(0, 10), reference: "", notes: "" });
   const [otModal, setOtModal] = useState(false);
   const [otForm, setOtForm] = useState({ workerId: "", workedOn: new Date().toISOString().slice(0, 10), hours: "", amount: "", category: "OVERTIME", notes: "" });
   const [historyFor, setHistoryFor] = useState<any>(null);
-  const [formErr, setFormErr] = useState("");
-  const [saving, setSaving] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -68,6 +83,60 @@ export default function PayrollPage() {
     const id = window.setTimeout(load, 0);
     return () => window.clearTimeout(id);
   }, [load]);
+
+  useEffect(() => {
+    fetch("/api/dashboard-cards", { cache: "no-store" }).then((r) => r.json())
+      .then((p) => { if (p.cards) setCards(p.cards); })
+      .catch(() => setCards([]));
+  }, []);
+  useEffect(() => {
+    const t = window.setTimeout(() => setCoopDeferred(coopSearch), 250);
+    return () => window.clearTimeout(t);
+  }, [coopSearch]);
+  useEffect(() => {
+    const q = new URLSearchParams({ view: "members", limit: "50" });
+    if (coopDeferred) q.set("search", coopDeferred);
+    fetch(`/api/payroll-deductions/cooperative?${q}`, { cache: "no-store" }).then((r) => r.json())
+      .then((p) => { setCoop(p.error ? null : p); setCoopErr(p.error ?? ""); })
+      .catch((e) => setCoopErr(e instanceof Error ? e.message : "Could not load the cooperative ledger."));
+  }, [coopDeferred]);
+
+  const cardVisible = (key: string) => {
+    const card = cards.find((c: any) => c.key === key);
+    return card ? card.visible !== false : true;
+  };
+  function openCardPicker() {
+    setCardsDraft(cards.map((c: any) => ({ key: c.key, label: c.label, visible: c.visible !== false })));
+    setCardsOpen(true);
+  }
+  async function saveCards(e: React.FormEvent) {
+    e.preventDefault();
+    setSaving(true); setFormErr("");
+    try {
+      const res = await fetch("/api/dashboard-cards", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cards: cardsDraft.map((c) => ({ key: c.key, visible: c.visible })) }),
+      });
+      const p = await res.json();
+      if (!res.ok) throw new Error(p.error || "Could not save the card selection.");
+      setCards(p.cards ?? cardsDraft.map((c) => ({ ...c, saved: true })));
+      setCardsOpen(false);
+    } catch (e: any) {
+      setFormErr(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function openCoopHistory(row: any) {
+    if (coopHistory?.workerId === row.workerId) { setCoopHistory(null); return; }
+    setCoopHistory({ workerId: row.workerId, workerName: row.workerName, loading: true });
+    try {
+      const p = await fetch(`/api/payroll-deductions/cooperative?workerId=${row.workerId}`, { cache: "no-store" }).then((r) => r.json());
+      setCoopHistory({ ...row, ...p, loading: false });
+    } catch (e: any) {
+      setCoopHistory(null); setCoopErr(e.message);
+    }
+  }
 
   function pickPayWorker(id: string) {
     const row = d?.workers.find((w: any) => String(w.workerId) === id);
@@ -133,7 +202,7 @@ export default function PayrollPage() {
 
   const payTotal = (Number(payForm.pieceworkAmount) || 0) + (Number(payForm.supportAmount) || 0) + (Number(payForm.salaryAmount) || 0) + (Number(payForm.overtimeAmount) || 0) + (Number(payForm.otherAmount) || 0);
 
-  if (err) return <p className="text-sm text-red-700">Failed to load: {err}</p>;
+  if (err) return <LoadError message={`Failed to load worker payments: ${err}`} onRetry={load} />;
 
   return (
     <div>
@@ -167,17 +236,22 @@ export default function PayrollPage() {
               <ChevronRight className="w-4 h-4" />
             </button>
           </div>
-          <p className="text-xs text-slate-500">
-            {month < monthKey(new Date()) ? "Past month - historical records" : "Current month - amounts update as work gets inspected"}
-          </p>
+          <div className="flex items-center gap-3">
+            <p className="text-xs text-slate-500">
+              {month < monthKey(new Date()) ? "Past month - historical records" : "Current month - amounts update as work gets inspected"}
+            </p>
+            <button type="button" onClick={openCardPicker} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 min-h-9">
+              Customise cards
+            </button>
+          </div>
         </div>
         {d && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
-            <StatCard label="Net Preview / Posted (this month)" value={naira(d.totals.due)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`${d.workers.filter((w: any) => w.due > 0).length} workers with earnings`} />
-            <StatCard label="All Deductions" value={naira(d.breakdown?.totalDeductions ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="red" sub="Helper allocation + approved PAYE + company deductions (preview or posted)" />
-            <StatCard label="Already Paid" value={naira(d.totals.paid)} icon={<HandCoins className="w-5 h-5" />} tone="green" />
-            <StatCard label="Still Owed" value={naira(d.totals.balance)} icon={<HandCoins className="w-5 h-5" />} tone={d.totals.balance > 0 ? "red" : "green"} sub={d.totals.balance > 0 ? "Settle before month end" : "All settled ✓"} />
-            <StatCard label="Piecework Share" value={naira(d.workers.reduce((s: number, w: any) => s + w.piecework, 0))} icon={<HandCoins className="w-5 h-5" />} tone="blue" sub="Approved pieces × rate — gross, before any support deduction" />
+            {cardVisible("net-preview") && <StatCard label="Net Preview / Posted (this month)" value={naira(d.totals.due)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`${d.workers.filter((w: any) => w.due > 0).length} workers with earnings`} />}
+            {cardVisible("all-deductions") && <StatCard label="All Deductions" value={naira(d.breakdown?.totalDeductions ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="red" sub="Helper allocation + approved PAYE + company deductions (preview or posted)" />}
+            {cardVisible("already-paid") && <StatCard label="Already Paid" value={naira(d.totals.paid)} icon={<HandCoins className="w-5 h-5" />} tone="green" />}
+            {cardVisible("still-owed") && <StatCard label="Still Owed" value={naira(d.totals.balance)} icon={<HandCoins className="w-5 h-5" />} tone={d.totals.balance > 0 ? "red" : "green"} sub={d.totals.balance > 0 ? "Settle before month end" : "All settled ✓"} />}
+            {cardVisible("piecework-share") && <StatCard label="Piecework Share" value={naira(d.workers.reduce((s: number, w: any) => s + w.piecework, 0))} icon={<HandCoins className="w-5 h-5" />} tone="blue" sub="Approved pieces × rate — gross, before any support deduction" />}
             {/*
               Both sides of delegated support work, side by side. Matesther pays the helper
               directly, and takes the same amount back out of the commission of the tailor
@@ -185,14 +259,14 @@ export default function PayrollPage() {
               order's labour cost does not rise by either of them. Showing only one side
               is what made support labour look like an extra cost.
             */}
-            <StatCard
+            {cardVisible("support-paid-helpers") && <StatCard
               label="Support Paid to Helpers"
               value={naira(d.breakdown?.supportPiecework ?? 0)}
               icon={<HandCoins className="w-5 h-5" />}
               tone="green"
               sub={`${d.workers.filter((w: any) => (w.supportPieces ?? 0) > 0).length} helpers on approved pieces`}
-            />
-            <StatCard
+            />}
+            {cardVisible("deducted-tailors") && <StatCard
               label="Deducted from Tailors"
               value={naira(d.breakdown?.supportDeduction ?? 0)}
               icon={<HandCoins className="w-5 h-5" />}
@@ -202,16 +276,85 @@ export default function PayrollPage() {
                   ? `${naira(d.breakdown.supportDeductionOwed)} more held against a tailor with no commission this month — carried forward, never written off`
                   : "The same money as the line above, not an extra cost"
               }
-            />
+            />}
           </div>
         )}
       </Card>
+
+      {/* Cooperative Savings card — selectable in "Customise cards". Figures come
+          straight from the posted cooperative ledger; the company total is the
+          sum of the member balances and the savings belong to the workers. */}
+      {cardVisible("cooperative-savings") && (
+        <Card className="mb-4">
+          <CardHeader
+            title="Cooperative Savings"
+            subtitle="Workers' own savings fund — separate from company income. Contributions come from posted payroll; only a recorded withdrawal payment reduces the fund."
+          />
+          {coopErr && <p className="px-4 pb-2 text-sm text-red-700">{coopErr}</p>}
+          {coop ? (
+            <div className="px-4 pb-4 space-y-3">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <StatCard label="Total held" value={naira(coop.totalHeld)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`= sum of ${coop.participating} member balance${coop.participating === 1 ? "" : "s"}`} />
+                <StatCard label="Contributed (posted)" value={naira(coop.totalContributions)} icon={<HandCoins className="w-5 h-5" />} tone="blue" />
+                <StatCard label="Withdrawn (paid)" value={naira(coop.totalWithdrawals)} icon={<HandCoins className="w-5 h-5" />} tone="red" />
+                <StatCard label="Authorised adjustments" value={naira(coop.totalAdjustments ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="green" sub="Approved corrections to the fund" />
+              </div>
+              <div className="flex flex-wrap items-end gap-3">
+                <Field label="Search members by name or ID">
+                  <input className={inputCls} value={coopSearch} onChange={(e) => setCoopSearch(e.target.value)} placeholder="Search workers…" />
+                </Field>
+                <p className="text-xs text-slate-500 pb-2">{coop.total} member{coop.total === 1 ? "" : "s"} · tap one for their balance history</p>
+              </div>
+              {coop.rows?.length ? (
+                <div className="divide-y divide-slate-100 rounded-lg border border-slate-100">
+                  {coop.rows.map((row: any) => (
+                    <div key={row.workerId}>
+                      <button type="button" onClick={() => openCoopHistory(row)} className="w-full flex flex-wrap items-center gap-3 p-3 text-sm text-left hover:bg-slate-50">
+                        <span className="flex-1 min-w-44">
+                          <strong>{row.workerName}</strong>
+                          <span className="block text-xs text-slate-500">
+                            contributed {naira(row.contributions)} · withdrawn {naira(row.withdrawals)}
+                            {row.adjustments ? ` · adjusted ${naira(row.adjustments)}` : ""}
+                          </span>
+                        </span>
+                        <strong className={row.balance < 0 ? "text-red-700" : "text-emerald-700"}>{naira(row.balance)}</strong>
+                      </button>
+                      {coopHistory?.workerId === row.workerId && (
+                        <div className="px-4 pb-3 text-xs">
+                          {coopHistory.loading ? <Loading label="Loading member ledger…" /> : (
+                            <div className="rounded-lg bg-slate-50 p-3 space-y-1">
+                              <p className="font-semibold text-slate-700">Balance {naira(coopHistory.balance)} · {coopHistory.total} posted transaction{coopHistory.total === 1 ? "" : "s"}</p>
+                              {(coopHistory.transactions ?? []).slice(0, 8).map((t: any) => (
+                                <p key={`${t.kind}-${t.line.id}`} className="flex justify-between gap-3">
+                                  <span>{t.periodMonth} · {t.line.description}</span>
+                                  <span className={t.line.cooperativeCredit < 0 ? "text-red-700" : "text-emerald-700"}>
+                                    {t.line.cooperativeCredit > 0 ? "+" : ""}{naira(t.line.cooperativeCredit)} · balance {naira(t.balanceAfter)}
+                                  </span>
+                                </p>
+                              ))}
+                              {coopHistory.total > 8 && <p className="text-slate-400">… {coopHistory.total - 8} more in the full ledger</p>}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState title="No members match" hint="Post a cooperative contribution in Payroll Deductions to start a member's savings." />
+              )}
+            </div>
+          ) : (
+            <Loading label="Loading the cooperative ledger…" />
+          )}
+        </Card>
+      )}
 
       {/* Payroll table */}
       <Card className="mb-4">
         <CardHeader title={`Who worked what - ${monthLabel(month)}`} subtitle="Pieceworkers earn only when their work is inspected & approved" />
         {loading ? (
-          <Loading />
+          <SkeletonTable rows={7} cols={6} bare label="Loading worker payments…" />
         ) : d?.workers.filter((w: any) => w.due > 0 || w.paid > 0 || w.deductionItems?.length).length === 0 ? (
           <EmptyState title={`No earnings recorded for ${monthLabel(month)}`} hint="Piecework appears here as soon as work is inspected; salaries appear for monthly staff." />
         ) : (
@@ -504,6 +647,31 @@ export default function PayrollPage() {
             )}
           </div>
         ) : null}
+      </Modal>
+
+      <Modal open={cardsOpen} onClose={() => setCardsOpen(false)} title="Customise dashboard cards">
+        <form onSubmit={saveCards} className="space-y-4">
+          <p className="text-xs text-slate-600">Choose which information cards appear on this dashboard. This only changes what you see — every figure stays available in Payroll Deductions and the reports.</p>
+          <div className="space-y-2">
+            {cardsDraft.map((card) => (
+              <label key={card.key} className="flex items-center gap-3 rounded-lg border border-slate-200 p-3 text-sm min-h-11">
+                <input
+                  type="checkbox"
+                  checked={card.visible}
+                  onChange={(e) => setCardsDraft((old) => old.map((c) => (c.key === card.key ? { ...c, visible: e.target.checked } : c)))}
+                />
+                <span className="font-semibold">{card.label}</span>
+                {card.key === "cooperative-savings" && <span className="text-xs text-slate-500">Workers&apos; fund totals, member balances and history</span>}
+              </label>
+            ))}
+            {!cardsDraft.length && <p className="text-xs text-slate-500">No cards to configure.</p>}
+          </div>
+          {formErr && <p role="alert" className="text-sm text-red-700 bg-red-50 rounded-lg p-2">{formErr}</p>}
+          <div className="flex justify-end gap-2">
+            <Btn variant="secondary" onClick={() => setCardsOpen(false)}>Cancel</Btn>
+            <Btn type="submit" disabled={saving}>{saving ? "Saving…" : "Save selection"}</Btn>
+          </div>
+        </form>
       </Modal>
     </div>
   );

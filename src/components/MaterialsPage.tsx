@@ -61,7 +61,10 @@ export default function MaterialsPage({
       })
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  useEffect(() => {
+    const id = window.setTimeout(load, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   async function submit(url: string, body: any, method: string) {
     setSaving(true);

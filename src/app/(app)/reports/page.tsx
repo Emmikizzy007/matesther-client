@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card, CardHeader, PageHeader, Badge, Loading, Btn } from "@/components/ui";
+import { SkeletonTable } from "@/components/Skeleton";
 import { naira, stageLabel } from "@/lib/format";
 
 function BarRow({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
@@ -26,46 +27,54 @@ export default function ReportsPage() {
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setErr("");
-    const timer = setTimeout(() => {
-      if (!cancelled) {
-        setErr("The report service is taking too long. The preview server may have gone to sleep - try again in a moment.");
-        setLoading(false);
-      }
-    }, 15000);
-    fetch("/api/reports", { cache: "no-store" })
-      .then((x) => {
-        if (!x.ok) throw new Error("Server error " + x.status);
-        return x.json();
-      })
-      .then((d) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Queued start keeps the effect body free of synchronous setState; the
+    // 15s watchdog still guards a report service that never answers.
+    const start = setTimeout(() => {
+      if (cancelled) return;
+      setLoading(true);
+      setErr("");
+      timer = setTimeout(() => {
         if (!cancelled) {
-          setR(d);
+          setErr("The report service is taking too long. The preview server may have gone to sleep - try again in a moment.");
           setLoading(false);
         }
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setErr(e.message || "Failed to load reports");
-          setLoading(false);
-        }
-      })
-      .finally(() => clearTimeout(timer));
+      }, 15000);
+      fetch("/api/reports", { cache: "no-store" })
+        .then((x) => {
+          if (!x.ok) throw new Error("Server error " + x.status);
+          return x.json();
+        })
+        .then((d) => {
+          if (!cancelled) {
+            setR(d);
+            setLoading(false);
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) {
+            setErr(e.message || "Failed to load reports");
+            setLoading(false);
+          }
+        })
+        .finally(() => clearTimeout(timer));
+    }, 0);
     return () => {
       cancelled = true;
+      clearTimeout(start);
+      clearTimeout(timer);
     };
   }, [retryKey]);
 
   if (err)
     return (
       <Card className="p-8 text-center">
-        <p className="text-sm font-semibold text-red-700">Couldn't load reports</p>
+        <p className="text-sm font-semibold text-red-700">Couldn&apos;t load reports</p>
         <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">{err}</p>
         <Btn className="mt-4" onClick={() => setRetryKey((k) => k + 1)}>Try again</Btn>
       </Card>
     );
-  if (!r) return <Loading label="Compiling reports…" />;
+  if (!r) return <SkeletonTable rows={6} cols={4} label="Compiling reports…" />;
 
   const maxProfit = Math.max(1, ...r.profitability.map((x: any) => Math.abs(x.profit)));
   const maxStage = Math.max(1, ...r.production.map((x: any) => x.approved));
@@ -147,7 +156,7 @@ export default function ReportsPage() {
             })}
           </div>
           {/*
-            An order's margin is a DIRECT-cost margin. Salaries and business-wide expenses
+            An order&apos;s margin is a DIRECT-cost margin. Salaries and business-wide expenses
             are real costs that belong to no single order, and Matesther has no rule for
             spreading them - so none is invented here; they are shown beside it instead.
           */}
