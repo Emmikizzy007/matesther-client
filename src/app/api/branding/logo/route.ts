@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { NextResponse } from "next/server";
@@ -22,6 +23,17 @@ function actualMime(buffer: Buffer): string | null {
 
 const BUNDLED_LOGO_PATH = join(process.cwd(), "public", "matesther-logo.png");
 let bundledLogoCache: Buffer | null | undefined;
+
+/** Bounded memo for the derived OS icons, keyed by source hash + size. */
+const iconMemo = new Map<string, Promise<Buffer>>();
+function iconCache(key: string, produce: () => Promise<Buffer>): Promise<Buffer> {
+  const hit = iconMemo.get(key);
+  if (hit) return hit;
+  const made = produce();
+  iconMemo.set(key, made);
+  if (iconMemo.size > 8) iconMemo.delete(iconMemo.keys().next().value as string);
+  return made;
+}
 
 /**
  * The official MATESTHER mark committed to `public/matesther-logo.png`. It is
@@ -62,15 +74,31 @@ export async function GET(req: Request) {
     if (!original) return new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
     const mime = hasUpload ? org!.logoMime! : "image/png";
 
+    // Content identity for cheap revalidation: the logo bytes only change when
+    // the Owner uploads a new file, so a hash of the source is a stable ETag.
+    const etag = `"${createHash("sha1").update(original).digest("hex").slice(0, 20)}"`;
+    const versioned = new URL(req.url).searchParams.has("v");
+    if (!versioned && req.headers.get("if-none-match") === etag)
+      return new Response(null, { status: 304, headers: { ETag: etag, "Cache-Control": "public, max-age=60" } });
+
     // Favicon / installed-app icons need square dimensions; fit and pad the same
     // original file without cropping, replacing, or redrawing its artwork.
+    // The result is memoised per (source, size): the expensive sharp pass then
+    // runs once per logo version instead of once per request.
     const bytes = size
-      ? await sharp(original).rotate().resize(size, size, { fit: "contain", background: "#000000" }).png().toBuffer()
+      ? await iconCache(`${etag}:${size}`, () =>
+          sharp(original).rotate().resize(size, size, { fit: "contain", background: "#000000" }).png().toBuffer()
+        )
       : original;
     return new Response(new Uint8Array(bytes), {
       headers: {
         "Content-Type": size ? "image/png" : mime,
-        "Cache-Control": "no-store, max-age=0",
+        // The logo was previously served no-store, so every page load (the
+        // sidebar shows it everywhere) re-downloaded the full image. A
+        // versioned URL (?v=..., used by Settings after an upload) is now
+        // immutable; bare URLs cache briefly and revalidate via ETag.
+        "Cache-Control": versioned ? "public, max-age=31536000, immutable" : "public, max-age=60",
+        ETag: etag,
         "X-Content-Type-Options": "nosniff",
       },
     });

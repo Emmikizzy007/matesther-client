@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { CheckCircle2, ChevronDown, ClipboardCheck, RefreshCcw, Search, XCircle } from "lucide-react";
 import { Badge, Btn, Card, EmptyState, Field, inputCls, Loading, Modal, PageHeader } from "@/components/ui";
@@ -73,7 +73,12 @@ export default function InspectionQueuePage() {
         .catch(() => setInspectors([]));
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load the Inspection Queue."); }
   }
-  useEffect(() => { void load(true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const id = window.setTimeout(() => { void loadRef.current(true); }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   function inspect(job: QueueJob) {
     if (user?.role === "PRODUCTION_MANAGER" && ownWorkerId !== null && job.workerId === ownWorkerId) {

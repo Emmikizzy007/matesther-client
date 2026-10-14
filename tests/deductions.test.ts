@@ -124,11 +124,16 @@ test("damage picker preserves stage versus support source even when numeric insp
     assert.throws(() => damageInspectionPayload(selection), /Choose one rejected/);
 });
 
-test("all six built-in categories are immutable; custom categories may be managed without code or historic renaming", async () => {
+test("all eight built-in categories are immutable; custom categories may be managed without code or historic renaming", async () => {
   const owner = await createOwner();
   const catalogue = await api("GET", "/api/payroll-deductions/categories", { cookie: owner.cookie });
   await expectStatus(catalogue, 200, "List categories");
-  assert.deepEqual(catalogue.data.builtins.map((c: any) => c.code), ["STATUTORY_TAX", "HOUSE_RENT", "COOPERATIVE", "ABSENCE", "DAMAGE", "STAFF_OCCASION"]);
+  assert.deepEqual(catalogue.data.builtins.map((c: any) => c.code),
+    ["INTERNAL_TAX", "HOUSE_RENT", "COOPERATIVE", "LOAN_REPAYMENT", "STAFF_OCCASION", "STATUTORY_TAX", "ABSENCE", "DAMAGE"]);
+  assert.equal(catalogue.data.builtins.find((c: any) => c.code === "INTERNAL_TAX").name, "Tax",
+    "The familiar Tax label is kept for the internal company deduction");
+  assert.equal(catalogue.data.builtins.find((c: any) => c.code === "STATUTORY_TAX").kind, "TAX",
+    "Statutory PAYE stays a separate category from the internal Tax deduction");
   const cat = await expectStatus(await api("POST", "/api/payroll-deductions/categories", {
     cookie: owner.cookie, body: { name: `Optional Staff Welfare ${suffix()}` },
   }), 201, "Add custom category");

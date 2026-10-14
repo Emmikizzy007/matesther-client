@@ -87,7 +87,7 @@ export default function ReceiptPage({ params }: { params: Promise<{ id: string }
         </div>
         {payment.notes && <p className="mt-6 text-xs text-[#62695c]">Payment note: {payment.notes}</p>}
         <p className="mt-8 font-serif text-[15px] font-semibold">Thank you for your payment.</p>
-        <p className="mt-1 text-xs text-[#6a7063]">Please retain this receipt for your school's records.</p>
+        <p className="mt-1 text-xs text-[#6a7063]">Please retain this receipt for your school&apos;s records.</p>
       </Letterhead>
     </main>
   );

@@ -21,7 +21,10 @@ export default function ProductsPage() {
       .then((d) => setRows(Array.isArray(d) ? d : []))
       .finally(() => setLoading(false));
   }
-  useEffect(load, []);
+  useEffect(() => {
+    const id = window.setTimeout(load, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   async function save(e: React.FormEvent) {
     e.preventDefault();

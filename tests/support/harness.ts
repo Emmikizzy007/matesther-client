@@ -38,6 +38,10 @@ import * as deductionPostRoute from "@/app/api/payroll-deductions/post/route";
 import * as deductionWorkerRoute from "@/app/api/payroll-deductions/workers/route";
 import * as deductionIncidentRoute from "@/app/api/payroll-deductions/incidents/route";
 import * as cooperativeRoute from "@/app/api/payroll-deductions/cooperative/route";
+import * as cooperativeWithdrawalRoute from "@/app/api/payroll-deductions/cooperative/withdrawals/route";
+import * as cooperativeAdjustmentRoute from "@/app/api/payroll-deductions/cooperative/adjustments/route";
+import * as productionIncidentsRoute from "@/app/api/production-incidents/route";
+import * as dashboardCardsRoute from "@/app/api/dashboard-cards/route";
 import * as reversalRoute from "@/app/api/payroll-deductions/reversals/route";
 import * as supportWorkRoute from "@/app/api/support-work/route";
 import * as supportInspectionsRoute from "@/app/api/support-work/inspections/route";
@@ -48,6 +52,7 @@ import * as productionAccessRoute from "@/app/api/production-access/route";
 import * as productionOrdersRoute from "@/app/api/production-orders/route";
 import * as paymentsRoute from "@/app/api/payments/route";
 import * as receiptsRoute from "@/app/api/receipts/route";
+import * as invoicesRoute from "@/app/api/invoices/route";
 import * as deliveriesRoute from "@/app/api/deliveries/route";
 import * as packingRoute from "@/app/api/packing/route";
 import * as expensesRoute from "@/app/api/expenses/route";
@@ -114,6 +119,17 @@ const ROUTES: Record<string, Handler> = {
   "GET /api/payroll-deductions/workers": deductionWorkerRoute.GET,
   "GET /api/payroll-deductions/incidents": deductionIncidentRoute.GET,
   "GET /api/payroll-deductions/cooperative": cooperativeRoute.GET,
+  "GET /api/payroll-deductions/cooperative/withdrawals": cooperativeWithdrawalRoute.GET,
+  "POST /api/payroll-deductions/cooperative/withdrawals": cooperativeWithdrawalRoute.POST,
+  "PUT /api/payroll-deductions/cooperative/withdrawals": cooperativeWithdrawalRoute.PUT,
+  "GET /api/payroll-deductions/cooperative/adjustments": cooperativeAdjustmentRoute.GET,
+  "POST /api/payroll-deductions/cooperative/adjustments": cooperativeAdjustmentRoute.POST,
+  "PUT /api/payroll-deductions/cooperative/adjustments": cooperativeAdjustmentRoute.PUT,
+  "GET /api/production-incidents": productionIncidentsRoute.GET,
+  "POST /api/production-incidents": productionIncidentsRoute.POST,
+  "PUT /api/production-incidents": productionIncidentsRoute.PUT,
+  "GET /api/dashboard-cards": dashboardCardsRoute.GET,
+  "PUT /api/dashboard-cards": dashboardCardsRoute.PUT,
   "GET /api/payroll-deductions/reversals": reversalRoute.GET,
   "POST /api/payroll-deductions/reversals": reversalRoute.POST,
   "PUT /api/payroll-deductions/reversals": reversalRoute.PUT,
@@ -129,6 +145,7 @@ const ROUTES: Record<string, Handler> = {
   "GET /api/payments": paymentsRoute.GET,
   "POST /api/payments": paymentsRoute.POST,
   "GET /api/receipts": receiptsRoute.GET,
+  "GET /api/invoices": invoicesRoute.GET,
   "GET /api/packing": packingRoute.GET,
   "POST /api/packing": packingRoute.POST,
   "GET /api/deliveries": deliveriesRoute.GET,

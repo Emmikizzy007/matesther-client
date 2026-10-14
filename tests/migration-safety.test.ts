@@ -458,8 +458,16 @@ test("the lifecycle, audit and payroll migrations are registered, in order, with
   }
   // Ordering matters: each snapshot's prevId chains to the one before it, and a file
   // applied out of order would build a table whose foreign key target is not there yet.
-  assert.deepEqual(tags.slice(-3), ["0011_support_lifecycle", "0012_deletion_and_purge_audit", "0013_payroll-deductions"]);
+  assert.deepEqual(tags.slice(-5), [
+    "0011_support_lifecycle",
+    "0012_deletion_and_purge_audit",
+    "0013_payroll-deductions",
+    "0014_payroll-cooperative-incidents",
+    "0015_worker-bank-account",
+  ]);
   assert.ok(fs.existsSync(path.join(REPO_ROOT, "drizzle/meta/0013_snapshot.json")));
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, "drizzle/meta/0014_snapshot.json")));
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, "drizzle/meta/0015_snapshot.json")));
   assert.deepEqual(
     journal.entries.map((entry) => entry.idx),
     journal.entries.map((_entry, index) => index),

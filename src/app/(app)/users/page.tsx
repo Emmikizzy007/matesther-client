@@ -43,7 +43,10 @@ export default function UsersPage() {
       setLoadError(cause instanceof Error ? cause.message : "Unable to load staff accounts.");
     } finally { setLoading(false); }
   }
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   function openNew() { setEditing(null); setForm(emptyForm()); setError(""); setModal(true); }
   function openEdit(account: Account) {

@@ -168,7 +168,10 @@ export default function ProductionControlPage() {
     }
   }, [queryString]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const id = setTimeout(() => { void load(); }, 0);
+    return () => clearTimeout(id);
+  }, [load]);
 
   function apply(next: Partial<typeof draft>) {
     setDraft((current) => ({ ...current, ...next }));

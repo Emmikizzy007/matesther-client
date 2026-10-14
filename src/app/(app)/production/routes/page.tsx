@@ -66,7 +66,10 @@ export default function ProductionRoutesPage() {
       setError(cause instanceof Error ? cause.message : "Could not load production routes.");
     } finally { setLoading(false); }
   }
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   function open(route: Route | "new") {
     setError(""); setSaved("");

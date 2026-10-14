@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { organizations, workerPayments, workers } from "@/db/schema";
 import { guard, getSessionUser, OWNER } from "@/lib/authz";
 import { monthLabel } from "@/lib/payroll";
+import { buildBankSchedule } from "@/lib/bank-schedule";
 import { getPayrollSummary, requiredOrganization } from "@/lib/payroll-deductions";
 
 export const dynamic = "force-dynamic";
@@ -34,7 +35,7 @@ export async function GET(req: Request) {
     // must be posted (or cancelled) before the payment sheet can be issued.
     if (rows.some((row) => row.mustPost && !row.finalized))
       return NextResponse.json({ error: "Approved deductions are still a preview. Post each affected completed worker-month before printing a bank payment sheet." }, { status: 409 });
-    const [orgRows, payRows] = await Promise.all([
+    const [orgRows, payRows, accountRows] = await Promise.all([
       db
         .select({
           name: organizations.name,
@@ -48,8 +49,13 @@ export async function GET(req: Request) {
       db.select({ payment: workerPayments }).from(workerPayments)
         .innerJoin(workers, eq(workers.id, workerPayments.workerId))
         .where(and(eq(workerPayments.periodMonth, month), eq(workers.organizationId, org))),
+      // One batched read of the payout detail the bank schedule prints. The
+      // account number is Owner-only data and this endpoint is Owner-only.
+      db.select({ id: workers.id, bankAccountNumber: workers.bankAccountNumber }).from(workers)
+        .where(eq(workers.organizationId, org)),
     ]);
 
+    const accountByWorker = new Map(accountRows.map((row) => [row.id, row.bankAccountNumber]));
     // The most recent reference recorded for each person this month, so the bank
     // sheet can be matched against the transfers actually made.
     const referenceByWorker = new Map<number, string>();
@@ -120,11 +126,27 @@ export async function GET(req: Request) {
           paid: row.paid,
           balance: row.balance,
           paymentStatus: row.paymentStatus,
+          bankAccountNumber: accountByWorker.get(row.workerId) ?? null,
           reference: referenceByWorker.get(row.workerId) ?? null,
         })),
         totals,
         breakdown,
         notListed,
+        // The printable bank schedule: Staff Name / Bank Account Number /
+        // Amount Payable only, non-payable people excluded, and a grand total
+        // reconciled against the authoritative payroll + payment batches.
+        bankSchedule: buildBankSchedule(
+          payable.map((row) => ({
+            workerId: row.workerId,
+            name: row.name,
+            due: row.due,
+            paid: row.paid,
+            balance: row.balance,
+            paymentStatus: row.paymentStatus,
+            bankAccountNumber: accountByWorker.get(row.workerId) ?? null,
+          })),
+          totals
+        ),
         payableCount: payable.length,
         settledCount: payable.filter((row) => row.paymentStatus === "PAID").length,
       },

@@ -275,6 +275,19 @@ export async function GET(req: Request) {
   }
 }
 
+/**
+ * Owner-recorded bank account number for the Monthly Staff Bank Payment
+ * Schedule. Digits only, 6-20 characters; blank clears it. The bank sheet -
+ * not this validator - flags anything that is not a standard 10-digit NUBAN,
+ * and it never fabricates a number for a worker who has none.
+ */
+function normaliseBankAccount(value: unknown): string | null {
+  const digits = String(value ?? "").replace(/[\s-]/g, "");
+  if (!digits) return null;
+  if (!/^\d{6,20}$/.test(digits)) return null;
+  return digits;
+}
+
 export async function POST(req: Request) {
   const denied = await guard(req, OWNER);
   if (denied) return denied;
@@ -298,6 +311,7 @@ export async function POST(req: Request) {
         department: String(body.department ?? "").trim() || null,
         jobTitle: String(body.jobTitle ?? "").trim() || null,
         paymentType, paymentRate: rate, status: "ACTIVE", isInspector: !!body.isInspector,
+        bankAccountNumber: normaliseBankAccount(body.bankAccountNumber),
       }).returning();
       // Roles live in worker_roles; the person row is created exactly once.
       await replaceWorkerRoles(tx, row.id, roles);
@@ -359,6 +373,7 @@ export async function PUT(req: Request) {
       department: String(body.department ?? "").trim() || null,
       jobTitle: String(body.jobTitle ?? "").trim() || null,
       paymentType, paymentRate: rate,
+      bankAccountNumber: body.bankAccountNumber === undefined ? existing.bankAccountNumber : normaliseBankAccount(body.bankAccountNumber),
       isInspector: !!body.isInspector,
       status,
       archivedAt: status === "INACTIVE" ? existing.archivedAt ?? new Date() : null,

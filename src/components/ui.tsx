@@ -67,7 +67,7 @@ export function StatCard({
   };
   const card = (
     <div
-      className={`flex min-w-0 items-start gap-2 rounded-xl border bg-white p-3 transition-all sm:gap-3 sm:p-4 ${
+      className={`flex h-full min-w-0 items-start gap-2 rounded-xl border bg-white p-3 transition-all sm:gap-3 sm:p-4 ${
         href
           ? "border-slate-200 hover:border-matesther-600 hover:shadow-md cursor-pointer"
           : "border-slate-200 shadow-[0_1px_3px_rgba(0,0,0,0.05)]"
@@ -78,14 +78,14 @@ export function StatCard({
       >
         {icon}
       </div>
-      <div className="min-w-0 flex-1">
-        <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+      <div className="flex h-full min-w-0 flex-1 flex-col">
+        <p className="min-h-[30px] break-words text-[11px] font-medium uppercase leading-[1.35] tracking-wide text-slate-500">
           {label}
         </p>
-        <p className="break-words text-[clamp(0.95rem,3.8vw,1.25rem)] font-bold leading-tight tracking-tight text-slate-900">{value}</p>
-        {sub && <p className="text-xs text-slate-500 mt-0.5">{sub}</p>}
+        <p className="tabular-nums break-words text-[clamp(0.95rem,3.8vw,1.25rem)] font-bold leading-tight tracking-tight text-slate-900">{value}</p>
+        <div className="mt-auto pt-1">{sub && <p className="break-words text-xs text-slate-500">{sub}</p>}</div>
         {href && (
-          <p className="text-[10px] font-bold text-matesther-700 mt-1 opacity-0 transition-opacity group-hover:opacity-100">
+          <p className="text-[10px] font-bold text-matesther-700 mt-1 hidden opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:block">
             View records →
           </p>
         )}
@@ -94,12 +94,27 @@ export function StatCard({
   );
   if (href) {
     return (
-      <Link href={href} className="group block">
+      <Link href={href} className="group block h-full">
         {card}
       </Link>
     );
   }
   return card;
+}
+
+/**
+ * The one responsive grid every stat-card section uses.
+ *
+ * One place decides columns and gaps so the Owner, Production and Worker
+ * dashboards cannot drift apart: two columns on phones, three at md, and
+ * enough xl columns for every card to sit in one row. Combined with the
+ * equal-height StatCard, long labels and large figures line up instead of
+ * shifting the row.
+ */
+export function StatGrid({ count, children, className = "" }: { count: number; children: ReactNode; className?: string }) {
+  const xl = count >= 6 ? "xl:grid-cols-6" : count === 5 ? "xl:grid-cols-5" : count === 4 ? "xl:grid-cols-4" : "xl:grid-cols-3";
+  const md = count >= 4 ? "md:grid-cols-4" : "md:grid-cols-3";
+  return <div className={`grid grid-cols-2 gap-3 ${md} ${xl} ${className}`}>{children}</div>;
 }
 
 /* ---------- Status badge ---------- */

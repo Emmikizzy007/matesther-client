@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Search, ClipboardCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Loading, Modal, Field, inputCls, Btn } from "@/components/ui";
+import { SkeletonTable } from "@/components/Skeleton";
 import { StageAllocations } from "@/components/StageAllocations";
 import { fmtDate, methodLabel, stageLabel, STAGES, STAGE_ROLES, personHoldsRole } from "@/lib/format";
 
@@ -76,7 +77,12 @@ export default function ProductionPage() {
   }
   // Changing the stage filter re-queries the database rather than re-filtering a
   // download of everything.
-  useEffect(load, [stage]); // eslint-disable-line react-hooks/exhaustive-deps
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const id = window.setTimeout(() => { void loadRef.current(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [stage]);
 
   function loadMore() {
     setErr("");
@@ -163,7 +169,7 @@ export default function ProductionPage() {
       )}
 
       {loading ? (
-        <Card><Loading /></Card>
+        <SkeletonTable rows={6} cols={5} label="Loading production…" />
       ) : (
         <div className="grid md:grid-cols-2 xl:grid-cols-5 gap-3">
           {COLS.map((col) => {

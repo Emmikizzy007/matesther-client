@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft,
@@ -155,7 +155,12 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
       load();
     }
   }
-  useEffect(load, [id]);
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; });
+  useEffect(() => {
+    const id = window.setTimeout(() => { void loadRef.current(); }, 0);
+    return () => window.clearTimeout(id);
+  }, [id]);
 
   async function post(url: string, body: any, method = "POST") {
     setSaving(true);
@@ -564,6 +569,14 @@ export default function OrderDetailPage({ params }: { params: Promise<{ id: stri
             <Btn className="mt-4 w-full" onClick={() => { setFormErr(""); setPayForm({ amount: order.balance > 0 ? String(order.balance) : "", paymentDate: new Date().toISOString().slice(0, 10), paymentMethod: "Bank Transfer", reference: "", notes: "" }); setPayModal(true); }}>
               <Plus className="w-4 h-4" /> Record Payment
             </Btn>
+            <a
+              href={`/invoice/${order.id}`}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-flex min-h-11 w-full items-center justify-center rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-matesther-700 hover:bg-slate-50"
+            >
+              Open printable invoice ↗
+            </a>
           </Card>
           <Card className="lg:col-span-2">
             <CardHeader title="Payments received" />

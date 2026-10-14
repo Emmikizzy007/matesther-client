@@ -29,17 +29,22 @@ export default function LoginPage() {
 
   useEffect(() => {
     let active = true;
-    setStatus(null);
-    setStatusError("");
-    fetch("/api/auth/status", { cache: "no-store" })
-      .then(async (response) => {
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Unable to connect to Matesther.");
-        return result as Status;
-      })
-      .then((result) => { if (active) setStatus(result); })
-      .catch((cause) => { if (active) setStatusError(cause instanceof Error ? cause.message : "Unable to connect to Matesther."); });
-    return () => { active = false; };
+    // Queued start: state resets and the fetch kickoff happen in the timeout
+    // callback, never synchronously inside the effect body.
+    const id = window.setTimeout(() => {
+      if (!active) return;
+      setStatus(null);
+      setStatusError("");
+      fetch("/api/auth/status", { cache: "no-store" })
+        .then(async (response) => {
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "Unable to connect to Matesther.");
+          return result as Status;
+        })
+        .then((result) => { if (active) setStatus(result); })
+        .catch((cause) => { if (active) setStatusError(cause instanceof Error ? cause.message : "Unable to connect to Matesther."); });
+    }, 0);
+    return () => { active = false; window.clearTimeout(id); };
   }, [attempt]);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {

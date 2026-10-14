@@ -86,6 +86,52 @@ main { min-width: 0; }
   animation: fadeUp 0.35s ease both;
 }
 
+/* ---- Facebook-style skeleton loaders -------------------------------------
+   A single shimmer used by every skeleton shape. The block itself is a soft
+   grey with a moving highlight; `prefers-reduced-motion` turns the highlight
+   off and leaves a static block, so nobody gets a pulsing screen they did not
+   ask for. Skeletons are aria-hidden decoration around a polite "Loading …"
+   status line, never an infinite wait: each page replaces them with content
+   or an error + retry as soon as its request settles. */
+@keyframes skeletonShimmer {
+  0% { background-position: -160% 0; }
+  100% { background-position: 260% 0; }
+}
+.skeleton-block {
+  border-radius: 0.5rem;
+  background: linear-gradient(90deg, #e8ebf1 25%, #f3f5f9 45%, #e8ebf1 65%);
+  background-size: 220% 100%;
+  animation: skeletonShimmer 1.35s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-block { animation: none; background: #e8ebf1; }
+  .fade-up { animation: none; }
+  html { scroll-behavior: auto; }
+}
+
+/* ---- Print pagination for the A4 documents -------------------------------
+   Each .print-page is one sheet: it always starts on a fresh page, its table
+   header is repeated at the top of that sheet by the browser, and a row is
+   never split across two sheets. The "Page x of y" footers live inside each
+   sheet, so page numbers are part of the generated PDF as well as paper. */
+@media print {
+  .print-page { break-after: page; page-break-after: always; }
+  .print-page:last-child { break-after: auto; page-break-after: auto; }
+  .print-page table thead { display: table-header-group; }
+  .print-page table tr { break-inside: avoid; page-break-inside: avoid; }
+  .print-page .print-page-footer { break-inside: avoid; page-break-inside: avoid; }
+}
+.print-page-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6mm;
+  padding-top: 2mm;
+  border-top: 1px solid #e6e2d6;
+  font-size: 10px;
+  color: #6b6250;
+}
+
 /* Customer-facing A4 documents inspired by Matesther's printed letterhead. */
 .matesther-letter {
   width: min(210mm, 100%);
@@ -107,8 +153,10 @@ main { min-width: 0; }
   z-index: -1;
   inset: 33% 3% 13%;
   opacity: .045;
-  background: linear-gradient(140deg, transparent 20%, #81a93c 20% 34%, transparent 34% 58%, #83a942 58% 71%, transparent 71%);
-  transform: rotate(-7deg);
+  /* Watermark bands are perfectly straight as well - no rotation, no diagonal:
+     every decorative rule on this letterhead is a flat horizontal band. */
+  background: linear-gradient(90deg, transparent 20%, #81a93c 20% 34%, transparent 34% 58%, #83a942 58% 71%, transparent 71%);
+  transform: none;
 }
 .letter-header { text-align: center; }
 .letter-logo-wrap { display: flex; justify-content: center; }
@@ -121,7 +169,10 @@ main { min-width: 0; }
 }
 .letter-tagline { margin-top: 1mm; font: italic 600 13px Georgia, serif; color: #5d713f; }
 .letter-contact { margin: 3mm auto 5mm; max-width: 155mm; font-size: 11px; line-height: 1.55; font-weight: 600; color: #303334; }
-.letter-color-rule { display: flex; width: 100%; height: 6px; overflow: hidden; transform: skewY(-1.3deg); }
+/* The brand rule is a pair of flat horizontal bands (rust + green). No skew,
+   rotation or gradient: a decorative rule must print perfectly straight and
+   land in the same place in the preview, the PDF and on paper. */
+.letter-color-rule { display: flex; width: 100%; height: 6px; overflow: hidden; transform: none; }
 .letter-color-rule span:first-child { width: 52%; background: #af644d; }
 .letter-color-rule span:last-child { flex: 1; background: #b2c76c; }
 .letter-references { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; padding: 8mm 1mm 4mm; font-size: 11px; text-align: left; }
@@ -142,7 +193,7 @@ main { min-width: 0; }
 .letter-table tfoot { border-top: 1.5px solid #9aaf62; font-weight: 700; }
 .letter-total-box { border: 1px solid #cad2b0; background: #f9fbf4; padding: 14px 18px; }
 .letter-footer { margin-top: 14mm; font-size: 11px; break-inside: avoid; }
-.letter-footer .letter-color-rule { height: 5px; transform: skewY(1deg); }
+.letter-footer .letter-color-rule { height: 5px; transform: none; }
 .letter-footer-row { display: flex; align-items: center; gap: 10px; padding-top: 5mm; color: #829c47; font-style: italic; font-weight: 700; line-height: 1.4; }
 .letter-table tr, .letter-heading, .letter-references { break-inside: avoid; }
 @media print {

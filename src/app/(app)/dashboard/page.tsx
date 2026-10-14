@@ -12,6 +12,7 @@ import {
   Wallet,
   Boxes,
   HandCoins,
+  Landmark,
   TrendingUp,
   Plus,
   ChevronRight,
@@ -27,7 +28,8 @@ import {
   Coins,
   RefreshCcw,
 } from "lucide-react";
-import { Card, CardHeader, StatCard, Badge, ProgressBar, Loading, Btn, Modal, Field, inputCls } from "@/components/ui";
+import { Card, CardHeader, StatCard, StatGrid, Badge, ProgressBar, Btn, Modal, Field, inputCls } from "@/components/ui";
+import { SkeletonStatGrid, SkeletonTable, LoadError } from "@/components/Skeleton";
 import { naira, fmtDate, stageLabel } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
 import { WorkerLinkNotice } from "@/components/WorkerLinkNotice";
@@ -52,28 +54,42 @@ export default function DashboardPage() {
 
   useEffect(() => {
     let active = true;
-    setD(null);
-    setErr("");
-    fetch("/api/dashboard", { cache: "no-store" })
-      .then(async (response) => {
-        const result = await response.json();
-        if (!response.ok || result.error) throw new Error(result.error || "Dashboard unavailable. Please try again.");
-        if (result.view !== view) throw new Error("Your session has changed. Sign out and sign in again.");
-        return result;
-      })
-      .then((result) => { if (active) setD(result); })
-      .catch((cause) => { if (active) setErr(cause instanceof Error ? cause.message : "Dashboard unavailable."); });
-    return () => { active = false; };
+    // Queued start keeps the effect body free of synchronous setState.
+    const id = window.setTimeout(() => {
+      if (!active) return;
+      setD(null);
+      setErr("");
+      fetch("/api/dashboard", { cache: "no-store" })
+        .then(async (response) => {
+          const result = await response.json();
+          if (!response.ok || result.error) throw new Error(result.error || "Dashboard unavailable. Please try again.");
+          if (result.view !== view) throw new Error("Your session has changed. Sign out and sign in again.");
+          return result;
+        })
+        .then((result) => { if (active) setD(result); })
+        .catch((cause) => { if (active) setErr(cause instanceof Error ? cause.message : "Dashboard unavailable."); });
+    }, 0);
+    return () => { active = false; window.clearTimeout(id); };
   }, [view, retry]);
 
-  if (err) return <Card className="p-6"><p className="text-sm font-semibold text-red-700">Could not load your dashboard</p><p className="mt-1 text-sm text-slate-600">{err}</p><Btn className="mt-4" onClick={() => setRetry((n) => n + 1)}>Try again</Btn></Card>;
-  if (!d) return <Loading label="Loading Matesther dashboard..." />;
+  if (err) return <LoadError message={`Could not load your dashboard. ${err}`} onRetry={() => setRetry((n) => n + 1)} />;
+  if (!d) return <DashboardSkeleton view={view} />;
 
   if (view === "pm") return <ProductionDashboard d={d} />;
   if (view === "worker") return d.linked === false || !d.profile
     ? <div><h1 className="mb-5 text-2xl font-bold text-slate-900">Welcome, {user?.name}</h1><WorkerLinkNotice name={user?.name} /></div>
     : <WorkerDashboard d={d} userName={user?.name || ""} refresh={() => setRetry((n) => n + 1)} />;
   return <OwnerDashboard d={d} userName={user?.name || ""} />;
+}
+
+/** Loading stand-in with the same shape as the dashboard it replaces. */
+function DashboardSkeleton({ view }: { view: string }) {
+  return (
+    <>
+      <SkeletonStatGrid count={view === "owner" ? 6 : 4} />
+      <SkeletonTable rows={5} cols={4} label="Loading dashboard details…" />
+    </>
+  );
 }
 
 /* ================= OWNER DASHBOARD ================= */
@@ -107,7 +123,7 @@ function OwnerDashboard({ d }: any) {
         title="Business Overview"
         right={<Link href="/payroll" className="text-xs font-semibold text-matesther-700 hover:underline">Worker Payments</Link>}
       />
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-5">
+      <StatGrid count={6} className="mb-5">
         <StatCard label="Total Revenue" value={naira(k.revenue)} icon={<Banknote className="w-5 h-5" />} sub="All orders" href="/profitability" />
         <StatCard label="Total Expenses" value={naira(k.expenseTotal)} icon={<Wallet className="w-5 h-5" />} tone="red" sub="All records" href="/expenses" />
         <StatCard
@@ -121,9 +137,9 @@ function OwnerDashboard({ d }: any) {
           href="/profitability"
         />
         <StatCard label="Owed by Customers" value={naira(k.outstanding)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub="Outstanding balances" href="/payments" />
-        <StatCard label={`Payroll Due (${payrollLabel})`} value={naira(d.payroll?.due ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`Paid ${naira(d.payroll?.paid ?? 0)} • ${naira(d.payroll?.balance ?? 0)} left`} href="/payroll" />
+        <StatCard label={`Payroll Due (${payrollLabel})`} value={naira(d.payroll?.due ?? 0)} icon={<Landmark className="w-5 h-5" />} tone="gold" sub={`Paid ${naira(d.payroll?.paid ?? 0)} • ${naira(d.payroll?.balance ?? 0)} left`} href="/payroll" />
         <StatCard label="Material Purchases" value={naira(k.materialCost)} icon={<Boxes className="w-5 h-5" />} tone="slate" sub="Purchase records" href="/materials/purchases" />
-      </div>
+      </StatGrid>
 
       {/* Business Growth - monthly revenue / expenses / profit history */}
       {growth && (
@@ -189,13 +205,13 @@ function OwnerDashboard({ d }: any) {
       )}
 
       <SectionTitle title="Orders" />
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
+      <StatGrid count={5} className="mb-5">
         <StatCard label="Active Orders" value={String(k.activeOrders)} icon={<ShoppingBag className="w-5 h-5" />} href="/orders" />
         <StatCard label="In Production" value={String(k.inProduction)} icon={<Factory className="w-5 h-5" />} tone="blue" href="/production" />
         <StatCard label="Due Soon (14d)" value={String(k.dueSoon)} icon={<Clock className="w-5 h-5" />} tone="gold" sub={k.dueToday > 0 ? `${k.dueToday} due today` : "-"} href="/orders" />
         <StatCard label="Completed" value={String(k.completedOrders)} icon={<CheckCircle2 className="w-5 h-5" />} href="/orders" />
         <StatCard label="Delayed" value={String(k.delayed)} icon={<AlertTriangle className="w-5 h-5" />} tone="red" sub={k.delayed > 0 ? "Needs attention" : "All on track"} href="/orders" />
-      </div>
+      </StatGrid>
 
       <SectionTitle
         title="Production"
@@ -241,11 +257,11 @@ function OwnerDashboard({ d }: any) {
       </Card>
 
       <SectionTitle title="Materials" right={<Link href="/materials" className="text-xs font-semibold text-matesther-700 hover:underline">Manage</Link>} />
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-5">
+      <StatGrid count={3} className="mb-5">
         <StatCard label="Stock Value" value={naira(k.stockValue)} icon={<Ruler className="w-5 h-5" />} tone="slate" sub="Materials on hand" href="/materials" />
         <StatCard label="Low Stock Items" value={String(d.lowStock.length)} icon={<AlertTriangle className="w-5 h-5" />} tone={d.lowStock.length ? "red" : "green"} sub={d.lowStock.length ? d.lowStock[0].name : "All healthy"} href="/materials" />
         <StatCard label="Material Costs (bought)" value={naira(k.materialCost)} icon={<Boxes className="w-5 h-5" />} tone="blue" href="/materials/purchases" />
-      </div>
+      </StatGrid>
 
       <SectionTitle title="Recent Activity" />
       <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-4">
@@ -352,12 +368,12 @@ function ProductionDashboard({ d }: any) {
       </Card>}
 
       <SectionTitle title="Today" />
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      <StatGrid count={4} className="mb-5">
         <StatCard label="Jobs Due Today" value={String(d.today.dueTodayJobs.length)} icon={<Clock className="w-5 h-5" />} tone="gold" href="/production" />
         <StatCard label="Awaiting Inspection" value={String(d.today.awaitingInspection.length)} icon={<ClipboardCheck className="w-5 h-5" />} tone="blue" sub={`${d.inspection.awaiting.reduce((s: number, x: any) => s + x.pendingInspection, 0)} pieces`} href="/production/inspection" />
         <StatCard label="Rework In Progress" value={String(d.today.rework.length)} icon={<RefreshCcw className="w-5 h-5" />} tone="red" href="/production/inspection" />
         <StatCard label="Stages Running" value={String(d.pipeline.filter((p: any) => p.active > 0).length)} icon={<Factory className="w-5 h-5" />} href="/production" />
-      </div>
+      </StatGrid>
 
       <SectionTitle title="Production Pipeline" right={<span className="text-xs text-slate-500">Cutting → Sewing → Monogramming / Embroidery → Buttonhole → Button Tacking → Ironing → Packing → Delivery</span>} />
       <Card className="mb-5">
@@ -535,12 +551,12 @@ function WorkerDashboard({ d, userName, refresh }: any) {
       </div>
 
       <SectionTitle title="My Earnings" right={<Link href="/worker/earnings" className="text-xs font-semibold text-matesther-700 hover:underline">Full breakdown</Link>} />
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      <StatGrid count={4} className="mb-5">
           <StatCard label="Today" value={naira(d.earnings.today)} icon={<Coins className="w-5 h-5" />} href="/worker/earnings" />
           <StatCard label="This Week" value={naira(d.earnings.week)} icon={<Coins className="w-5 h-5" />} tone="blue" href="/worker/earnings" />
           <StatCard label="This Month" value={naira(d.earnings.month)} icon={<Coins className="w-5 h-5" />} tone="gold" href="/worker/earnings" />
           <StatCard label="Total Earnings" value={naira(d.earnings.total)} icon={<Banknote className="w-5 h-5" />} tone="green" sub="On approved pieces" href="/worker/earnings" />
-      </div>
+      </StatGrid>
 
       <SectionTitle title="Recent Jobs" />
       <Card>

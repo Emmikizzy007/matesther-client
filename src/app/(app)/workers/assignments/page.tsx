@@ -45,7 +45,10 @@ export default function WorkerAssignmentsPage() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Assignments could not be loaded."); }
     finally { setLoading(false); }
   }
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const id = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
 
   const matchesTab = (job: Job, selected: Filter) => selected === "all" ||
     selected === "working" && !!job.workerId && ["IN_PROGRESS", "PENDING", "ON_HOLD"].includes(job.status) ||

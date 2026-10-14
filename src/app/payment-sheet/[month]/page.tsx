@@ -1,34 +1,15 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useCallback, useEffect, useState } from "react";
 import { DocumentActions } from "@/components/documents/DocumentActions";
 import { Letterhead, type LetterBusiness } from "@/components/documents/Letterhead";
+import { PaginatedTable } from "@/components/documents/PaginatedTable";
+import { SkeletonDocument, LoadError } from "@/components/Skeleton";
+import { buildBankSchedule, type BankSchedule, type SheetPayRow } from "@/lib/bank-schedule";
 import { fmtDate, naira } from "@/lib/format";
 
-type SheetRow = {
-  workerId: number;
-  name: string;
+type SheetRow = SheetPayRow & {
   roles: string[];
-  categories: string[];
-  department: string | null;
-  jobTitle: string | null;
-  paymentType: string;
-  pieces: number;
-  piecework: number;
-  supportPieces: number;
-  supportPiecework: number;
-  salary: number;
-  overtime: number;
-  other: number;
-  gross: number;
-  totalDeductions: number;
-  taxDeduction: number;
-  deductionItems: { id: number; categoryName: string; amount: number; calculation: string }[];
-  finalized: boolean;
-  due: number;
-  paid: number;
-  balance: number;
-  paymentStatus: string;
   reference: string | null;
 };
 
@@ -40,70 +21,78 @@ type PaymentSheet = {
   business: LetterBusiness | null;
   rows: SheetRow[];
   totals: { due: number; paid: number; balance: number };
-  breakdown: { piecework: number; supportPiecework: number; salary: number; overtime: number; other: number };
+  bankSchedule: BankSchedule;
   payableCount: number;
-  settledCount: number;
-  /**
-   * Workers this sheet does not list, and what they are still owed. A tailor who handed work
-   * out and approved no pieces themselves has a deduction with nothing to come out of yet, so
-   * they are not a payee this month - and a sheet whose total silently excluded people would
-   * not reconcile against the payroll screen or the transfers actually made.
-   */
   notListed: { count: number; due: number; supportDeductionOwed: number };
 };
 
-const STATUS_LABEL: Record<string, string> = {
-  PAID: "Paid in full",
-  PARTIAL: "Part paid",
-  UNPAID: "Not yet paid",
-  NOTHING_DUE: "Nothing due",
-};
-
+/**
+ * Monthly Staff Bank Payment Schedule.
+ *
+ * The bank table carries exactly three columns - Staff Name, Bank Account
+ * Number and Amount Payable (the final net after every approved deduction,
+ * less payments already recorded). The internal payroll breakdown stays in
+ * the authorised Worker Payments and Payroll Deductions screens; it is not
+ * printed here and not included in the shareable message.
+ */
 export default function PaymentSheetPage({ params }: { params: Promise<{ month: string }> }) {
   const { month } = use(params);
   const [sheet, setSheet] = useState<PaymentSheet | null>(null);
   const [error, setError] = useState("");
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let active = true;
     fetch(`/api/payment-sheet?month=${encodeURIComponent(month)}`, { cache: "no-store" })
       .then(async (response) => {
         const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not load the payment sheet.");
+        if (!response.ok) throw new Error(result.error || "Could not load the payment schedule.");
         return result as PaymentSheet;
       })
       .then((result) => { if (active) setSheet(result); })
-      .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : "Could not load the payment sheet."); });
+      .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : "Could not load the payment schedule."); });
     return () => { active = false; };
-  }, [month]);
+  }, [month, reload]);
+
+  const retry = useCallback(() => setReload((n) => n + 1), []);
 
   if (error)
     return (
-      <div className="document-page min-h-screen bg-[#f2f3ee] p-8 text-center text-sm text-red-700" role="alert">
-        {error} <a href="/login" className="underline">Sign in</a> as the Owner to open a payment sheet.
+      <div className="document-page min-h-screen bg-[#f2f3ee] p-4 sm:p-8">
+        <div className="mx-auto max-w-[210mm]">
+          <LoadError message={`${error} Sign in as the Owner to open a payment schedule.`} onRetry={retry}>
+            <p className="mt-2 text-xs font-normal text-red-700">
+              <a href="/login" className="font-semibold underline">Sign in</a> if your session has expired.
+            </p>
+          </LoadError>
+        </div>
       </div>
     );
   if (!sheet)
-    return <div className="document-page min-h-screen bg-[#f2f3ee] p-8 text-center text-sm text-slate-500">Loading the Matesther payment sheet...</div>;
+    return (
+      <main className="document-page min-h-screen bg-[#f2f3ee] px-3 py-6 sm:px-6">
+        <SkeletonDocument label="Loading the Matesther bank payment schedule…" rows={10} />
+      </main>
+    );
+
+  const schedule = sheet.bankSchedule ?? buildBankSchedule(sheet.rows, sheet.totals);
+  const { reconciliation } = schedule;
+  const preparedDate = fmtDate(sheet.generatedAt);
 
   const note = [
-    `${sheet.business?.name || "Matesther Enterprises"} monthly staff payment sheet ${sheet.sheetNo}`,
-    `Month: ${sheet.monthLabel}`,
-    ...sheet.rows.map(
-      (row) =>
-        `${row.name} (${row.roles.join(", ") || row.paymentType}) - due ${naira(row.due)}, paid ${naira(row.paid)}, balance ${naira(row.balance)}`
-    ),
-    `Total payable: ${naira(sheet.totals.due)}`,
-    `Already paid: ${naira(sheet.totals.paid)}`,
-    `Outstanding: ${naira(sheet.totals.balance)}`,
-    `Print or Save as PDF for the full letterheaded sheet.`,
+    `${sheet.business?.name || "Matesther Enterprises"} Monthly Staff Bank Payment Schedule ${sheet.sheetNo}`,
+    `Payroll month: ${sheet.monthLabel}`,
+    `Prepared: ${preparedDate}`,
+    `Staff on schedule: ${schedule.entries.length}`,
+    `Grand total payable: ${naira(schedule.grandTotal)}`,
+    `For the letterheaded schedule with account numbers and signatures, use Print / Save as PDF and attach the saved file. Confidential payroll document - check the recipient before sharing.`,
   ].join("\n");
 
   return (
     <main className="document-page min-h-screen bg-[#f2f3ee] px-3 py-6 sm:px-6">
       <DocumentActions
-        title={`Matesther staff payment sheet ${sheet.sheetNo}`}
-        filename={`matesther-payment-sheet-${sheet.month}`}
+        title={`Matesther Monthly Staff Bank Payment Schedule ${sheet.sheetNo}`}
+        filename={`matesther-bank-payment-schedule-${sheet.month}`}
         message={note}
         sensitive
       />
@@ -111,136 +100,176 @@ export default function PaymentSheetPage({ params }: { params: Promise<{ month: 
         business={sheet.business}
         ourRef={sheet.sheetNo}
         yourRef={`Payroll ${sheet.month}`}
-        date={fmtDate(sheet.generatedAt)}
-        title="Monthly Staff Payment Sheet"
-        subtitle={`Payments due for ${sheet.monthLabel}`}
+        date={preparedDate}
+        title="Monthly Staff Bank Payment Schedule"
+        subtitle={`Payroll month: ${sheet.monthLabel}`}
       >
-        <div className="grid gap-4 sm:grid-cols-3">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
           <div>
-            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Period</p>
+            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Payroll month</p>
             <p className="mt-1 font-semibold text-[#282b25]">{sheet.monthLabel}</p>
           </div>
           <div>
-            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Staff on this sheet</p>
-            <p className="mt-1 font-semibold text-[#282b25]">{sheet.payableCount}</p>
+            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Prepared on</p>
+            <p className="mt-1 font-semibold text-[#282b25]">{preparedDate}</p>
           </div>
           <div>
-            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Settled</p>
-            <p className="mt-1 font-semibold text-[#282b25]">
-              {sheet.settledCount} of {sheet.payableCount}
-            </p>
+            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Staff on this schedule</p>
+            <p className="mt-1 font-semibold text-[#282b25]">{schedule.entries.length}</p>
+          </div>
+          <div>
+            <p className="text-[11px] font-bold uppercase tracking-wide text-[#987048]">Grand total payable</p>
+            <p className="mt-1 font-semibold text-[#282b25]">{naira(schedule.grandTotal)}</p>
           </div>
         </div>
 
-        {sheet.rows.length === 0 ? (
+        {schedule.entries.length === 0 ? (
           <p className="mt-6 rounded border border-dashed border-slate-300 p-4 text-sm text-slate-600">
-            No staff payments are due for {sheet.monthLabel}.
+            No staff payments are payable for {sheet.monthLabel}.
           </p>
         ) : (
-          <table className="mt-6 w-full border-collapse text-[11px]">
-            <thead>
-              <tr className="border-y border-[#d8d3c4] bg-[#f6f4ee] text-left uppercase tracking-wide text-[#6b6250]">
-                <th className="px-2 py-2">Staff</th>
-                <th className="px-2 py-2">Role / Position</th>
-                <th className="px-2 py-2">Pay type</th>
-                <th className="px-2 py-2 text-right">Salary</th>
-                <th className="px-2 py-2 text-right">Piecework</th>
-                <th className="px-2 py-2 text-right">Support</th>
-                <th className="px-2 py-2 text-right">Overtime</th>
-                <th className="px-2 py-2 text-right">Other</th>
-                <th className="px-2 py-2 text-right">Total due</th>
-                <th className="px-2 py-2 text-right">Paid</th>
-                <th className="px-2 py-2 text-right">Balance</th>
-                <th className="px-2 py-2">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sheet.rows.map((row) => (
-                <tr key={row.workerId} className="border-b border-[#e6e2d6] align-top">
-                  <td className="px-2 py-2 font-semibold text-[#282b25]">
-                    {row.name}
-                    {(row.department || row.jobTitle) && (
-                      <span className="block font-normal text-[#6b6250]">
-                        {[row.jobTitle, row.department].filter(Boolean).join(" - ")}
-                      </span>
-                    )}
-                    <span className="block font-normal text-[#6b6250]">Gross {naira(row.gross)} · deductions {naira(row.totalDeductions)}</span>
-                    {row.deductionItems.map((line) => (
-                      <span key={line.id} className="block font-normal text-[#6b6250]" title={line.calculation}>
-                        {line.categoryName}: {line.amount < 0 ? `refund ${naira(-line.amount)}` : `−${naira(line.amount)}`}
-                      </span>
-                    ))}
-                  </td>
-                  <td className="px-2 py-2 text-[#4a4f45]">{row.roles.join(", ") || "-"}</td>
-                  <td className="px-2 py-2 text-[#4a4f45]">{row.paymentType.replace("_", " ")}</td>
-                  <td className="px-2 py-2 text-right">{row.salary ? naira(row.salary) : "-"}</td>
-                  <td className="px-2 py-2 text-right">
-                    {row.piecework ? `${naira(row.piecework)}` : "-"}
-                    {row.piecework > 0 && <span className="block text-[#6b6250]">{row.pieces} pcs</span>}
-                  </td>
-                  <td className="px-2 py-2 text-right">
-                    {row.supportPiecework ? `${naira(row.supportPiecework)}` : "-"}
-                    {row.supportPiecework > 0 && <span className="block text-[#6b6250]">{row.supportPieces} pcs</span>}
-                  </td>
-                  <td className="px-2 py-2 text-right">{row.overtime ? naira(row.overtime) : "-"}</td>
-                  <td className="px-2 py-2 text-right">{row.other ? naira(row.other) : "-"}</td>
-                  <td className="px-2 py-2 text-right font-bold text-[#282b25]">{naira(row.due)}</td>
-                  <td className="px-2 py-2 text-right">{row.paid ? naira(row.paid) : "-"}</td>
-                  <td className="px-2 py-2 text-right font-semibold">{row.balance > 0 ? naira(row.balance) : "-"}</td>
-                  <td className="px-2 py-2 text-[#4a4f45]">
-                    {STATUS_LABEL[row.paymentStatus] ?? row.paymentStatus}
-                    {row.reference && <span className="block text-[#6b6250]">Ref {row.reference}</span>}
-                  </td>
-                </tr>
+          <>
+            {/* Mobile: one readable card per person - no whole-page scrolling. */}
+            <div className="mt-6 space-y-3 sm:hidden">
+              {schedule.entries.map((entry, index) => (
+                <div key={entry.workerId} className="rounded-lg border border-[#d8d3c4] bg-[#faf9f5] p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-[10px] uppercase tracking-wide text-[#6b6250]">#{index + 1} Staff name</p>
+                      <p className="break-words font-semibold text-[#282b25]">{entry.name}</p>
+                    </div>
+                    <p className="shrink-0 text-right">
+                      <span className="block text-[10px] uppercase tracking-wide text-[#6b6250]">Amount payable</span>
+                      <span className="font-bold tabular-nums text-[#282b25]">{naira(entry.amountPayable)}</span>
+                    </p>
+                  </div>
+                  <p className="mt-2 text-[10px] uppercase tracking-wide text-[#6b6250]">Bank account number</p>
+                  <p className={entry.accountFlag === "OK" ? "tabular-nums font-semibold text-[#282b25]" : "font-semibold text-[#a4573c]"}>
+                    {entry.accountNumber ?? "Not on file"}
+                    {entry.accountFlag === "CHECK" && " — check number"}
+                    {entry.accountFlag === "MISSING" && " — add before transfer"}
+                  </p>
+                </div>
               ))}
-            </tbody>
-            <tfoot>
-              <tr className="border-t-2 border-[#987048] bg-[#f6f4ee] font-bold text-[#282b25]">
-                <td className="px-2 py-2" colSpan={3}>
-                  Total - {sheet.monthLabel}
-                </td>
-                <td className="px-2 py-2 text-right">{naira(sheet.breakdown.salary)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.breakdown.piecework)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.breakdown.supportPiecework)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.breakdown.overtime)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.breakdown.other)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.totals.due)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.totals.paid)}</td>
-                <td className="px-2 py-2 text-right">{naira(sheet.totals.balance)}</td>
-                <td className="px-2 py-2" />
-              </tr>
-            </tfoot>
-          </table>
+              <div className="rounded-lg border-t-2 border-[#987048] bg-[#f6f4ee] p-3">
+                <p className="flex items-center justify-between font-bold text-[#282b25]">
+                  <span>Grand total payable</span>
+                  <span className="tabular-nums">{naira(schedule.grandTotal)}</span>
+                </p>
+              </div>
+            </div>
+
+            {/* Screen (sm+) and print: the paginated bank table. */}
+            <div className="mt-6 hidden sm:block">
+              <PaginatedTable
+                rows={schedule.entries}
+                rowKey={(entry) => entry.workerId}
+                rowsFirstPage={22}
+                rowsPerPage={32}
+                continuationLabel={`Bank payment schedule ${sheet.sheetNo}`}
+                footerLeft={`${sheet.sheetNo} · ${sheet.monthLabel} · Prepared ${preparedDate}`}
+                columns={[
+                  { header: "S/N", widthClass: "w-12" },
+                  { header: "Staff Name" },
+                  { header: "Bank Account Number" },
+                  { header: "Amount Payable", align: "right", widthClass: "w-36" },
+                ]}
+                renderRow={(entry, index) => (
+                  <>
+                    <td>{index + 1}</td>
+                    <td className="font-semibold text-[#282b25]">{entry.name}</td>
+                    <td className={entry.accountFlag === "OK" ? "tabular-nums" : "font-semibold text-[#a4573c]"}>
+                      {entry.accountNumber ?? "Not on file"}
+                      {entry.accountFlag === "CHECK" && " — check number"}
+                      {entry.accountFlag === "MISSING" && " — add before transfer"}
+                    </td>
+                    <td className="font-bold tabular-nums text-[#282b25]">{naira(entry.amountPayable)}</td>
+                  </>
+                )}
+                renderTotalRow={
+                  <tr className="border-t-2 border-[#987048] bg-[#f6f4ee] font-bold text-[#282b25]">
+                    <td colSpan={3}>Grand total payable — {sheet.monthLabel}</td>
+                    <td className="tabular-nums">{naira(schedule.grandTotal)}</td>
+                  </tr>
+                }
+              />
+            </div>
+          </>
         )}
+
+        {(schedule.accountFlags.missing > 0 || schedule.accountFlags.invalid > 0) && (
+          <p className="mt-4 border-l-2 border-[#c9642f] pl-3 text-[11px] leading-relaxed text-[#6b4a35]">
+            {schedule.accountFlags.missing > 0 &&
+              `${schedule.accountFlags.missing} staff ${schedule.accountFlags.missing === 1 ? "account number is" : "account numbers are"} not on file and ${schedule.accountFlags.missing === 1 ? "has" : "have"} been flagged above. `}
+            {schedule.accountFlags.invalid > 0 &&
+              `${schedule.accountFlags.invalid} account ${schedule.accountFlags.invalid === 1 ? "number does" : "numbers do"} not look like a standard 10-digit NUBAN - confirm with the staff member before transfer. `}
+            No account number has been invented: record the real one on the Workers screen and reprint.
+          </p>
+        )}
+
+        {/* Reconciliation against the authoritative payroll and payment batches. */}
+        <div className="letter-total-box mt-6">
+          <p className="font-serif text-[15px] font-semibold text-[#30312e]">Reconciliation</p>
+          <dl className="mt-2 space-y-1 text-xs text-[#4a4f45]">
+            <div className="flex justify-between gap-4">
+              <dt>Net payroll for {sheet.monthLabel} (after all approved deductions)</dt>
+              <dd className="font-semibold tabular-nums">{naira(reconciliation.netPayrollDue)}</dd>
+            </div>
+            <div className="flex justify-between gap-4">
+              <dt>Less payments already recorded for the month (payment batch)</dt>
+              <dd className="font-semibold tabular-nums">−{naira(reconciliation.paymentBatchPaid)}</dd>
+            </div>
+            <div className="flex justify-between gap-4 border-t border-[#cad2b0] pt-1">
+              <dt>Expected remaining payable</dt>
+              <dd className="font-semibold tabular-nums">{naira(reconciliation.expectedRemaining)}</dd>
+            </div>
+            <div className="flex justify-between gap-4">
+              <dt>Grand total on this schedule</dt>
+              <dd className="font-bold tabular-nums">{naira(reconciliation.scheduleTotal)}</dd>
+            </div>
+          </dl>
+          <p className={`mt-2 text-xs font-semibold ${reconciliation.reconciled ? "text-[#166b3d]" : "text-[#a4573c]"}`}>
+            {reconciliation.reconciled
+              ? "Reconciled: this schedule matches the authoritative payroll and payment records for the month."
+              : `DISCREPANCY of ${naira(Math.abs(reconciliation.discrepancy))} vs the authoritative records - investigate before transferring.`}
+          </p>
+          {!reconciliation.reconciled && schedule.nonPayableBalance !== 0 && (
+            <p className="mt-1 text-[11px] text-[#6b6250]">
+              Explained in part by {naira(Math.abs(schedule.nonPayableBalance))} in overpaid or non-payable balances
+              ({schedule.settledExcluded} settled staff excluded from this schedule) - the payroll records show the detail.
+            </p>
+          )}
+        </div>
 
         {sheet.notListed.count > 0 && (
           <p className="mt-3 border-l-2 border-[#c9c3b2] pl-3 text-[11px] leading-relaxed text-[#6b6250]">
             {sheet.notListed.count} worker{sheet.notListed.count === 1 ? "" : "s"} not listed on this
-            sheet{sheet.notListed.supportDeductionOwed > 0
+            schedule{sheet.notListed.supportDeductionOwed > 0
               ? `: a support deduction of ${naira(sheet.notListed.supportDeductionOwed)} arose against work they did not themselves approve this month, so there is no piece-rate earning to deduct it from yet`
               : ""}.
             It is carried forward against their later piece-rate earnings, never written off, and
-            is why this sheet&apos;s total differs from the payroll screen.
+            is why this schedule&apos;s total differs from the payroll screen.
           </p>
         )}
 
         <div className="mt-8 grid gap-6 sm:grid-cols-2">
           <div>
             <p className="border-b border-[#c9c3b2] pb-6 text-[11px] uppercase tracking-wide text-[#6b6250]">
-              Prepared by (date)
+              Prepared by (name, signature, date)
             </p>
           </div>
           <div>
             <p className="border-b border-[#c9c3b2] pb-6 text-[11px] uppercase tracking-wide text-[#6b6250]">
-              Approved by (date)
+              Approved by (name, signature, date)
             </p>
           </div>
         </div>
 
         <p className="mt-6 text-[10px] leading-relaxed text-[#6b6250]">
-          Piecework and support-work amounts are calculated from inspected and approved pieces only; submitted,
-          reworked or rejected work is never payable. This sheet is confidential Matesther payroll information and is
-          intended for the Owner and Matesther&apos;s bank.
+          Amount Payable is the final net for the month after every applicable approved deduction (PAYE tax, cooperative
+          and incident charges are each deducted exactly once), less any payment already recorded for the month. Piecework
+          and support-work amounts are calculated from inspected and approved pieces only. This schedule is confidential
+          Matesther payroll information and is intended for the Owner and Matesther&apos;s bank.
         </p>
       </Letterhead>
     </main>
