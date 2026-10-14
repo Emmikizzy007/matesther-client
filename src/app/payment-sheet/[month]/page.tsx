@@ -20,6 +20,11 @@ type SheetRow = {
   salary: number;
   overtime: number;
   other: number;
+  gross: number;
+  totalDeductions: number;
+  taxDeduction: number;
+  deductionItems: { id: number; categoryName: string; amount: number; calculation: string }[];
+  finalized: boolean;
   due: number;
   paid: number;
   balance: number;
@@ -159,6 +164,12 @@ export default function PaymentSheetPage({ params }: { params: Promise<{ month: 
                         {[row.jobTitle, row.department].filter(Boolean).join(" - ")}
                       </span>
                     )}
+                    <span className="block font-normal text-[#6b6250]">Gross {naira(row.gross)} · deductions {naira(row.totalDeductions)}</span>
+                    {row.deductionItems.map((line) => (
+                      <span key={line.id} className="block font-normal text-[#6b6250]" title={line.calculation}>
+                        {line.categoryName}: {line.amount < 0 ? `refund ${naira(-line.amount)}` : `−${naira(line.amount)}`}
+                      </span>
+                    ))}
                   </td>
                   <td className="px-2 py-2 text-[#4a4f45]">{row.roles.join(", ") || "-"}</td>
                   <td className="px-2 py-2 text-[#4a4f45]">{row.paymentType.replace("_", " ")}</td>

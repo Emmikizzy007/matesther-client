@@ -208,7 +208,7 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: `Select an active ${entry.role ?? "worker"} from Matesther's Workers page.` }, { status: 400 });
       if (entry.role && !(await workerHoldsRole(person, entry.role, roleCache)))
         return NextResponse.json({ error: `${entry.stage.replaceAll("_", " ")} needs a ${entry.role}. ${person.name} does not hold that role.` }, { status: 400 });
-      if (person.paymentType === "PER_PIECE") {
+      if (["PER_PIECE", "HYBRID"].includes(person.paymentType ?? "")) {
         const rate = Number(entry.rate);
         if (!Number.isSafeInteger(rate) || rate < 1)
           return NextResponse.json({ error: `Enter the agreed amount per piece for ${person.name} on this batch.` }, { status: 400 });

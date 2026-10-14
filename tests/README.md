@@ -4,7 +4,7 @@
 npm test
 ```
 
-Runs 386 tests in about 4 minutes. No server, no `DATABASE_URL`, no network,
+Runs the complete regression suite (currently 437 tests, about 4 minutes). No server, no `DATABASE_URL`, no network,
 and **no seeded demo data** are required.
 
 ## Why this suite exists
@@ -28,6 +28,8 @@ place and untouched.
 | `authorization.test.ts` | Role boundaries: Project Manager finance blackout, Worker own-data-only, price and pay-rate redaction |
 | `separation-of-duties.test.ts` | Cutter-supervisor restriction, self-inspection ban, inspector identity, approved-only stage flow, history preservation |
 | `payroll-rules.test.ts` | Payroll accrual (piecework / salary / overtime), plus the pure pay and progress helpers |
+| `deductions.test.ts` | Built-in/custom categories, fixed/percentage/variable/one-time/recurring terms, salary/piece/support/HYBRID, documented leave and one-time stage/support-inspection damage workflows, Nigeria 2026 PAYE, per-person bulk consent, cooperative credits/refunds, period snapshots, one-third ceiling, Owner-only authorization, cross-organisation isolation and duplicate/concurrent API requests |
+| `deductions-migration.test.ts` | Seven additive empty tables, guarded PostgreSQL/SQL Editor upgrade with Supabase RLS/privilege checks, journal/snapshot chain and rollback that refuses to destroy financial history |
 | `multi-role.test.ts` | One person with several roles: no duplicate people, no duplicate roles, role removal keeps the person, legacy single-role workers unchanged, and the cutter-supervisor and self-inspection controls still holding when the role is one of several |
 | `pwa-branding.test.ts` | Installability contract, and the official-logo endpoint: Owner-only upload, the committed official mark served byte-for-byte when none is uploaded, SVG and undersized uploads refused, the stored logo returned **byte-for-byte**, square OS icons, the install button never faked, and the mobile safe-area / tap-target / iOS-zoom fixes |
 | `whatsapp-sharing.test.ts` | WhatsApp deep links: correct `wa.me` number normalisation, refusal to guess an unusable number, no application URL in a shared message, confidentiality handling on the Owner-only payment sheet, and the Owner-only guard still holding on the documents behind the share buttons |

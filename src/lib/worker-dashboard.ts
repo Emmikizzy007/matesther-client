@@ -159,7 +159,7 @@ export async function getWorkerDashboard(user: SessionUser) {
     ? await db.select().from(stageInspections).where(inArray(stageInspections.productionOperationId, opIds))
     : [];
   const jobById = new Map(journal.map((job) => [job.id, job]));
-  const perPiece = profile.paymentType === "PER_PIECE";
+  const perPiece = ["PER_PIECE", "HYBRID"].includes(profile.paymentType ?? "");
   const productionEvents = inspections
     // A split stage has one inspection row PER WORKER credited, all pointing at the
     // same operation. Without this filter a tailor sharing a stage would see - and

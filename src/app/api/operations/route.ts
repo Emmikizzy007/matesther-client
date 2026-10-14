@@ -309,7 +309,7 @@ export async function PUT(req: Request) {
       return NextResponse.json({ error: "This job already has production history. Keep the assigned worker; use a new batch to split the work." }, { status: 400 });
 
     let pieceRate = current.pieceRate;
-    if (person?.paymentType === "PER_PIECE") {
+    if (["PER_PIECE", "HYBRID"].includes(person?.paymentType ?? "")) {
       const proposed = body.pieceRate === undefined || body.pieceRate === "" || body.pieceRate === null
         ? (changedWorker ? null : pieceRate) : Number(body.pieceRate);
       if (changedWorker && (!Number.isSafeInteger(proposed) || (proposed ?? 0) < 1))

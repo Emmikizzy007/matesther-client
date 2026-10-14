@@ -196,7 +196,7 @@ export function StageAllocations({ operation, workers, requiredRole, onChanged }
                 <input className={inputCls} type="number" min="1" max={free} step="1" required value={quantity}
                   onChange={(event) => setQuantity(event.target.value)} />
               </Field>
-              {chosen?.paymentType === "PER_PIECE" ? (
+              {["PER_PIECE", "HYBRID"].includes(chosen?.paymentType ?? "") ? (
                 <Field label="Agreed ₦ per approved piece *">
                   <input className={inputCls} type="number" min="1" step="1" required value={pieceRate}
                     onChange={(event) => setPieceRate(event.target.value)} />
@@ -204,7 +204,7 @@ export function StageAllocations({ operation, workers, requiredRole, onChanged }
               ) : (
                 <div className="self-end"><Btn type="submit" disabled={busy || !workerId || !quantity}>{busy ? "Saving…" : "Allocate"}</Btn></div>
               )}
-              {chosen?.paymentType === "PER_PIECE" && (
+              {["PER_PIECE", "HYBRID"].includes(chosen?.paymentType ?? "") && (
                 <div className="self-end sm:col-span-4"><Btn type="submit" disabled={busy || !workerId || !quantity || !pieceRate}>{busy ? "Saving…" : "Allocate"}</Btn></div>
               )}
             </form>

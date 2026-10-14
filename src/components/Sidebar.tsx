@@ -82,6 +82,7 @@ const OWNER_NAV: NavGroup[] = [
       { href: "/expenses", label: "Expenses", icon: Wallet },
       { href: "/payments", label: "Payments", icon: CreditCard },
       { href: "/payroll", label: "Worker Payments", icon: HandCoins },
+      { href: "/payroll/deductions", label: "Payroll Deductions", icon: Coins },
       { href: "/profitability", label: "Profitability", icon: TrendingUp },
     ],
   },

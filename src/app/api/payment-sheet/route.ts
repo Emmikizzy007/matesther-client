@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { organizations, workerPayments } from "@/db/schema";
-import { guard, OWNER } from "@/lib/authz";
-import { workerAccruals, monthLabel } from "@/lib/payroll";
+import { organizations, workerPayments, workers } from "@/db/schema";
+import { guard, getSessionUser, OWNER } from "@/lib/authz";
+import { monthLabel } from "@/lib/payroll";
+import { getPayrollSummary, requiredOrganization } from "@/lib/payroll-deductions";
 
 export const dynamic = "force-dynamic";
 
@@ -26,7 +27,13 @@ export async function GET(req: Request) {
       ? (requested as string)
       : new Date().toISOString().slice(0, 7);
 
-    const { workers: rows, breakdown } = await workerAccruals(month);
+    const session = (await getSessionUser(req))!;
+    const org = requiredOrganization(session);
+    const { workers: rows, breakdown } = await getPayrollSummary(org, month);
+    // A preview is for review, NOT a bank instruction. Unposted deductions
+    // must be posted (or cancelled) before the payment sheet can be issued.
+    if (rows.some((row) => row.mustPost && !row.finalized))
+      return NextResponse.json({ error: "Approved deductions are still a preview. Post each affected completed worker-month before printing a bank payment sheet." }, { status: 409 });
     const [orgRows, payRows] = await Promise.all([
       db
         .select({
@@ -36,15 +43,17 @@ export async function GET(req: Request) {
           address: organizations.address,
         })
         .from(organizations)
-        .where(eq(organizations.id, 1))
+        .where(eq(organizations.id, org))
         .limit(1),
-      db.select().from(workerPayments).where(eq(workerPayments.periodMonth, month)),
+      db.select({ payment: workerPayments }).from(workerPayments)
+        .innerJoin(workers, eq(workers.id, workerPayments.workerId))
+        .where(and(eq(workerPayments.periodMonth, month), eq(workers.organizationId, org))),
     ]);
 
     // The most recent reference recorded for each person this month, so the bank
     // sheet can be matched against the transfers actually made.
     const referenceByWorker = new Map<number, string>();
-    for (const payment of payRows) {
+    for (const { payment } of payRows) {
       if (payment.reference) referenceByWorker.set(payment.workerId, payment.reference);
     }
 
@@ -102,6 +111,11 @@ export async function GET(req: Request) {
           salary: row.salary,
           overtime: row.overtime,
           other: row.other,
+          gross: row.gross,
+          deductionItems: row.deductionItems,
+          totalDeductions: row.totalDeductions,
+          taxDeduction: row.taxDeduction,
+          finalized: row.finalized,
           due: row.due,
           paid: row.paid,
           balance: row.balance,

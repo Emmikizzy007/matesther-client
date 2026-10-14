@@ -165,10 +165,10 @@ const tailors = alias(workers, "support_cost_tailor");
  * only for people paid per piece. Counting approved pieces only is what keeps order
  * cost consistent with what payroll actually pays out.
  */
-const stageEarnings = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end`;
+const stageEarnings = sql`case when ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end`;
 
 /** A helper's approved support earnings, and the deduction it causes. */
-const supportEarnings = sql`case when ${helpers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${helpers.paymentRate}) else 0 end`;
+const supportEarnings = sql`case when ${helpers.paymentType} in ('PER_PIECE','HYBRID') then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${helpers.paymentRate}) else 0 end`;
 
 /**
  * The deduction an approved support inspection causes, gated on the tailor who handed
@@ -176,7 +176,7 @@ const supportEarnings = sql`case when ${helpers.paymentType} = 'PER_PIECE' then 
  * helper's rate to come out of, so no deduction arises and the helper's pay remains a
  * genuine extra cost of the order.
  */
-const supportDeduction = sql`case when ${tailors.paymentType} = 'PER_PIECE' and ${helpers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${helpers.paymentRate}) else 0 end`;
+const supportDeduction = sql`case when ${tailors.paymentType} in ('PER_PIECE','HYBRID') and ${helpers.paymentType} in ('PER_PIECE','HYBRID') then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${helpers.paymentRate}) else 0 end`;
 
 type CostAccumulator = {
   readyMade: number;
@@ -498,7 +498,7 @@ export async function unattributableCosts(fromDay?: string, toDay?: string) {
       count: sql<number>`count(*)`,
     })
     .from(workers)
-    .where(and(eq(workers.paymentType, "MONTHLY"), eq(workers.status, "ACTIVE")));
+    .where(and(inArray(workers.paymentType, ["MONTHLY", "HYBRID"]), eq(workers.status, "ACTIVE")));
   return {
     /** Monthly salary commitment, i.e. one month of it. */
     monthlySalaries: Number(salaryRows?.total) || 0,

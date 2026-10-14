@@ -18,7 +18,8 @@ import {
 } from "@/db/schema";
 import { desc, gt, sql } from "drizzle-orm";
 import { batchProgress } from "@/lib/server";
-import { workerAccruals, buildGrowth, currentMonth } from "@/lib/payroll";
+import { buildGrowth, currentMonth } from "@/lib/payroll";
+import { getPayrollSummary, requiredOrganization } from "@/lib/payroll-deductions";
 import { guard, getSessionUser, ANYONE } from "@/lib/authz";
 import { getWorkerDashboard } from "@/lib/worker-dashboard";
 import { batchApprovedProgress } from "@/lib/server";
@@ -307,7 +308,7 @@ export async function GET(req: Request) {
 
     /* ================= OWNER view - business + production + money ================= */
     const thisMonth = currentMonth();
-    const payroll = await workerAccruals(thisMonth);
+    const payroll = await getPayrollSummary(requiredOrganization(sessionUser), thisMonth);
     const growth = buildGrowth(orderRows, expenseRows, usageRows);
 
     const recentOrders = orderRows.slice(0, 5).map((o) => ({

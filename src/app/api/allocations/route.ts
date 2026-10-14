@@ -279,7 +279,7 @@ export async function POST(req: Request) {
 
     const existing = await liveAllocations(db, op.id);
     const mine = existing.find((row) => row.workerId === workerId);
-    if (person.paymentType === "PER_PIECE" && !mine) {
+    if (["PER_PIECE", "HYBRID"].includes(person.paymentType ?? "") && !mine) {
       const rate = Number(body.pieceRate);
       if (!Number.isSafeInteger(rate) || rate < 1)
         return NextResponse.json({ error: `Enter the agreed amount per approved piece for ${person.name} on this stage.` }, { status: 400 });

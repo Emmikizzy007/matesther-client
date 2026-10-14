@@ -149,7 +149,7 @@ export default function WorkersPage() {
                     </td>
                     {isOwner && <td className="px-3 py-3 text-xs">
                       {w.paymentType.replace("_", " ")}<br />
-                      <span className="font-semibold">{w.paymentType === "PER_PIECE" ? "Agreed per job" : naira(w.paymentRate)}</span>
+                      <span className="font-semibold">{w.paymentType === "HYBRID" ? `${naira(w.paymentRate)} / month + by job` : w.paymentType === "PER_PIECE" ? "Agreed per job" : naira(w.paymentRate)}</span>
                     </td>}
                     <td className="px-3 py-3 text-right font-bold">{w.currentTasks}</td>
                     <td className="px-3 py-3 text-right">{w.assigned.toLocaleString()}</td>
@@ -213,14 +213,16 @@ export default function WorkersPage() {
               <option value="PER_PIECE">Per piece</option>
               <option value="DAILY">Daily</option>
               <option value="MONTHLY">Monthly</option>
+              <option value="HYBRID">Monthly salary + approved pieces</option>
             </select>
           </Field>
           {form.paymentType === "PER_PIECE" ? <p className="self-end rounded-lg border border-matesther-100 bg-matesther-50 p-2 text-xs text-matesther-800">Agree the price per garment when assigning each production job. This profile does not fix one price for all clothes.</p>
-            : <Field label={form.paymentType === "MONTHLY" ? "Monthly salary (₦)" : "Daily rate (₦)"}><input type="number" min="0" value={form.paymentRate} onChange={(e) => setForm({ ...form, paymentRate: e.target.value })} className={inputCls} /></Field>}
+            : <Field label={["MONTHLY", "HYBRID"].includes(form.paymentType) ? "Monthly salary (₦)" : "Daily rate (₦)"}><input type="number" min="0" value={form.paymentRate} onChange={(e) => setForm({ ...form, paymentRate: e.target.value })} className={inputCls} /></Field>}
+          {form.paymentType === "HYBRID" && <p className="sm:col-span-2 text-xs text-amber-900 bg-amber-50 rounded-lg p-2">Salary is added monthly; piece rates are agreed on individual jobs and paid only on approved pieces. To protect past payroll, changing an established worker into or out of this payment type is blocked.</p>}
           <label className="flex items-center gap-2 text-sm text-slate-700 sm:col-span-2">
             <input type="checkbox" checked={!!form.isInspector} onChange={(e) => setForm({ ...form, isInspector: e.target.checked })} className="accent-matesther-700" />
             <span>
-              Also inspects production work - <span className="text-slate-500">they'll appear in the Inspection Queue's “Inspectors on duty”</span>
+              Also inspects production work - <span className="text-slate-500">they&apos;ll appear in the Inspection Queue&apos;s “Inspectors on duty”</span>
             </span>
           </label>
           {editing && (

@@ -226,7 +226,7 @@ export async function POST(req: Request) {
         }, { status: 403 });
     }
     const [assigned] = op.workerId ? await db.select().from(workers).where(eq(workers.id, op.workerId)).limit(1) : [];
-    const agreedRate = assigned?.paymentType === "PER_PIECE" ? op.pieceRate ?? assigned.paymentRate : null;
+    const agreedRate = ["PER_PIECE", "HYBRID"].includes(assigned?.paymentType ?? "") ? op.pieceRate ?? assigned.paymentRate : null;
 
     const pending = (op.quantityCompleted ?? 0) - (op.quantityInspected ?? 0);
     if (total > pending)
@@ -258,7 +258,7 @@ export async function POST(req: Request) {
             rejected: row.rejected,
             // The rate agreed with THIS worker for THIS stage, then the same
             // fallbacks that have always applied: the job rate, then their profile.
-            rate: allocation.pieceRate ?? (person?.paymentType === "PER_PIECE" ? op.pieceRate ?? person.paymentRate : null),
+            rate: allocation.pieceRate ?? (person && ["PER_PIECE", "HYBRID"].includes(person.paymentType) ? op.pieceRate ?? person.paymentRate : null),
           };
         });
       if (!shares.length)
@@ -272,7 +272,7 @@ export async function POST(req: Request) {
       let rate = agreedRate;
       if (only) {
         const [person] = await db.select().from(workers).where(eq(workers.id, only.workerId)).limit(1);
-        rate = only.pieceRate ?? (person?.paymentType === "PER_PIECE" ? op.pieceRate ?? person.paymentRate : null);
+        rate = only.pieceRate ?? (["PER_PIECE", "HYBRID"].includes(person?.paymentType ?? "") ? op.pieceRate ?? person.paymentRate : null);
       }
       shares = [{ workerId: only?.workerId ?? null, allocation: only, approved, rework, rejected, rate }];
     }
