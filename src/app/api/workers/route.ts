@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
-import { and, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { and, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { workers, users, productionOperations, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime } from "@/db/schema";
+import { workers, users, productionOperations, productionAllocations, supportAssignments, productionBatches, orders, customers, stageInspections, workerPayments, workerOvertime, payrollDeductions, payrollAttendance, payrollStatements } from "@/db/schema";
+import { currentMonth, monthKey } from "@/lib/payroll";
 import { guard, getSessionUser, getLinkedWorkerId, ANYONE, OWNER, STAFF } from "@/lib/authz";
 import { SUPPORT_ROLE, hasRole } from "@/lib/format";
 import { allocatedTotalsByWorker, operationIdsWithAllocations } from "@/lib/production-allocation";
@@ -22,7 +23,7 @@ import {
  * PER_PIECE people earn it. It replaced a loop that re-scanned every inspection
  * in the database once per worker: O(workers x all inspections ever).
  */
-const LIFETIME_EARNINGS = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
+const LIFETIME_EARNINGS = sql`coalesce(sum(case when ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
 
 /**
  * Who an inspection's approved pieces belong to - the same rule lib/payroll.ts uses.
@@ -217,9 +218,8 @@ export async function GET(req: Request) {
       // Their share of any split stage, added to the stages they hold outright.
       const share = allocationStats.get(person.id);
       // MONTHLY people are shown their salary, exactly as before.
-      const earned = person.paymentType === "MONTHLY"
-        ? person.paymentRate
-        : earnedByWorker.get(person.id) ?? 0;
+      const earned = (person.paymentType === "MONTHLY" || person.paymentType === "HYBRID" ? person.paymentRate : 0)
+        + (person.paymentType === "PER_PIECE" || person.paymentType === "HYBRID" ? earnedByWorker.get(person.id) ?? 0 : 0);
       return {
         ...personView(person),
         // Additive: every person still carries `specialty`; `roles` is the
@@ -282,9 +282,9 @@ export async function POST(req: Request) {
     const body = await req.json();
     const name = String(body.name ?? "").trim();
     if (!name) return NextResponse.json({ error: "Worker name is required." }, { status: 400 });
-    const paymentType = ["PER_PIECE", "MONTHLY", "DAILY"].includes(body.paymentType) ? body.paymentType : "PER_PIECE";
+    const paymentType = ["PER_PIECE", "MONTHLY", "HYBRID", "DAILY"].includes(body.paymentType) ? body.paymentType : "PER_PIECE";
     const rate = Number(body.paymentRate) || 0;
-    if (!Number.isSafeInteger(rate) || rate < 0 || (paymentType === "MONTHLY" && rate < 1))
+    if (!Number.isSafeInteger(rate) || rate < 0 || (["MONTHLY", "HYBRID"].includes(paymentType) && rate < 1))
       return NextResponse.json({ error: "Enter a valid monthly salary, or set the per-piece amount when assigning the job." }, { status: 400 });
     const roles = normaliseRoles(body.roles, String(body.specialty ?? "Tailor").trim() || "Tailor");
     const invalid = unknownRoles(roles);
@@ -319,10 +319,33 @@ export async function PUT(req: Request) {
     if (!Number.isSafeInteger(id) || id < 1) return NextResponse.json({ error: "Select a worker." }, { status: 400 });
     const [existing] = await db.select().from(workers).where(eq(workers.id, id)).limit(1);
     if (!existing) return NextResponse.json({ error: "Worker not found." }, { status: 404 });
-    const paymentType = ["PER_PIECE", "MONTHLY", "DAILY"].includes(body.paymentType) ? body.paymentType : existing.paymentType;
+    const paymentType = ["PER_PIECE", "MONTHLY", "HYBRID", "DAILY"].includes(body.paymentType) ? body.paymentType : existing.paymentType;
     const rate = Number(body.paymentRate);
-    if (!Number.isSafeInteger(rate) || rate < 0 || (paymentType === "MONTHLY" && rate < 1))
+    if (!Number.isSafeInteger(rate) || rate < 0 || (["MONTHLY", "HYBRID"].includes(paymentType) && rate < 1))
       return NextResponse.json({ error: "Enter a valid salary. Per-piece pay is set on each production job." }, { status: 400 });
+    // New HYBRID contracts cannot be applied RETROACTIVELY to an established
+    // worker: the old schema has no effective-dated payment-contract history.
+    // Simply flipping the type would convert all their earlier MONTHLY/PER_PIECE
+    // inspections and salaries into a different amount due, even if already paid.
+    // A fresh, unused profile can choose HYBRID; an established person's change
+    // needs a separately agreed effective-dated contract design, not a silent PUT.
+    if (paymentType !== existing.paymentType && [paymentType, existing.paymentType].includes("HYBRID")) {
+      const hasPriorMonth = !!existing.createdAt && monthKey(existing.createdAt) < currentMonth();
+      const cannotRestate = { error: "This worker already has pay/production history. Switching into or out of salary + piecework would rewrite past earnings. Keep the existing type until an effective-dated contract change is approved." };
+      if (hasPriorMonth) return NextResponse.json(cannotRestate, { status: 409 });
+      const histories = await Promise.all([
+        db.select({ id: productionOperations.id }).from(productionOperations).where(eq(productionOperations.workerId, id)).limit(1),
+        db.select({ id: productionAllocations.id }).from(productionAllocations).where(eq(productionAllocations.workerId, id)).limit(1),
+        db.select({ id: supportAssignments.id }).from(supportAssignments)
+          .where(or(eq(supportAssignments.workerId, id), eq(supportAssignments.assignedByWorkerId, id))).limit(1),
+        db.select({ id: workerPayments.id }).from(workerPayments).where(eq(workerPayments.workerId, id)).limit(1),
+        db.select({ id: workerOvertime.id }).from(workerOvertime).where(eq(workerOvertime.workerId, id)).limit(1),
+        db.select({ id: payrollDeductions.id }).from(payrollDeductions).where(eq(payrollDeductions.workerId, id)).limit(1),
+        db.select({ id: payrollStatements.id }).from(payrollStatements).where(eq(payrollStatements.workerId, id)).limit(1),
+      ]);
+      if (histories.some((rows) => rows.length > 0))
+        return NextResponse.json(cannotRestate, { status: 409 });
+    }
     const status = body.status === "INACTIVE" ? "INACTIVE" : "ACTIVE";
     const roles = body.roles === undefined ? null : normaliseRoles(body.roles, existing.specialty);
     const invalid = roles ? unknownRoles(roles) : [];
@@ -359,12 +382,15 @@ export async function DELETE(req: Request) {
     if (!Number.isSafeInteger(id) || id < 1) return NextResponse.json({ error: "Select a worker." }, { status: 400 });
     const [person] = await db.select().from(workers).where(eq(workers.id, id)).limit(1);
     if (!person) return NextResponse.json({ error: "Worker not found." }, { status: 404 });
-    const [jobs, wages, overtime] = await Promise.all([
+    const [jobs, wages, overtime, cases, attendance, statements] = await Promise.all([
       db.select({ id: productionOperations.id }).from(productionOperations).where(eq(productionOperations.workerId, id)).limit(1),
       db.select({ id: workerPayments.id }).from(workerPayments).where(eq(workerPayments.workerId, id)).limit(1),
       db.select({ id: workerOvertime.id }).from(workerOvertime).where(eq(workerOvertime.workerId, id)).limit(1),
+      db.select({ id: payrollDeductions.id }).from(payrollDeductions).where(eq(payrollDeductions.workerId, id)).limit(1),
+      db.select({ id: payrollAttendance.id }).from(payrollAttendance).where(eq(payrollAttendance.workerId, id)).limit(1),
+      db.select({ id: payrollStatements.id }).from(payrollStatements).where(eq(payrollStatements.workerId, id)).limit(1),
     ]);
-    const archived = jobs.length > 0 || wages.length > 0 || overtime.length > 0;
+    const archived = [jobs, wages, overtime, cases, attendance, statements].some((rows) => rows.length > 0);
     await db.transaction(async (tx) => {
       await tx.update(users).set({ status: "INACTIVE" }).where(eq(users.workerId, id));
       if (archived) await tx.update(workers).set({ status: "INACTIVE", archivedAt: person.archivedAt ?? new Date() }).where(eq(workers.id, id));

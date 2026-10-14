@@ -107,7 +107,8 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
   );
 
   const p = d.profile;
-  const rate = p?.paymentType === "PER_PIECE" ? "Agreed separately for each production job" : `${naira(p.paymentRate)} per month`;
+  const rate = p.paymentType === "HYBRID" ? `${naira(p.paymentRate)} per month PLUS an agreed rate per approved garment`
+    : p.paymentType === "PER_PIECE" ? "Agreed separately for each production job" : `${naira(p.paymentRate)} per month`;
 
   if (mode === "profile") {
     return (
@@ -127,7 +128,8 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
   if (mode === "earnings") {
     return (
       <div>
-        <PageHeader title="My Earnings" subtitle={p?.paymentType === "PER_PIECE" ? "You are paid when your work is inspected and approved" : "Monthly wage worker"} />
+        <PageHeader title="My Earnings" subtitle={p.paymentType === "HYBRID" ? "Production earnings shown here are on approved work only; your monthly salary is an additional part of payroll, not counted in these work-journal figures."
+          : p.paymentType === "PER_PIECE" ? "You are paid when your work is inspected and approved" : "Production journal; monthly salary is settled through payroll."} />
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
           <StatCard label="Today" value={naira(d.earnings.today)} icon={<Coins className="w-5 h-5" />} />
           <StatCard label="This Week" value={naira(d.earnings.week)} icon={<Coins className="w-5 h-5" />} tone="blue" />
@@ -236,7 +238,7 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
             <p className="mt-3 font-semibold text-matesther-900">{job.garment}{job.size ? ` • Size ${job.size}` : ""}{job.color ? ` • ${job.color}` : ""}</p>
             <p className="mt-1 text-sm text-slate-600">{stageLabel(job.stage)} • Due {fmtDate(job.expectedCompletionDate)}</p>
             <div className="mt-3 grid grid-cols-3 gap-2 rounded-lg bg-slate-50 p-2 text-center text-xs"><div><p className="text-slate-500">Received</p><strong>{job.quantityReceived}</strong></div><div><p className="text-slate-500">Left</p><strong>{job.quantityRemaining}</strong></div><div><p className="text-slate-500">To inspect</p><strong className="text-violet-700">{job.pendingInspection}</strong></div></div>
-            <p className="mt-2 text-xs font-semibold text-matesther-800">{p.paymentType === "PER_PIECE" ? `${naira(job.pieceRate ?? p.paymentRate)} per approved piece` : "Monthly salary"}</p>
+            <p className="mt-2 text-xs font-semibold text-matesther-800">{["PER_PIECE", "HYBRID"].includes(p.paymentType ?? "") ? `${naira(job.pieceRate ?? p.paymentRate)} per approved piece` : "Monthly salary"}</p>
             {["IN_PROGRESS", "SUBMITTED"].includes(job.status) && job.availableToSubmit > 0 && <Btn className="mt-3 w-full" variant="secondary" onClick={() => { setSubmitErr(""); setQty(String(job.availableToSubmit)); setSubmit(job); }}>Submit finished pieces</Btn>}
           </div>)}
           {d.todayJobs.length === 0 && <p className="p-5 text-sm text-slate-500">No active jobs right now.</p>}
@@ -262,7 +264,7 @@ export default function WorkerPages({ mode }: { mode: Mode }) {
                   <td className="px-3 py-3">{j.garment}{j.size && <span className="block text-xs font-semibold text-matesther-800">Size {j.size}</span>}{j.color && <span className="block text-xs text-slate-500">{j.color}</span>}</td>
                   <td className="px-3 py-3">{stageLabel(j.stage)} <span className="text-xs text-slate-400">({j.batchNumber})</span></td>
                   <td className="px-3 py-3 text-right font-bold">{j.quantityRemaining}</td>
-                  <td className="px-3 py-3 text-right">{p?.paymentType === "PER_PIECE" ? `${naira(j.pieceRate ?? p.paymentRate)}/pc` : "Monthly salary"}</td>
+                  <td className="px-3 py-3 text-right">{["PER_PIECE", "HYBRID"].includes(p?.paymentType ?? "") ? `${naira(j.pieceRate ?? p.paymentRate)}/pc` : "Monthly salary"}</td>
                   <td className="px-3 py-3 text-xs">{fmtDate(j.expectedCompletionDate)}</td>
                   <td className="px-3 py-3">
                     <Badge status={j.status} />

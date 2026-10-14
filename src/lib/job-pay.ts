@@ -13,6 +13,6 @@ export function inspectionPieceRate(check: RateInspection, job: RateJob, worker:
 }
 
 export function inspectionEarnings(check: RateInspection, job: RateJob, worker: RateWorker): number {
-  if (worker.paymentType !== "PER_PIECE") return 0;
+  if (!(["PER_PIECE", "HYBRID"].includes(worker.paymentType))) return 0;
   return check.quantityApproved * inspectionPieceRate(check, job, worker);
 }

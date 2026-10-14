@@ -564,7 +564,7 @@ test("payroll separates salary, production piecework, support piecework, overtim
     // `supportDeduction` is the other side of `supportPiecework`: what approved
     // support work takes back out of the tailors who handed it out. It is its own
     // line rather than being netted into piecework so the two can be reconciled.
-    ["other", "overtime", "piecework", "salary", "supportDeduction", "supportDeductionOwed", "supportPiecework"]
+    ["gross", "other", "overtime", "payrollDeductions", "piecework", "salary", "supportDeduction", "supportDeductionOwed", "supportPiecework", "taxDeduction", "totalDeductions"]
   );
   assert.equal(payroll.data.breakdown.supportPiecework >= 5 * 200, true);
   // This person only ever RECEIVED support work, so nothing is deducted from them.

@@ -493,7 +493,7 @@ export async function POST(req: Request) {
     const rate = body.pieceRate === undefined || body.pieceRate === "" ? 0 : Number(body.pieceRate);
     if (!Number.isSafeInteger(rate) || rate < 0)
       return NextResponse.json({ error: "The agreed rate must be a whole naira amount." }, { status: 400 });
-    if (person.paymentType === "PER_PIECE" && rate < 1)
+    if (["PER_PIECE", "HYBRID"].includes(person.paymentType ?? "") && rate < 1)
       return NextResponse.json(
         { error: `Enter the agreed per-piece rate for ${person.name} on this support work.` },
         { status: 400 }

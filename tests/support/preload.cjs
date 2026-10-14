@@ -64,6 +64,7 @@ const MIGRATIONS = [
   "0010_actor_audit",
   "0011_support_lifecycle",
   "0012_deletion_and_purge_audit",
+  "0013_payroll-deductions",
 ];
 const INNER_STATEMENTS = /ALTER TABLE[^;]+;/g;
 /**
@@ -191,6 +192,14 @@ const REQUIRED_COLUMNS = [
   ["test_data_purges", "preview_fingerprint"],
   ["test_data_purges", "payroll_report"],
   ["test_data_purges", "inventory_report"],
+  ["payroll_deduction_categories", "slug"],
+  ["payroll_attendance", "status"],
+  ["payroll_deductions", "authority_ref"],
+  ["payroll_deductions", "incident_support_inspection_id"],
+  ["payroll_deduction_audit", "actor_name"],
+  ["payroll_statements", "net"],
+  ["payroll_statement_lines", "cooperative_credit"],
+  ["payroll_reversals", "source_line_id"],
 ];
 for (const [table, column] of REQUIRED_COLUMNS) {
   mem.public.none(`select "${column}" from "${table}" limit 1`);

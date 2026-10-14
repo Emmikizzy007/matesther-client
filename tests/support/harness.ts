@@ -31,6 +31,14 @@ import * as batchesRoute from "@/app/api/batches/route";
 import * as operationsRoute from "@/app/api/operations/route";
 import * as inspectionsRoute from "@/app/api/inspections/route";
 import * as payrollRoute from "@/app/api/payroll/route";
+import * as deductionRoute from "@/app/api/payroll-deductions/route";
+import * as deductionCategoryRoute from "@/app/api/payroll-deductions/categories/route";
+import * as attendanceRoute from "@/app/api/payroll-deductions/attendance/route";
+import * as deductionPostRoute from "@/app/api/payroll-deductions/post/route";
+import * as deductionWorkerRoute from "@/app/api/payroll-deductions/workers/route";
+import * as deductionIncidentRoute from "@/app/api/payroll-deductions/incidents/route";
+import * as cooperativeRoute from "@/app/api/payroll-deductions/cooperative/route";
+import * as reversalRoute from "@/app/api/payroll-deductions/reversals/route";
 import * as supportWorkRoute from "@/app/api/support-work/route";
 import * as supportInspectionsRoute from "@/app/api/support-work/inspections/route";
 import * as paymentSheetRoute from "@/app/api/payment-sheet/route";
@@ -93,6 +101,22 @@ const ROUTES: Record<string, Handler> = {
   "POST /api/inspections": inspectionsRoute.POST,
   "GET /api/payroll": payrollRoute.GET,
   "POST /api/payroll": payrollRoute.POST,
+  "GET /api/payroll-deductions": deductionRoute.GET,
+  "POST /api/payroll-deductions": deductionRoute.POST,
+  "PUT /api/payroll-deductions": deductionRoute.PUT,
+  "GET /api/payroll-deductions/categories": deductionCategoryRoute.GET,
+  "POST /api/payroll-deductions/categories": deductionCategoryRoute.POST,
+  "PUT /api/payroll-deductions/categories": deductionCategoryRoute.PUT,
+  "GET /api/payroll-deductions/attendance": attendanceRoute.GET,
+  "POST /api/payroll-deductions/attendance": attendanceRoute.POST,
+  "PUT /api/payroll-deductions/attendance": attendanceRoute.PUT,
+  "POST /api/payroll-deductions/post": deductionPostRoute.POST,
+  "GET /api/payroll-deductions/workers": deductionWorkerRoute.GET,
+  "GET /api/payroll-deductions/incidents": deductionIncidentRoute.GET,
+  "GET /api/payroll-deductions/cooperative": cooperativeRoute.GET,
+  "GET /api/payroll-deductions/reversals": reversalRoute.GET,
+  "POST /api/payroll-deductions/reversals": reversalRoute.POST,
+  "PUT /api/payroll-deductions/reversals": reversalRoute.PUT,
   "GET /api/support-work": supportWorkRoute.GET,
   "POST /api/support-work": supportWorkRoute.POST,
   "PUT /api/support-work": supportWorkRoute.PUT,

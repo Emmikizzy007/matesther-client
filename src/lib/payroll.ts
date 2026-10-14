@@ -1,6 +1,7 @@
 import { db } from "@/db";
 import {
   workers,
+  workerRoles,
   productionOperations,
   stageInspections,
   workerPayments,
@@ -12,7 +13,9 @@ import { and, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { inspectionEarnings } from "@/lib/job-pay";
 import { staffCategories } from "@/lib/format";
-import { rolesByWorker, rolesForWorker } from "@/lib/worker-roles";
+import { effectiveRoles, rolesByWorker, rolesForWorker, rolesForWorkerIds } from "@/lib/worker-roles";
+
+export type PayrollDb = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 /* ---------------- month helpers ---------------- */
 
@@ -146,12 +149,12 @@ export interface WorkerAccrual {
  */
 const PAID_WORKER = sql`coalesce(${stageInspections.workerId}, ${productionOperations.workerId})`;
 
-const PIECEWORK_SUM = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
-const SUPPORT_SUM = sql`coalesce(sum(case when ${workers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
+const PIECEWORK_SUM = sql`coalesce(sum(case when ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
+const SUPPORT_SUM = sql`coalesce(sum(case when ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
 
 /** The same rule for ONE row, for the history path which buckets in JS. */
-const PIECEWORK_ROW = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end`;
-const SUPPORT_ROW = sql`case when ${workers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end`;
+const PIECEWORK_ROW = sql`case when ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${stageInspections.quantityApproved} * coalesce(${stageInspections.pieceRate}, ${productionOperations.pieceRate}, ${workers.paymentRate}) else 0 end`;
+const SUPPORT_ROW = sql`case when ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end`;
 
 /**
  * The DEDUCTION side of support work.
@@ -189,7 +192,7 @@ const supportTailor = alias(workers, "payroll_support_tailor");
  * so there is nothing to deduct from and nothing to carry: the helper is still paid, and
  * that pay is a real extra cost of the work rather than a slice of somebody's commission.
  */
-const DEDUCTION_SUM = sql`coalesce(sum(case when ${supportTailor.paymentType} = 'PER_PIECE' and ${workers.paymentType} = 'PER_PIECE' then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
+const DEDUCTION_SUM = sql`coalesce(sum(case when ${supportTailor.paymentType} in ('PER_PIECE','HYBRID') and ${workers.paymentType} in ('PER_PIECE','HYBRID') then ${supportInspections.quantityApproved} * coalesce(${supportInspections.pieceRate}, ${supportAssignments.pieceRate}, ${workers.paymentRate}) else 0 end), 0)`;
 
 type PieceworkRow = { workerId: number; pieces: number; piecework: number };
 
@@ -228,8 +231,8 @@ const monthIndexOfColumn = (column: any) =>
 type SupportRow = { workerId: number; supportPieces: number; supportPiecework: number };
 
 /** Stage piecework per worker for a month, in ONE grouped query. */
-async function stagePiecework(from: Date, to: Date, workerId?: number): Promise<Map<number, PieceworkRow>> {
-  const rows = await db
+async function stagePiecework(from: Date, to: Date, workerId?: number, handle: PayrollDb = db, workerIds?: number[]): Promise<Map<number, PieceworkRow>> {
+  const rows = await handle
     .select({
       workerId: PAID_WORKER,
       pieces: sql<number>`coalesce(sum(${stageInspections.quantityApproved}), 0)`,
@@ -242,7 +245,8 @@ async function stagePiecework(from: Date, to: Date, workerId?: number): Promise<
       and(
         gte(stageInspections.inspectedAt, from),
         lt(stageInspections.inspectedAt, to),
-        workerId === undefined ? undefined : eq(PAID_WORKER, workerId)
+        workerId === undefined ? undefined : eq(PAID_WORKER, workerId),
+        workerIds === undefined ? undefined : inArray(PAID_WORKER, workerIds)
       )
     )
     .groupBy(PAID_WORKER);
@@ -255,8 +259,8 @@ async function stagePiecework(from: Date, to: Date, workerId?: number): Promise<
 }
 
 /** Support piecework per worker for a month, in ONE grouped query. */
-async function supportPiecework(from: Date, to: Date, workerId?: number): Promise<Map<number, SupportRow>> {
-  const rows = await db
+async function supportPiecework(from: Date, to: Date, workerId?: number, handle: PayrollDb = db, workerIds?: number[]): Promise<Map<number, SupportRow>> {
+  const rows = await handle
     .select({
       workerId: supportAssignments.workerId,
       supportPieces: sql<number>`coalesce(sum(${supportInspections.quantityApproved}), 0)`,
@@ -269,7 +273,8 @@ async function supportPiecework(from: Date, to: Date, workerId?: number): Promis
       and(
         gte(supportInspections.inspectedAt, from),
         lt(supportInspections.inspectedAt, to),
-        workerId === undefined ? undefined : eq(supportAssignments.workerId, workerId)
+        workerId === undefined ? undefined : eq(supportAssignments.workerId, workerId),
+        workerIds === undefined ? undefined : inArray(supportAssignments.workerId, workerIds)
       )
     )
     .groupBy(supportAssignments.workerId);
@@ -312,10 +317,12 @@ async function supportPiecework(from: Date, to: Date, workerId?: number): Promis
  */
 async function deductionSchedule(
   endMonth: string,
-  workerId?: number
+  workerId?: number,
+  handle: PayrollDb = db,
+  workerIds?: number[]
 ): Promise<Map<number, Map<string, DeductionMonth>>> {
   const schedule = new Map<number, Map<string, DeductionMonth>>();
-  const [firstRow] = await db
+  const [firstRow] = await handle
     .select({ first: sql<Date | null>`min(${supportInspections.inspectedAt})` })
     .from(supportInspections);
   const firstDate = firstRow?.first ? new Date(firstRow.first) : null;
@@ -336,7 +343,7 @@ async function deductionSchedule(
   // (production piecework, and support piecework the worker earned themselves), and
   // the deductions arising against the worker who handed the work out.
   const [stageBase, supportBase, arising] = await Promise.all([
-    db
+    handle
       .select({
         workerId: PAID_WORKER,
         monthIndex: stageMonth,
@@ -344,11 +351,12 @@ async function deductionSchedule(
       })
       .from(stageInspections)
       .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
-      .innerJoin(workers, eq(workers.id, productionOperations.workerId))
+      .innerJoin(workers, eq(workers.id, PAID_WORKER))
       .where(and(gte(stageInspections.inspectedAt, from), lt(stageInspections.inspectedAt, to),
-        scope === undefined ? undefined : eq(PAID_WORKER, scope)))
+        scope === undefined ? undefined : eq(PAID_WORKER, scope),
+        workerIds === undefined ? undefined : inArray(PAID_WORKER, workerIds)))
       .groupBy(PAID_WORKER, stageMonth),
-    db
+    handle
       .select({
         workerId: supportAssignments.workerId,
         monthIndex: supportMonth,
@@ -358,9 +366,10 @@ async function deductionSchedule(
       .innerJoin(supportAssignments, eq(supportAssignments.id, supportInspections.supportAssignmentId))
       .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
       .where(and(gte(supportInspections.inspectedAt, from), lt(supportInspections.inspectedAt, to),
-        scope === undefined ? undefined : eq(supportAssignments.workerId, scope)))
+        scope === undefined ? undefined : eq(supportAssignments.workerId, scope),
+        workerIds === undefined ? undefined : inArray(supportAssignments.workerId, workerIds)))
       .groupBy(supportAssignments.workerId, supportMonth),
-    db
+    handle
       .select({
         workerId: supportAssignments.assignedByWorkerId,
         monthIndex: supportMonth,
@@ -372,7 +381,8 @@ async function deductionSchedule(
       .innerJoin(workers, eq(workers.id, supportAssignments.workerId))
       .innerJoin(supportTailor, eq(supportTailor.id, supportAssignments.assignedByWorkerId))
       .where(and(gte(supportInspections.inspectedAt, from), lt(supportInspections.inspectedAt, to),
-        scope === undefined ? undefined : eq(supportAssignments.assignedByWorkerId, scope)))
+        scope === undefined ? undefined : eq(supportAssignments.assignedByWorkerId, scope),
+        workerIds === undefined ? undefined : inArray(supportAssignments.assignedByWorkerId, workerIds)))
       .groupBy(supportAssignments.assignedByWorkerId, supportMonth),
   ]);
 
@@ -424,8 +434,8 @@ async function deductionSchedule(
 
 /** Amount already paid per worker for a month. `period_month` is TEXT, so this
  *  is an exact match with no timestamp semantics involved. */
-async function paidByWorker(months: string[], workerId?: number): Promise<Map<number, number>> {
-  const rows = await db
+async function paidByWorker(months: string[], workerId?: number, handle: PayrollDb = db, workerIds?: number[]): Promise<Map<number, number>> {
+  const rows = await handle
     .select({
       workerId: workerPayments.workerId,
       periodMonth: workerPayments.periodMonth,
@@ -435,7 +445,8 @@ async function paidByWorker(months: string[], workerId?: number): Promise<Map<nu
     .where(
       and(
         inArray(workerPayments.periodMonth, months),
-        workerId === undefined ? undefined : eq(workerPayments.workerId, workerId)
+        workerId === undefined ? undefined : eq(workerPayments.workerId, workerId),
+        workerIds === undefined ? undefined : inArray(workerPayments.workerId, workerIds)
       )
     )
     .groupBy(workerPayments.workerId, workerPayments.periodMonth);
@@ -451,10 +462,10 @@ type ExtraRow = { workerId: number; overtime: number; other: number };
 
 /** Overtime and other approved earnings per worker for a month.
  *  `months` is the inclusive list of `YYYY-MM` keys to cover. */
-async function extrasByWorker(months: string[], workerId?: number): Promise<Map<number, ExtraRow>> {
+async function extrasByWorker(months: string[], workerId?: number, handle: PayrollDb = db, workerIds?: number[]): Promise<Map<number, ExtraRow>> {
   const from = `${months[0]}-01`;
   const to = `${shiftMonth(months[months.length - 1], 1)}-01`;
-  const rows = await db
+  const rows = await handle
     .select({
       workerId: workerOvertime.workerId,
       // `category` is NOT NULL DEFAULT 'OVERTIME'; the coalesce mirrors the
@@ -467,7 +478,8 @@ async function extrasByWorker(months: string[], workerId?: number): Promise<Map<
       and(
         gte(workerOvertime.workedOn, from),
         lt(workerOvertime.workedOn, to),
-        workerId === undefined ? undefined : eq(workerOvertime.workerId, workerId)
+        workerId === undefined ? undefined : eq(workerOvertime.workerId, workerId),
+        workerIds === undefined ? undefined : inArray(workerOvertime.workerId, workerIds)
       )
     )
     .groupBy(workerOvertime.workerId);
@@ -492,7 +504,7 @@ function salaryFor(w: {
 }, month: string): number {
   const rate = w.paymentRate ?? 0;
   const activeDuringMonth = w.status === "ACTIVE" || (!!w.archivedAt && month <= monthKey(w.archivedAt));
-  return w.paymentType === "MONTHLY" && activeDuringMonth && (!w.createdAt || month >= monthKey(w.createdAt)) ? rate : 0;
+  return (w.paymentType === "MONTHLY" || w.paymentType === "HYBRID") && activeDuringMonth && (!w.createdAt || month >= monthKey(w.createdAt)) ? rate : 0;
 }
 
 function assemble(
@@ -552,20 +564,21 @@ function assemble(
  * `support_inspections` whose rows were then thrown away by a JS month filter.
  * It now issues 7 statements and reads only that person's rows for that month.
  */
-export async function accrualForWorker(workerId: number, month: string): Promise<WorkerAccrual | null> {
-  const [w] = await db.select().from(workers).where(eq(workers.id, workerId));
+export async function accrualForWorker(workerId: number, month: string, handle: PayrollDb = db): Promise<WorkerAccrual | null> {
+  const [w] = await handle.select().from(workers).where(eq(workers.id, workerId));
   if (!w) return null;
   const { from, to } = monthBounds(month);
   const [stage, support, delegated, paid, extra, roles] = await Promise.all([
-    stagePiecework(from, to, workerId),
-    supportPiecework(from, to, workerId),
-    deductionSchedule(month, workerId),
-    paidByWorker([month], workerId),
-    extrasByWorker([month], workerId),
-    rolesForWorker(workerId),
+    stagePiecework(from, to, workerId, handle),
+    supportPiecework(from, to, workerId, handle),
+    deductionSchedule(month, workerId, handle),
+    paidByWorker([month], workerId, handle),
+    extrasByWorker([month], workerId, handle),
+    handle.select({ role: workerRoles.role, isPrimary: workerRoles.isPrimary })
+      .from(workerRoles).where(eq(workerRoles.workerId, workerId)),
   ]);
   return assemble(
-    w, month, roles, stage.get(workerId), support.get(workerId),
+    w, month, effectiveRoles(w.specialty, roles), stage.get(workerId), support.get(workerId),
     paid.get(workerId) ?? 0, extra.get(workerId), delegated.get(workerId)?.get(month)
   );
 }
@@ -618,16 +631,18 @@ export async function allTimePiecework(): Promise<Map<number, PieceworkRow>> {
   );
 }
 
-export async function workerAccruals(month: string) {
+export async function workerAccruals(month: string, organizationId?: number) {
   const { from, to } = monthBounds(month);
-  const [people, roleMap, stage, support, delegated, paid, extra] = await Promise.all([
-    db.select().from(workers),
-    rolesByWorker(),
-    stagePiecework(from, to),
-    supportPiecework(from, to),
-    deductionSchedule(month),
-    paidByWorker([month]),
-    extrasByWorker([month]),
+  const people = await db.select().from(workers)
+    .where(organizationId === undefined ? undefined : eq(workers.organizationId, organizationId));
+  const ids = organizationId === undefined ? undefined : people.map((person) => person.id);
+  const [roleMap, stage, support, delegated, paid, extra] = await Promise.all([
+    ids === undefined ? rolesByWorker() : rolesForWorkerIds(ids),
+    ids?.length === 0 ? new Map() : stagePiecework(from, to, undefined, db, ids),
+    ids?.length === 0 ? new Map() : supportPiecework(from, to, undefined, db, ids),
+    ids?.length === 0 ? new Map() : deductionSchedule(month, undefined, db, ids),
+    ids?.length === 0 ? new Map() : paidByWorker([month], undefined, db, ids),
+    ids?.length === 0 ? new Map() : extrasByWorker([month], undefined, db, ids),
   ]);
   const rows = people
     .map((w) =>
@@ -693,7 +708,7 @@ export async function workerHistory(workerId: number, month: string) {
       })
       .from(stageInspections)
       .innerJoin(productionOperations, eq(productionOperations.id, stageInspections.productionOperationId))
-      .innerJoin(workers, eq(workers.id, productionOperations.workerId))
+      .innerJoin(workers, eq(workers.id, PAID_WORKER))
       .where(
         and(
           // Their work either names them directly (a split stage) or predates split

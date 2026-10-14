@@ -445,7 +445,7 @@ test("each deploy script and its drizzle migration describe exactly the same obj
   }
 });
 
-test("both new migrations are registered, in order, with a snapshot each", () => {
+test("the lifecycle, audit and payroll migrations are registered, in order, with snapshots", () => {
   const journal = JSON.parse(read("drizzle/meta/_journal.json")) as {
     entries: { idx: number; tag: string }[];
   };
@@ -458,7 +458,8 @@ test("both new migrations are registered, in order, with a snapshot each", () =>
   }
   // Ordering matters: each snapshot's prevId chains to the one before it, and a file
   // applied out of order would build a table whose foreign key target is not there yet.
-  assert.deepEqual(tags.slice(-2), ["0011_support_lifecycle", "0012_deletion_and_purge_audit"]);
+  assert.deepEqual(tags.slice(-3), ["0011_support_lifecycle", "0012_deletion_and_purge_audit", "0013_payroll-deductions"]);
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, "drizzle/meta/0013_snapshot.json")));
   assert.deepEqual(
     journal.entries.map((entry) => entry.idx),
     journal.entries.map((_entry, index) => index),

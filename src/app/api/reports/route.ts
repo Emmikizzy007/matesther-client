@@ -252,9 +252,8 @@ export async function GET(req: Request) {
      */
     const workerEarnings = workerRows.map((w) => {
       const approved = Number(opsByWorker.get(w.id)?.approved ?? 0);
-      const earnings = w.paymentType === "PER_PIECE"
-        ? piecework.get(w.id)?.piecework ?? 0
-        : w.paymentType === "MONTHLY" ? (w.paymentRate ?? 0) : 0;
+      const productionPay = ["PER_PIECE", "HYBRID"].includes(w.paymentType) ? piecework.get(w.id)?.piecework ?? 0 : 0;
+      const earnings = productionPay + (["MONTHLY", "HYBRID"].includes(w.paymentType) ? w.paymentRate ?? 0 : 0);
       return {
         id: w.id,
         name: w.name,
@@ -264,6 +263,7 @@ export async function GET(req: Request) {
         status: w.status,
         approved,
         earnings,
+        productionPay,
       };
     });
 
@@ -295,10 +295,10 @@ export async function GET(req: Request) {
         profit: profitability.reduce((s, p) => s + p.profit, 0),
         batches: Number(batchCountRows[0]?.total ?? 0),
         workerPieceworkTotal: workerEarnings
-          .filter((w) => w.paymentType === "PER_PIECE")
-          .reduce((s, w) => s + w.earnings, 0),
+          .filter((w) => ["PER_PIECE", "HYBRID"].includes(w.paymentType ?? ""))
+          .reduce((s, w) => s + w.productionPay, 0),
         monthlyPayroll: workerEarnings
-          .filter((w) => w.paymentType === "MONTHLY")
+          .filter((w) => ["MONTHLY", "HYBRID"].includes(w.paymentType))
           .reduce((s, w) => s + w.paymentRate, 0),
       },
     });

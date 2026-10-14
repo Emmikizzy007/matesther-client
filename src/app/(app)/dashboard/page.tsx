@@ -497,7 +497,8 @@ function WorkerDashboard({ d, userName, refresh }: any) {
   }
 
   const p = d.profile;
-  const rateNote = p?.paymentType === "PER_PIECE" ? "pay agreed for each production job" : `${naira(p.paymentRate)} / month`;
+  const rateNote = p?.paymentType === "HYBRID" ? `${naira(p.paymentRate)} monthly salary + pay agreed for each approved production job`
+    : p?.paymentType === "PER_PIECE" ? "pay agreed for each production job" : `${naira(p.paymentRate)} / month`;
 
   return (
     <div>
@@ -517,7 +518,7 @@ function WorkerDashboard({ d, userName, refresh }: any) {
             <p className="text-sm mt-1">{j.customer} <span className="text-slate-500">• {j.orderNumber}</span></p>
             <p className="mt-0.5 text-xs font-semibold text-slate-700">{j.garment}{j.size ? ` • Size ${j.size}` : ""}{j.color ? ` • ${j.color}` : ""}</p>
             <p className="text-xs text-slate-500 mt-0.5">Batch {j.batchNumber} • due {fmtDate(j.expectedCompletionDate)}</p>
-            {p?.paymentType === "PER_PIECE" && <p className="mt-1 text-xs font-bold text-matesther-700">Your agreed pay: {naira(j.pieceRate ?? p.paymentRate)} per approved piece</p>}
+            {["PER_PIECE", "HYBRID"].includes(p?.paymentType ?? "") && <p className="mt-1 text-xs font-bold text-matesther-700">Your agreed pay: {naira(j.pieceRate ?? p.paymentRate)} per approved piece</p>}
             <div className="flex items-center gap-2 mt-3 text-[11px]">
               <span className="bg-slate-100 rounded px-1.5 py-0.5">Left {j.quantityRemaining}</span>
               <span className="bg-matesther-50 text-matesther-800 rounded px-1.5 py-0.5 font-semibold">Done {j.quantityCompleted}</span>

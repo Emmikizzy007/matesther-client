@@ -11,6 +11,8 @@ import {
   unique,
   index,
   uniqueIndex,
+  check,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 
 // ---------- Organizations ----------
@@ -1265,3 +1267,218 @@ export const testDataPurges = pgTable("test_data_purges", {
     index("test_data_purges_ran_at_idx").on(table.ranAt)
   ]
 );
+
+// ---------- Payroll deductions (not expenses, not production inspection outcomes) ----------
+/** Custom categories only. Statutory PAYE, cooperative, absence, damage, rent and
+ * occasion are built-in codes in lib/payroll-deductions.ts, so no business rows
+ * are inserted by a migration. A name may be retired, never deleted. */
+export const payrollDeductionCategories = pgTable("payroll_deduction_categories", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  slug: text("slug").notNull(),
+  name: text("name").notNull(),
+  active: boolean("active").notNull().default(true),
+  createdById: integer("created_by_id").references(() => users.id, { onDelete: "set null" }),
+  createdByName: text("created_by_name").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [unique("payroll_category_org_slug_unique").on(table.organizationId, table.slug)]);
+
+/** Only EXPLICIT daily records. Missing dates are never inferred as absences.
+ * Corrections write an audit event; a day attached to an approved deduction may
+ * not be changed. This is not a time clock or an automatic attendance import. */
+export const payrollAttendance = pgTable("payroll_attendance", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  day: date("day").notNull(),
+  status: text("status").notNull(),
+  reason: text("reason").notNull(),
+  evidenceRef: text("evidence_ref"),
+  recordedById: integer("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+  recordedByName: text("recorded_by_name").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+}, (table) => [
+  unique("payroll_attendance_worker_day_unique").on(table.workerId, table.day),
+  index("payroll_attendance_org_day_idx").on(table.organizationId, table.day),
+  check("payroll_attendance_status_check", sql`${table.status} in ('PRESENT','UNAUTHORIZED_ABSENCE','UNPAID_LEAVE','APPROVED_LEAVE','PAID_LEAVE','OTHER')`),
+]);
+
+/** A proposal/authorisation per WORKER, not a payment and never an earned-wage
+ * adjustment. The fields document the basis and evidence; only a posted statement
+ * line moves money. Replacing terms means cancel + new proposal, not editing this row. */
+export const payrollDeductions = pgTable("payroll_deductions", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  categoryCode: text("category_code").notNull(),
+  customCategoryId: integer("custom_category_id").references(() => payrollDeductionCategories.id),
+  categoryName: text("category_name").notNull(),
+  description: text("description").notNull(),
+  method: text("method").notNull(),
+  basis: text("basis").notNull().default("AFTER_SUPPORT"),
+  amount: integer("amount"),
+  rateBps: integer("rate_bps"), // 100 = 1%; no floating-point percentages
+  frequencyMonths: integer("frequency_months").notNull().default(0), // 0 = once
+  startMonth: text("start_month").notNull(),
+  endMonth: text("end_month"),
+  reference: text("reference"), // distinct case/consent reference per worker
+  consentRef: text("consent_ref"),
+  consentOn: date("consent_on"),
+  authorityRef: text("authority_ref"), // prior written labour-officer approval for damage
+  evidenceRef: text("evidence_ref"),
+  incidentInspectionId: integer("incident_inspection_id").references(() => stageInspections.id),
+  incidentSupportInspectionId: integer("incident_support_inspection_id").references(() => supportInspections.id),
+  incidentQuantity: integer("incident_quantity"),
+  incidentLossAmount: integer("incident_loss_amount"), // net provable loss, after unpaid rejected work
+  incidentFindings: text("incident_findings"),
+  incidentLossBasis: text("incident_loss_basis"),
+  attendanceId: integer("attendance_id").references(() => payrollAttendance.id),
+  workingDays: integer("working_days"), // documented month policy, not inferred calendar days
+  annualGross: integer("annual_gross"),
+  annualPension: integer("annual_pension"),
+  annualNhf: integer("annual_nhf"),
+  annualNhis: integer("annual_nhis"),
+  annualRentPaid: integer("annual_rent_paid"),
+  annualOtherRelief: integer("annual_other_relief"),
+  otherReliefBasis: text("other_relief_basis"),
+  minimumWageExempt: boolean("minimum_wage_exempt").notNull().default(false),
+  status: text("status").notNull().default("PENDING"),
+  createdById: integer("created_by_id").references(() => users.id, { onDelete: "set null" }),
+  createdByName: text("created_by_name").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  approvedById: integer("approved_by_id").references(() => users.id, { onDelete: "set null" }),
+  approvedByName: text("approved_by_name"),
+  approvedAt: timestamp("approved_at"),
+  cancelledById: integer("cancelled_by_id").references(() => users.id, { onDelete: "set null" }),
+  cancelledByName: text("cancelled_by_name"),
+  cancelledAt: timestamp("cancelled_at"),
+  decisionReason: text("decision_reason"),
+}, (table) => [
+  unique("payroll_deduction_worker_reference_unique").on(table.organizationId, table.workerId, table.reference),
+  // One active claim per inspection/worker; cancelled UNPOSTED cases may be
+  // corrected and resubmitted. The API also checks the posted line ledger so a
+  // cancelled-but-already-booked case can never be charged a second time.
+  uniqueIndex("payroll_deduction_incident_worker_active_unique").on(table.incidentInspectionId, table.workerId)
+    .where(sql`${table.status} in ('PENDING','APPROVED')`),
+  uniqueIndex("payroll_deduction_support_incident_active_unique").on(table.incidentSupportInspectionId, table.workerId)
+    .where(sql`${table.status} in ('PENDING','APPROVED')`),
+  // Cancelled, never-posted proposals may be corrected and resubmitted; an
+  // active proposal may still be the only claim on one recorded day.
+  uniqueIndex("payroll_deduction_attendance_active_unique").on(table.attendanceId)
+    .where(sql`${table.status} in ('PENDING','APPROVED')`),
+  index("payroll_deduction_period_idx").on(table.organizationId, table.status, table.startMonth, table.endMonth),
+  index("payroll_deduction_worker_idx").on(table.workerId),
+  check("payroll_deduction_status_check", sql`${table.status} in ('PENDING','APPROVED','CANCELLED','REJECTED')`),
+  check("payroll_deduction_frequency_check", sql`${table.frequencyMonths} between 0 and 12`),
+  check("payroll_deduction_amount_check", sql`${table.amount} is null or ${table.amount} > 0`),
+  check("payroll_deduction_rate_check", sql`${table.rateBps} is null or ${table.rateBps} between 1 and 10000`),
+  check("payroll_deduction_days_check", sql`${table.workingDays} is null or ${table.workingDays} between 1 and 31`),
+]);
+
+/** Append-only actor/reason trail for categories, attendance, proposals, reviews,
+ * reversals and posting. The names survive account removal (same convention as
+ * production_movements and order_deletions). The API never offers a DELETE. */
+export const payrollDeductionAudit = pgTable("payroll_deduction_audit", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  entityType: text("entity_type").notNull(),
+  entityId: integer("entity_id").notNull(),
+  action: text("action").notNull(),
+  reason: text("reason").notNull(),
+  before: text("before"),
+  after: text("after"),
+  actorId: integer("actor_id").references(() => users.id, { onDelete: "set null" }),
+  actorName: text("actor_name").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (table) => [
+  index("payroll_audit_entity_idx").on(table.organizationId, table.entityType, table.entityId),
+  index("payroll_audit_created_idx").on(table.organizationId, table.createdAt),
+]);
+
+/** Immutable earnings + deduction snapshot. Existing worker_payments stay
+ * append-only cash settlements; they are NOT rewritten and never credited to
+ * the cooperative. One worker/period can be posted exactly once. */
+export const payrollStatements = pgTable("payroll_statements", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  workerName: text("worker_name").notNull(),
+  department: text("department"),
+  periodMonth: text("period_month").notNull(),
+  paymentType: text("payment_type").notNull(),
+  rate: integer("rate").notNull(),
+  pieces: integer("pieces").notNull(),
+  supportPieces: integer("support_pieces").notNull(),
+  supportPiecesDelegated: integer("support_pieces_delegated").notNull(),
+  supportDeductionOwed: integer("support_deduction_owed").notNull(),
+  piecework: integer("piecework").notNull(),
+  supportPiecework: integer("support_piecework").notNull(),
+  salary: integer("salary").notNull(),
+  overtime: integer("overtime").notNull(),
+  other: integer("other").notNull(),
+  gross: integer("gross").notNull(),
+  supportDeduction: integer("support_deduction").notNull(),
+  taxDeduction: integer("tax_deduction").notNull(),
+  companyDeductions: integer("company_deductions").notNull(),
+  net: integer("net").notNull(),
+  postedById: integer("posted_by_id").references(() => users.id, { onDelete: "set null" }),
+  postedByName: text("posted_by_name").notNull(),
+  postedAt: timestamp("posted_at").defaultNow().notNull(),
+}, (table) => [
+  unique("payroll_statement_worker_month_unique").on(table.workerId, table.periodMonth),
+  index("payroll_statement_org_month_idx").on(table.organizationId, table.periodMonth),
+]);
+
+/** One booked item per proposal per month (or one compensating reversal). The
+ * signed cooperative_credit is the cooperative transaction ledger: balance is
+ * SUM of posted credits, never a mutable worker counter or company revenue. */
+export const payrollStatementLines = pgTable("payroll_statement_lines", {
+  id: serial("id").primaryKey(),
+  statementId: integer("statement_id").references(() => payrollStatements.id).notNull(),
+  deductionId: integer("deduction_id").references(() => payrollDeductions.id),
+  reversalId: integer("reversal_id").references((): AnyPgColumn => payrollReversals.id),
+  categoryCode: text("category_code").notNull(),
+  categoryName: text("category_name").notNull(),
+  method: text("method").notNull(),
+  description: text("description").notNull(),
+  basisAmount: integer("basis_amount").notNull(),
+  amount: integer("amount").notNull(), // negative = an approved refund in a later period
+  cooperativeCredit: integer("cooperative_credit").notNull().default(0),
+  calculation: text("calculation").notNull(),
+}, (table) => [
+  unique("payroll_line_statement_deduction_unique").on(table.statementId, table.deductionId),
+  unique("payroll_line_reversal_unique").on(table.reversalId),
+  index("payroll_line_category_idx").on(table.categoryCode),
+  check("payroll_line_cooperative_check", sql`(${table.categoryCode} = 'COOPERATIVE' and ${table.cooperativeCredit} = ${table.amount}) or (${table.categoryCode} <> 'COOPERATIVE' and ${table.cooperativeCredit} = 0)`),
+]);
+
+/** A reviewed request to REFUND a posted item in a later period. It never
+ * changes or deletes the original line/statement. Full amount only, once per
+ * source line. Tax corrections need a separate tax-authority process and cannot
+ * be disguised as company refunds here. */
+export const payrollReversals = pgTable("payroll_reversals", {
+  id: serial("id").primaryKey(),
+  organizationId: integer("organization_id").references(() => organizations.id).notNull(),
+  workerId: integer("worker_id").references(() => workers.id).notNull(),
+  sourceLineId: integer("source_line_id").references((): AnyPgColumn => payrollStatementLines.id).notNull(),
+  targetMonth: text("target_month").notNull(),
+  amount: integer("amount").notNull(),
+  status: text("status").notNull().default("PENDING"),
+  reason: text("reason").notNull(),
+  createdById: integer("created_by_id").references(() => users.id, { onDelete: "set null" }),
+  createdByName: text("created_by_name").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  approvedById: integer("approved_by_id").references(() => users.id, { onDelete: "set null" }),
+  approvedByName: text("approved_by_name"),
+  approvedAt: timestamp("approved_at"),
+  cancelledById: integer("cancelled_by_id").references(() => users.id, { onDelete: "set null" }),
+  cancelledByName: text("cancelled_by_name"),
+  cancelledAt: timestamp("cancelled_at"),
+}, (table) => [
+  unique("payroll_reversal_source_unique").on(table.sourceLineId),
+  index("payroll_reversal_month_idx").on(table.organizationId, table.targetMonth, table.status),
+  check("payroll_reversal_amount_check", sql`${table.amount} > 0`),
+  check("payroll_reversal_status_check", sql`${table.status} in ('PENDING','APPROVED','CANCELLED','REJECTED')`),
+]);

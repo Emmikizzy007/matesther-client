@@ -459,7 +459,7 @@ function AssignProduction() {
                         </select>
                         {role && !eligible.length && <p className="mt-1 text-[11px] text-amber-700">No active worker holds {role}. Add the role under Workers.</p>}
                       </Field>
-                      {chosen?.paymentType === "PER_PIECE" && (
+                      {["PER_PIECE", "HYBRID"].includes(chosen?.paymentType ?? "") && (
                         <Field label="Agreed pay per approved garment (₦) *">
                           <input className={inputCls} type="number" min="1" step="1" required value={choice.pieceRate}
                             onChange={(event) => setStageChoices({ ...stageChoices, [stage.stage]: { ...choice, pieceRate: event.target.value } })} />

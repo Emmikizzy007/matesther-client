@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ChevronLeft, ChevronRight, HandCoins, History, Plus, Printer } from "lucide-react";
 import {
   Card,
@@ -17,7 +17,6 @@ import {
   Btn,
 } from "@/components/ui";
 import { naira, fmtDate } from "@/lib/format";
-import { useAuth } from "@/lib/auth";
 
 const PAY_METHODS = ["Cash", "Bank Transfer", "POS", "Other"];
 
@@ -39,7 +38,6 @@ function monthLabel(key: string) {
 }
 
 export default function PayrollPage() {
-  const { user } = useAuth();
   const [month, setMonth] = useState(() => monthKey(new Date()));
   const [d, setD] = useState<any>(null);
   const [workers, setWorkers] = useState<any[]>([]);
@@ -54,31 +52,37 @@ export default function PayrollPage() {
   const [formErr, setFormErr] = useState("");
   const [saving, setSaving] = useState(false);
 
-  function load() {
+  const load = useCallback(() => {
     setLoading(true);
-    Promise.all([
-      fetch(`/api/payroll?month=${month}`, { cache: "no-store" }).then((r) => r.json()),
-      fetch("/api/workers?view=slim", { cache: "no-store" }).then((r) => r.json()),
-    ])
-      .then(([p, w]) => {
+    fetch(`/api/payroll?month=${month}`, { cache: "no-store" }).then((r) => r.json())
+      .then((p) => {
         if (p.error) setErr(p.error);
-        else setD(p);
-        setWorkers(Array.isArray(w) ? w : []);
+        else { setErr(""); setD(p); setWorkers(p.workers.map((w: any) => ({ id: w.workerId, name: w.name, specialty: w.specialty, status: w.status }))); }
       })
+      .catch((cause) => setErr(cause instanceof Error ? cause.message : "Could not load payroll."))
       .finally(() => setLoading(false));
-  }
-  useEffect(load, [month]);
+  }, [month]);
+  useEffect(() => {
+    // Loading happens in the queued callback, not synchronously during render's
+    // effect setup; the same loader is reused after cash settlements.
+    const id = window.setTimeout(load, 0);
+    return () => window.clearTimeout(id);
+  }, [load]);
 
   function pickPayWorker(id: string) {
     const row = d?.workers.find((w: any) => String(w.workerId) === id);
+    // Existing breakdown fields describe a CASH settlement, not the gross wage
+    // before a helper share, PAYE or savings. For a net-of-deductions or partial
+    // payment leave them blank; the immutable statement holds the calculation.
+    const simpleFullPay = row && row.paid === 0 && row.totalDeductions === 0;
     setPayForm({
       workerId: id,
-      pieceworkAmount: row ? String(row.piecework) : "",
-      supportAmount: row ? String(row.supportPiecework ?? 0) : "",
-      salaryAmount: row ? String(row.salary) : "",
-      overtimeAmount: row ? String(row.overtime) : "",
-      otherAmount: row ? String(row.other ?? 0) : "",
-      amount: row ? String(row.due) : "",
+      pieceworkAmount: simpleFullPay ? String(row.piecework) : "",
+      supportAmount: simpleFullPay ? String(row.supportPiecework ?? 0) : "",
+      salaryAmount: simpleFullPay ? String(row.salary) : "",
+      overtimeAmount: simpleFullPay ? String(row.overtime) : "",
+      otherAmount: simpleFullPay ? String(row.other ?? 0) : "",
+      amount: row ? String(row.balance) : "",
       method: "Bank Transfer",
       paymentDate: new Date().toISOString().slice(0, 10),
       reference: "",
@@ -93,11 +97,11 @@ export default function PayrollPage() {
     try {
       const body = kind === "payment"
         ? {
-            ...payForm,
+            ...Object.fromEntries(Object.entries(payForm).filter(([key, value]) =>
+              !["pieceworkAmount", "supportAmount", "salaryAmount", "overtimeAmount", "otherAmount"].includes(key) || value !== "")),
             kind,
             workerId: Number(payForm.workerId),
             periodMonth: month,
-            paidBy: user?.name,
             // Same worker, month, date, amount, method and reference can only be
             // recorded once, so a double click or a retried request cannot pay twice.
             idempotencyKey: `payroll:${month}:${payForm.workerId}:${payForm.paymentDate}:${Number(payForm.amount) || 0}:${payForm.method}:${payForm.reference}`.slice(0, 200),
@@ -135,9 +139,10 @@ export default function PayrollPage() {
     <div>
       <PageHeader
         title="Worker Payments"
-        subtitle="Monthly payroll - piecework on approved work, monthly salaries and overtime. This is part of the month's expenses."
+        subtitle="Monthly payroll: approved production, salary and overtime → itemized statutory/company deductions → net payable. Post completed months before paying workers with approved deductions."
         action={
           <>
+            <Btn href="/payroll/deductions" variant="secondary">Payroll Deductions</Btn>
             <Link href={`/payment-sheet/${month}`} target="_blank" rel="noreferrer">
               <Btn variant="secondary"><Printer className="w-4 h-4" /> Bank Payment Sheet</Btn>
             </Link>
@@ -168,7 +173,8 @@ export default function PayrollPage() {
         </div>
         {d && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
-            <StatCard label="Expected to Pay (this month)" value={naira(d.totals.due)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`${d.workers.filter((w: any) => w.due > 0).length} workers with earnings`} />
+            <StatCard label="Net Preview / Posted (this month)" value={naira(d.totals.due)} icon={<HandCoins className="w-5 h-5" />} tone="gold" sub={`${d.workers.filter((w: any) => w.due > 0).length} workers with earnings`} />
+            <StatCard label="All Deductions" value={naira(d.breakdown?.totalDeductions ?? 0)} icon={<HandCoins className="w-5 h-5" />} tone="red" sub="Helper allocation + approved PAYE + company deductions (preview or posted)" />
             <StatCard label="Already Paid" value={naira(d.totals.paid)} icon={<HandCoins className="w-5 h-5" />} tone="green" />
             <StatCard label="Still Owed" value={naira(d.totals.balance)} icon={<HandCoins className="w-5 h-5" />} tone={d.totals.balance > 0 ? "red" : "green"} sub={d.totals.balance > 0 ? "Settle before month end" : "All settled ✓"} />
             <StatCard label="Piecework Share" value={naira(d.workers.reduce((s: number, w: any) => s + w.piecework, 0))} icon={<HandCoins className="w-5 h-5" />} tone="blue" sub="Approved pieces × rate — gross, before any support deduction" />
@@ -206,7 +212,7 @@ export default function PayrollPage() {
         <CardHeader title={`Who worked what - ${monthLabel(month)}`} subtitle="Pieceworkers earn only when their work is inspected & approved" />
         {loading ? (
           <Loading />
-        ) : d?.workers.filter((w: any) => w.due > 0 || w.paid > 0).length === 0 ? (
+        ) : d?.workers.filter((w: any) => w.due > 0 || w.paid > 0 || w.deductionItems?.length).length === 0 ? (
           <EmptyState title={`No earnings recorded for ${monthLabel(month)}`} hint="Piecework appears here as soon as work is inspected; salaries appear for monthly staff." />
         ) : (
           <div className="overflow-x-auto slim-scroll">
@@ -222,7 +228,9 @@ export default function PayrollPage() {
                   <th className="px-3 py-3 text-right">Salary</th>
                   <th className="px-3 py-3 text-right">Overtime</th>
                   <th className="px-3 py-3 text-right">Other</th>
-                  <th className="px-3 py-3 text-right">Total Due</th>
+                  <th className="px-3 py-3 text-right">Gross</th>
+                  <th className="px-3 py-3 text-right">PAYE / Other Deductions</th>
+                  <th className="px-3 py-3 text-right">Net Due</th>
                   <th className="px-3 py-3 text-right">Paid</th>
                   <th className="px-3 py-3 text-right">Balance</th>
                   <th className="px-3 py-3">Status</th>
@@ -231,12 +239,12 @@ export default function PayrollPage() {
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {d?.workers
-                  .filter((w: any) => w.due > 0 || w.paid > 0)
+                  .filter((w: any) => w.due > 0 || w.paid > 0 || w.deductionItems?.length)
                   .map((w: any) => (
                     <tr key={w.workerId} className="hover:bg-slate-50">
                       <td className="px-5 py-3 font-semibold">
                         {w.name}
-                        <span className="block text-xs font-normal text-slate-500">{w.specialty} • {w.paymentType === "PER_PIECE" ? "Agreed rate varies by job" : `${naira(w.rate)} / month`}</span>
+                        <span className="block text-xs font-normal text-slate-500">{w.specialty} • {w.paymentType === "HYBRID" ? `${naira(w.rate)} monthly + approved pieces` : w.paymentType === "PER_PIECE" ? "Agreed rate varies by job" : `${naira(w.rate)} / month`}</span>
                       </td>
                       <td className="px-3 py-3 text-xs">{w.paymentType.replace("_", " ")}</td>
                       <td className="px-3 py-3 text-right">{w.pieces.toLocaleString()}</td>
@@ -272,6 +280,17 @@ export default function PayrollPage() {
                       <td className="px-3 py-3 text-right">{w.salary ? naira(w.salary) : "-"}</td>
                       <td className="px-3 py-3 text-right">{w.overtime ? naira(w.overtime) : "-"}</td>
                       <td className="px-3 py-3 text-right">{w.other ? naira(w.other) : "-"}</td>
+                      <td className="px-3 py-3 text-right">{naira(w.gross)}</td>
+                      <td className="px-3 py-3 text-right">
+                        {w.payrollDeductions ? <span className={w.payrollDeductions < 0 ? "text-emerald-700" : "text-red-700"}>
+                          {w.payrollDeductions < 0 ? `+${naira(-w.payrollDeductions)} refund` : `−${naira(w.payrollDeductions)}`}
+                        </span> : "-"}
+                        {w.deductionItems?.map((item: any) => <span key={`${item.id}-${item.categoryCode}`} className="block text-[11px] text-slate-500" title={item.calculation}>
+                          {item.categoryName}: {item.amount < 0 ? `+${naira(-item.amount)}` : `−${naira(item.amount)}`}
+                        </span>)}
+                        {w.previewIssues?.map((issue: string, i: number) => <span key={i} className="block text-[11px] font-semibold text-red-700" title={issue}>Blocked: {issue}</span>)}
+                        {!w.finalized && w.mustPost && !w.previewIssues?.length && <span className="block text-[11px] text-amber-700">Preview · post before payment</span>}
+                      </td>
                       <td className="px-3 py-3 text-right font-bold">{naira(w.due)}</td>
                       <td className="px-3 py-3 text-right text-matesther-700 font-semibold">{w.paid ? naira(w.paid) : "-"}</td>
                       <td className="px-3 py-3 text-right font-bold">
@@ -282,9 +301,11 @@ export default function PayrollPage() {
                           : w.paymentStatus === "PARTIAL" ? <span className="font-semibold text-amber-700">Part paid</span>
                           : w.paymentStatus === "UNPAID" ? <span className="font-semibold text-red-700">Not yet paid</span>
                           : <span className="text-slate-400">Nothing due</span>}
+                        {w.finalized && <span className="block text-[11px] font-semibold text-emerald-700">Posted #{w.statementId}</span>}
                       </td>
                       <td className="px-3 py-3 text-right whitespace-nowrap">
-                        {w.balance > 0 && (
+                        {w.mustPost && !w.finalized && <Link href="/payroll/deductions" className="text-xs font-bold text-amber-800 hover:underline mr-3">Review → Post</Link>}
+                        {w.balance > 0 && !(w.mustPost && !w.finalized) && (
                           <button
                             onClick={() => { setFormErr(""); pickPayWorker(String(w.workerId)); setPayModal(w); }}
                             className="text-xs font-bold text-matesther-700 hover:underline mr-3"
@@ -302,7 +323,9 @@ export default function PayrollPage() {
               <tfoot>
                 {d && (
                   <tr className="border-t-2 border-slate-200 bg-slate-50">
-                    <td colSpan={8} className="px-5 py-3 font-bold">Total - {monthLabel(month)}</td>
+                    <td colSpan={9} className="px-5 py-3 font-bold">Total - {monthLabel(month)}</td>
+                    <td className="px-3 py-3 text-right font-bold">{naira(d.breakdown?.gross ?? 0)}</td>
+                    <td className="px-3 py-3 text-right font-bold text-red-700">{(d.breakdown?.payrollDeductions ?? 0) < 0 ? `+${naira(-d.breakdown.payrollDeductions)} refunds` : `−${naira(d.breakdown?.payrollDeductions ?? 0)}`}</td>
                     <td className="px-3 py-3 text-right font-extrabold">{naira(d.totals.due)}</td>
                     <td className="px-3 py-3 text-right font-bold text-matesther-700">{naira(d.totals.paid)}</td>
                     <td className="px-3 py-3 text-right font-extrabold text-red-700">{naira(d.totals.balance)}</td>
@@ -364,7 +387,7 @@ export default function PayrollPage() {
         <form onSubmit={(e) => submit("payment", e)} className="grid sm:grid-cols-2 gap-3">
           <p className="sm:col-span-2 text-xs text-slate-500 bg-matesther-50 border border-matesther-100 rounded-lg px-3 py-2">
             Settling {monthLabel(month)} for <span className="font-semibold">{payModal?.name}</span>.
-            Breakdown is pre-filled from their approved work, salary and overtime - adjust if part of it is paid.
+            Breakdown fields describe only the CASH settlement. For a posted net-of-deductions payment they start blank: the posted statement above holds the gross, each deduction and the net. If you fill any settlement breakdown fields, their sum must equal the amount paid now.
           </p>
           <Field label="Production piecework"><input type="number" min="0" value={payForm.pieceworkAmount} onChange={(e) => setPayForm({ ...payForm, pieceworkAmount: e.target.value })} className={inputCls} /></Field>
           <Field label="Support work piecework"><input type="number" min="0" value={payForm.supportAmount} onChange={(e) => setPayForm({ ...payForm, supportAmount: e.target.value })} className={inputCls} /></Field>
@@ -425,7 +448,7 @@ export default function PayrollPage() {
         ) : historyFor?.history ? (
           <div>
             <p className="text-xs text-slate-500 mb-3">
-              {(historyFor.roles ?? [historyFor.specialty]).join(", ")} • {historyFor.paymentType === "PER_PIECE" ? "Per-piece rates agreed by job" : `${historyFor.paymentType.replace("_", " ")} ${naira(historyFor.rate)} per month`}
+              {(historyFor.roles ?? [historyFor.specialty]).join(", ")} • {historyFor.paymentType === "HYBRID" ? `${naira(historyFor.rate)} monthly plus agreed piece rates` : historyFor.paymentType === "PER_PIECE" ? "Per-piece rates agreed by job" : `${historyFor.paymentType.replace("_", " ")} ${naira(historyFor.rate)} per month`}
             </p>
             <div className="overflow-x-auto slim-scroll rounded-lg border border-slate-200">
               <table className="w-full text-sm min-w-[700px]">
@@ -438,7 +461,8 @@ export default function PayrollPage() {
                     <th className="px-3 py-2.5 text-right">Salary</th>
                     <th className="px-3 py-2.5 text-right">Overtime</th>
                     <th className="px-3 py-2.5 text-right">Other</th>
-                    <th className="px-3 py-2.5 text-right">Due</th>
+                    <th className="px-3 py-2.5 text-right">Deductions</th>
+                    <th className="px-3 py-2.5 text-right">Net Due</th>
                     <th className="px-3 py-2.5 text-right">Paid</th>
                     <th className="px-3 py-2.5 text-right">Balance</th>
                   </tr>
@@ -453,6 +477,10 @@ export default function PayrollPage() {
                       <td className="px-3 py-2 text-right">{h.salary ? naira(h.salary) : "-"}</td>
                       <td className="px-3 py-2 text-right">{h.overtime ? naira(h.overtime) : "-"}</td>
                       <td className="px-3 py-2 text-right">{h.other ? naira(h.other) : "-"}</td>
+                      <td className="px-3 py-2 text-right">{h.totalDeductions ? naira(h.totalDeductions) : "-"}
+                        {h.deductionItems?.map((item: any) => <span className="block text-[11px] text-slate-500" key={item.id}>{item.categoryName}: {item.amount < 0 ? "+" : "−"}{naira(Math.abs(item.amount))}</span>)}
+                        {h.finalized && <span className="block text-[11px] text-emerald-700">Posted #{h.statementId}</span>}
+                      </td>
                       <td className="px-3 py-2 text-right font-bold">{naira(h.due)}</td>
                       <td className="px-3 py-2 text-right text-matesther-700 font-semibold">{h.paid ? naira(h.paid) : "-"}</td>
                       <td className="px-3 py-2 text-right font-semibold">{h.balance > 0 ? <span className="text-red-700">{naira(h.balance)}</span> : h.paid > 0 ? <span className="text-emerald-700">Settled</span> : "-"}</td>
